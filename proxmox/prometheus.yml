@@ -1,0 +1,59 @@
+global:
+  scrape_interval:     5s
+  evaluation_interval: 5s
+  scrape_timeout:      4s
+
+scrape_configs:
+
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'proxmox_cluster'
+    metrics_path: /pve
+    params:
+      module: [default]
+      cluster: ['1']
+      node: ['1']
+    static_configs:
+      - targets:
+          - '192.168.138.100:9221'   # pve1
+        labels:
+          instance: 'pve-node1'
+          datacenter: 'homelab'
+      - targets:
+          - '192.168.138.101:9221'   # pve2
+        labels:
+          instance: 'pve-node2'
+          datacenter: 'homelab'
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: 'localhost:9221'
+
+  - job_name: 'vm_linux_pve1'
+    static_configs:
+      - targets: ['192.168.138.133:9100']
+        labels:
+          vm_id: '101'
+          vm_name: 'linux-vm1'
+          vm_type: 'linux'
+          os: 'ubuntu'
+
+  - job_name: 'vm_linux_pve2'
+    static_configs:
+      - targets: ['192.168.138.137:9100']
+        labels:
+          vm_id: '103'
+          vm_name: 'linux-vm2'
+          vm_type: 'linux'
+          os: 'ubuntu'
+
+  - job_name: 'agent_ai'
+    static_configs:
+      - targets: ['localhost:8001']
+        labels:
+          service: 'agentic-ai'

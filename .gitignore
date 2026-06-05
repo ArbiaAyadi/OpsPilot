@@ -1,0 +1,55 @@
+# ══════════════════════════════════════════════════════
+# OpsPilot — .gitignore
+# ══════════════════════════════════════════════════════
+
+# ── Sécurité — NE JAMAIS COMMITTER ───────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# ── Python ────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+venv/
+env/
+.venv/
+pip-log.txt
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# ── Node / Frontend ───────────────────────────────────
+node_modules/
+dist/
+frontend/dist/
+.npm
+*.log
+npm-debug.log*
+
+# ── Données générées ──────────────────────────────────
+rapports/
+llm_memoire.json
+*.db
+*.sqlite
+
+# ── IDE ───────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── ML Models ─────────────────────────────────────────
+*.h5
+*.keras
+*.pkl
+*.joblib
+models/
