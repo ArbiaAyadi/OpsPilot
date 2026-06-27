@@ -1,11 +1,3 @@
-"""
-proxmox_api.py — Client Proxmox API complet
-
-Ressources surveillées :
-  Niveau 1 (Critique) : RAM, Disk, CPU
-  Niveau 2 (Important): Réseau, Nodes offline
-  Niveau 3 (Optimisation): GPU, Allocation vs Usage, Processus
-"""
 
 import os
 import requests
@@ -52,6 +44,10 @@ def get_noeuds() -> list[dict]:
             "nom":          n.get("node"),
             "statut":       n.get("status"),
             "cpu_pct":      round(n.get("cpu", 0) * 100, 1),
+            # FIX : Proxmox renvoie nativement "maxcpu" (nombre de cores) sur
+            # /nodes — ce champ n'etait jamais lu, donc cpu_cores arrivait
+            # toujours a 0 jusqu'au frontend (affiche "? cores").
+            "cpu_cores":    n.get("maxcpu", 0),
             "ram_used_gb":  round(n.get("mem", 0) / 1024**3, 1),
             "ram_total_gb": round(maxmem / 1024**3, 1),
             "ram_pct":      round(n.get("mem", 0) / maxmem * 100, 1),
@@ -444,9 +440,15 @@ def get_etat_cluster() -> dict:
     gpu_info = []
     try:
         gpu_info = get_gpu_info()
-        # Alerte si GPU disponible mais aucune VM ne l'utilise
+        # Alerte uniquement pour les vrais GPUs physiques non assignes.
+        # On exclut les adaptateurs graphiques virtuels (VMware SVGA, VirtualBox,
+        # QEMU VGA...) qui ne peuvent pas etre assignes en passthrough — ce sont
+        # des peripheriques de l'hyperviseur lui-meme, pas des GPUs utilisables.
+        ADAPTATEURS_VIRTUELS = ("svga", "vmware", "virtualbox", "vbox", "qemu", "bochs", "cirrus", "virtio-vga")
         for gpu in gpu_info:
-            if not gpu["en_passthrough"]:
+            nom_lower = gpu.get("nom","").lower()
+            is_virtual = any(v in nom_lower for v in ADAPTATEURS_VIRTUELS)
+            if not gpu["en_passthrough"] and not is_virtual:
                 alertes.append({
                     "niveau":  "SURVEILLANCE",
                     "cible":   gpu["noeud"],

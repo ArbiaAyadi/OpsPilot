@@ -414,8 +414,15 @@ def _metriques_zfs(node: str) -> dict:
         results = _query(f'node_zfs_arc_c{{instance=~"{node}.*"}}')
     
     if results:
-        m["zfs_available"]  = True
-        m["zfs_arc_size_gb"] = round(_val(results[0]) / (1024**3), 2)
+        taille = round(_val(results[0]) / (1024**3), 2)
+        m["zfs_arc_size_gb"] = taille
+        # zfs_available = True seulement si le cache ARC contient reellement
+        # des donnees. Le module kernel ZFS de Proxmox VE expose toujours
+        # node_zfs_arc_size meme sans pool actif (LVM-thin uniquement) —
+        # sans ce garde-fou, "ZFS available" est un faux positif systematique
+        # sur tout cluster qui n'utilise pas ZFS, et generait une fausse
+        # alerte CRITICAL "ARC hit rate 0%" sur le dashboard.
+        m["zfs_available"] = taille > 0.01
 
     # Taille ARC max configurée
     results = _query(f'node_zfs_arc_c_max{{instance=~"{node}.*"}}')
