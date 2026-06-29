@@ -1,147 +1,162 @@
 import asyncio
-import re
+import time
 from datetime import datetime
 from fastapi import WebSocket, WebSocketDisconnect
 
-from agent.chat_history  import (
+from agent.chat_history import (
     ajouter_message, editer_message, get_messages_llm,
     vider_historique, get_historique_complet, charger_depuis_db, next_id
 )
-from agent.groq_client   import appeler_groq, GROQ_MODEL, GROQ_OK
-from agent.prompts       import system_prompt_chat
+from agent.groq_client  import appeler_groq, GROQ_MODEL, GROQ_OK
+from agent.prompts      import system_prompt_chat
 import agent.surveillance as surveillance
 
 clients: list = []
 
+# ── Cache PC hôte (TTL 60s) ──────────────────────────────────────────────────
+# Évite d'appeler windows_exporter à chaque question
+_pc_hote_cache: dict  = {}
+_pc_hote_ts:    float = 0.0
+PC_HOTE_TTL_S         = 60
+
+
+def _get_pc_hote() -> dict:
+    """
+    Retourne les ressources du PC hôte avec cache TTL 60s.
+    Importe metriques_pc_hote uniquement ici — non bloquant si absent.
+    """
+    global _pc_hote_cache, _pc_hote_ts
+    now = time.time()
+
+    if now - _pc_hote_ts < PC_HOTE_TTL_S and _pc_hote_cache:
+        return _pc_hote_cache
+
+    try:
+        from metriques_pc_hote import collecter_ressources_pc_hote
+        _pc_hote_cache = collecter_ressources_pc_hote()
+        _pc_hote_ts    = now
+    except Exception as e:
+        print(f"[PC Host] {e}")
+        if not _pc_hote_cache:
+            _pc_hote_cache = {"disponible": False}
+
+    return _pc_hote_cache
+
+
+def _detecter_langue(question: str) -> str:
+    """Détecte si la question est en français ou en anglais."""
+    mots_fr = ["créer", "construire", "ajouter", "veux", "je", "comment",
+               "pourquoi", "quoi", "quel", "quelle", "mon", "ma", "les",
+               "du", "de", "est", "sont", "pour", "avec", "sur", "dans",
+               "quelle", "combien", "puis-je", "peux"]
+    return "fr" if any(m in question.lower() for m in mots_fr) else "en"
+
 
 def _verifier_ressources_vm(question: str, etat: dict) -> str | None:
     """
-    Vérifie si la question concerne une création de VM et si les ressources
-    sont suffisantes sur le nœud cible.
-    Retourne un message de refus si insuffisant, None sinon.
+    Vérifie les ressources avant création VM/LXC.
+    Intercepte avant l'appel LLM — zéro quota Groq consommé si refus.
     """
     q = question.lower()
 
-    # Détecter intention de création VM
     mots_creation = ['create', 'build', 'add', 'new vm', 'créer', 'construire',
-                     'ajouter', 'nouvelle vm', 'deploy', 'déployer', 'install']
-    mots_vm       = ['vm', 'virtual machine', 'machine virtuelle', 'container', 'lxc']
+                     'ajouter', 'nouvelle vm', 'deploy', 'déployer', 'install',
+                     'lancer', 'nouveau', 'faire']
+    mots_vm       = ['vm', 'virtual machine', 'machine virtuelle', 'container',
+                     'lxc', 'conteneur', 'instance', 'nœud', 'node']
 
     is_creation = any(m in q for m in mots_creation) and any(m in q for m in mots_vm)
     if not is_creation:
         return None
-
     if not etat or not etat.get("noeuds"):
         return None
 
-    # Détecter le nœud cible mentionné dans la question
-    noeuds_mentionnes = []
-    for n in etat.get("noeuds", []):
-        if n.get("nom", "").lower() in q:
-            noeuds_mentionnes.append(n)
-
-    # Si aucun nœud mentionné, prendre les nœuds online
+    noeuds_mentionnes = [n for n in etat.get("noeuds", [])
+                         if n.get("nom", "").lower() in q]
     if not noeuds_mentionnes:
         noeuds_mentionnes = [n for n in etat.get("noeuds", [])
                              if str(n.get("statut","")).lower() in ("online","up","en ligne")]
-
     if not noeuds_mentionnes:
         return None
 
-    # Vérifier les ressources du nœud cible
+    lang        = _detecter_langue(question)
+    RAM_MIN_GB  = 1.0
+    DISK_MIN_GB = 10.0
+
     for n in noeuds_mentionnes:
         nom    = n.get("nom", "?")
         statut = str(n.get("statut", "")).lower()
 
-        # Nœud offline
         if statut not in ("online", "up", "en ligne"):
-            lang = "fr" if any(m in q for m in ["créer","construire","ajouter","veux","je"]) else "en"
             if lang == "fr":
                 return (f"❌ **Impossible de créer une VM sur {nom}**\n\n"
-                        f"Le nœud **{nom}** est actuellement **OFFLINE** et inaccessible.\n\n"
+                        f"Le nœud **{nom}** est **OFFLINE** et inaccessible.\n\n"
                         f"**Solutions :**\n"
                         f"- Attendez que {nom} soit en ligne\n"
                         f"- Créez la VM sur **pve1** qui est ONLINE")
             else:
                 return (f"❌ **Cannot create a VM on {nom}**\n\n"
-                        f"Node **{nom}** is currently **OFFLINE** and unreachable.\n\n"
+                        f"Node **{nom}** is **OFFLINE** and unreachable.\n\n"
                         f"**Options:**\n"
                         f"- Wait for {nom} to come back online\n"
                         f"- Create the VM on **pve1** which is ONLINE")
 
-        # RAM insuffisante — minimum 1GB libre requis pour créer une VM
         ram_libre  = round(n.get("ram_total_gb", 0) - n.get("ram_used_gb", 0), 1)
         disk_libre = round(n.get("disk_total_gb", 0) * (1 - n.get("disk_pct", 0) / 100), 1)
-        RAM_MIN_GB = 1.0
-        DISK_MIN_GB = 10.0
-
-        lang = "fr" if any(m in q for m in ["créer","construire","ajouter","veux","je"]) else "en"
 
         if ram_libre < RAM_MIN_GB:
             if lang == "fr":
                 return (f"❌ **RAM insuffisante sur {nom}**\n\n"
                         f"RAM libre : **{ram_libre}GB** — minimum requis : **{RAM_MIN_GB}GB**\n\n"
                         f"**Libérez de la RAM avant de créer une VM :**\n"
-                        f"```bash\n"
-                        f"ps aux --sort=-%mem | head -15\n"
-                        f"```\n"
-                        f"Identifiez les processus consommateurs et réduisez "
-                        f"la mémoire allouée aux VMs existantes :\n"
-                        f"```bash\n"
-                        f"qm set 101 --balloon 512\n"
-                        f"echo 1 > /sys/kernel/mm/ksm/run\n"
-                        f"```\n"
-                        f"Ressources actuelles sur {nom} : "
-                        f"RAM {ram_libre}GB libre | Disk {disk_libre}GB libre")
+                        f"```bash\nps aux --sort=-%mem | head -15\n```\n"
+                        f"Réduisez le balloon des VMs existantes :\n"
+                        f"```bash\nqm set 101 --balloon 512\necho 1 > /sys/kernel/mm/ksm/run\n```\n"
+                        f"Ressources actuelles : RAM {ram_libre}GB libre | Disk {disk_libre}GB libre")
             else:
                 return (f"❌ **Not enough RAM on {nom}**\n\n"
                         f"RAM free: **{ram_libre}GB** — minimum required: **{RAM_MIN_GB}GB**\n\n"
                         f"**Free up RAM before creating a VM:**\n"
-                        f"```bash\n"
-                        f"ps aux --sort=-%mem | head -15\n"
-                        f"```\n"
-                        f"Identify memory consumers, then reduce existing VM balloon:\n"
-                        f"```bash\n"
-                        f"qm set 101 --balloon 512\n"
-                        f"echo 1 > /sys/kernel/mm/ksm/run\n"
-                        f"```\n"
-                        f"Current resources on {nom}: "
-                        f"RAM {ram_libre}GB free | Disk {disk_libre}GB free")
+                        f"```bash\nps aux --sort=-%mem | head -15\n```\n"
+                        f"Reduce existing VM balloon:\n"
+                        f"```bash\nqm set 101 --balloon 512\necho 1 > /sys/kernel/mm/ksm/run\n```\n"
+                        f"Current: RAM {ram_libre}GB free | Disk {disk_libre}GB free")
 
         if disk_libre < DISK_MIN_GB:
             if lang == "fr":
                 return (f"❌ **Espace disque insuffisant sur {nom}**\n\n"
                         f"Disque libre : **{disk_libre}GB** — minimum requis : **{DISK_MIN_GB}GB**\n\n"
-                        f"**Libérez de l'espace disque :**\n"
-                        f"```bash\n"
-                        f"du -sh /var/lib/vz/dump/* 2>/dev/null | sort -rh | head -10\n"
-                        f"df -h /\n"
-                        f"```\n"
-                        f"Supprimez les anciens backups et nettoyez les logs.")
+                        f"**Libérez de l'espace :**\n"
+                        f"```bash\ndu -sh /var/lib/vz/dump/* 2>/dev/null | sort -rh | head -10\ndf -h /\n```\n"
+                        f"Supprimez les anciens backups.")
             else:
-                return (f"❌ **Not enough disk space on {nom}**\n\n"
+                return (f"❌ **Not enough disk on {nom}**\n\n"
                         f"Disk free: **{disk_libre}GB** — minimum required: **{DISK_MIN_GB}GB**\n\n"
-                        f"**Free up disk space first:**\n"
-                        f"```bash\n"
-                        f"du -sh /var/lib/vz/dump/* 2>/dev/null | sort -rh | head -10\n"
-                        f"df -h /\n"
-                        f"```\n"
-                        f"Delete old backups and clean up logs.")
+                        f"**Free up disk space:**\n"
+                        f"```bash\ndu -sh /var/lib/vz/dump/* 2>/dev/null | sort -rh | head -10\ndf -h /\n```\n"
+                        f"Delete old backups and clean logs.")
 
-    return None  # Ressources suffisantes — laisser le LLM répondre
+    return None
 
 
 async def repondre_question(question: str, msg_id_edition: str = None) -> tuple:
-    """Appelle le LLM et retourne (reponse, msg_id)."""
-    etat   = surveillance.dernier_etat
-    system = system_prompt_chat(etat, surveillance.dernier_lstm)
-    msgs   = get_messages_llm(jusqu_a_id=msg_id_edition) if msg_id_edition else get_messages_llm()
+    """
+    Appelle le LLM avec contexte complet :
+    - Vérification ressources (sans appel LLM si refus)
+    - Etat cluster Proxmox niveaux 1+2+3
+    - Ressources PC hôte Windows (metriques_pc_hote.py)
+    """
+    etat    = surveillance.dernier_etat
+    pc_hote = _get_pc_hote()
 
-    # Vérification ressources avant appel LLM
+    # Vérification avant LLM — économise le quota Groq
     refus = _verifier_ressources_vm(question, etat)
     if refus:
         msg = ajouter_message("assistant", refus)
         return refus, msg["id"]
+
+    system = system_prompt_chat(etat, surveillance.dernier_lstm, pc_hote)
+    msgs   = get_messages_llm(jusqu_a_id=msg_id_edition) if msg_id_edition else get_messages_llm()
 
     loop    = asyncio.get_event_loop()
     reponse = await loop.run_in_executor(
@@ -164,7 +179,6 @@ async def handle_connection(ws: WebSocket):
         "content":   "connected",
     })
 
-    # Restaurer historique depuis DB si memoire vide
     if not get_historique_complet():
         try:
             from database import get_chat_history

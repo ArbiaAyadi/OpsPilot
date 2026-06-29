@@ -152,6 +152,14 @@ export default function App() {
 
       setChatMessages(m=>[...m,{...data, content: cleanContent, id:data.id||`alert_${Date.now()}`}])
 
+      // Récupérer les métriques complètes du nœud concerné (niveaux 1+2+3)
+      // pour les injecter dans la carte Recommendations
+      const cibleNom   = data.anomalies?.[0]?.cible || ''
+      const noeudLive  = cluster?.noeuds?.find(n =>
+        n.nom?.toLowerCase() === cibleNom?.toLowerCase() ||
+        cibleNom?.toLowerCase().includes(n.nom?.toLowerCase())
+      ) || cluster?.noeuds?.[0] || {}
+
       setSuggestions(s=>[...s, {
         title:       recoTitle,
         description: recoPart,
@@ -161,6 +169,34 @@ export default function App() {
         target:      data.anomalies?.[0]?.cible || 'cluster',
         rapport:     data.rapport,
         incident:    incidentPart,
+        // Métriques niveau 1
+        cpu_pct:     noeudLive.cpu_pct     ?? null,
+        ram_pct:     noeudLive.ram_pct     ?? null,
+        disk_pct:    noeudLive.disk_pct    ?? null,
+        ram_used_gb: noeudLive.ram_used_gb ?? null,
+        ram_total_gb:noeudLive.ram_total_gb?? null,
+        // Métriques niveau 2
+        swap_pct:              noeudLive.swap_pct              ?? null,
+        swap_used_gb:          noeudLive.swap_used_gb          ?? null,
+        cpu_iowait_pct:        noeudLive.cpu_iowait_pct        ?? null,
+        disk_read_latency_ms:  noeudLive.disk_read_latency_ms  ?? null,
+        disk_write_latency_ms: noeudLive.disk_write_latency_ms ?? null,
+        disk_read_iops:        noeudLive.disk_read_iops        ?? null,
+        disk_write_iops:       noeudLive.disk_write_iops       ?? null,
+        net_errors_in:         noeudLive.net_errors_in         ?? null,
+        net_errors_out:        noeudLive.net_errors_out        ?? null,
+        net_drop_in:           noeudLive.net_drop_in           ?? null,
+        net_drop_out:          noeudLive.net_drop_out          ?? null,
+        // Métriques niveau 3
+        cpu_temp_max_c:          noeudLive.cpu_temp_max_c          ?? null,
+        smart_ok:                noeudLive.smart_ok                ?? null,
+        smart_reallocated_sectors:noeudLive.smart_reallocated_sectors?? null,
+        zfs_arc_hit_rate:        noeudLive.zfs_arc_hit_rate        ?? null,
+        zfs_arc_size_gb:         noeudLive.zfs_arc_size_gb         ?? null,
+        zfs_available:           noeudLive.zfs_available            ?? null,
+        corosync_ok:             noeudLive.corosync_ok              ?? null,
+        corosync_quorum_ok:      noeudLive.corosync_quorum_ok       ?? null,
+        load_avg_1m:             noeudLive.load_avg_1m              ?? null,
       }])
 
       setIncidents(a=>[...a,...(data.anomalies||[]).map(an=>({

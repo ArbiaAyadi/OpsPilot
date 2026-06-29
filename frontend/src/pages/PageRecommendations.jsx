@@ -1,4 +1,8 @@
-
+/**
+ * OpsPilot — Page Recommendations
+ * Affiche les actions correctives avec solutions spécifiques par type de problème,
+ * valeurs cibles exactes, et commandes Proxmox VE officielles.
+ */
 import { useState } from 'react'
 import { C } from '../utils/colors'
 import { severityColor, normalizeSeverity } from '../styles/theme'
@@ -167,27 +171,90 @@ systemctl status corosync`,
     longTerm: 'For a 2-node cluster, add a QDevice (Quorum Device) to avoid split-brain: pvecm qdevice setup {qdevice-ip}. A Raspberry Pi or small VM on a third host can serve as QDevice. This eliminates the 2-node quorum vulnerability.',
     ref: 'pve.proxmox.com/pve-docs/pve-admin-guide.html#chapter_pvecm',
   },
+  network: {
+    icon: '⟳',
+    color: '#f97316',
+    label: 'Network Errors / Packet Drops',
+    thresholds: { warning: 1, critical: 10, target: 0 },
+    cmd: `ip -s link show
+ethtool eth0
+cat /proc/net/dev`,
+    cmdLabel: 'Network interface stats — errors and drops per interface',
+    cmdExpl: 'RX/TX errors > 0 indicate hardware or cable issues. Drops > 0 indicate buffer saturation or CPU overload. ethtool shows duplex/speed mismatch which causes errors on gigabit links.',
+    steps: [
+      'Run ip -s link — note RX/TX errors and drops per interface',
+      'Check duplex/speed: ethtool eth0 | grep -E "Speed|Duplex"',
+      'Verify cable and switch port: replace cable if errors persist',
+      'Check CPU overload causing drops: top — if CPU > 80%, network buffers overflow',
+      'Increase ring buffer: ethtool -G eth0 rx 4096 tx 4096',
+    ],
+    longTerm: 'Set network card to auto-negotiate: ethtool -s eth0 autoneg on. Configure jumbo frames if using NFS/iSCSI storage: ip link set eth0 mtu 9000. Monitor with: watch -n1 "ip -s link show eth0". Target: 0 errors, 0 drops.',
+    ref: 'pve.proxmox.com/pve-docs/pve-admin-guide.html#sysadmin_network_configuration',
+  },
+  smart: {
+    icon: '💾',
+    color: '#ef4444',
+    label: 'Disk SMART Failure',
+    thresholds: {},
+    cmd: `smartctl -a /dev/sda
+smartctl -H /dev/sda
+lsblk -d -o NAME,SIZE,MODEL,SERIAL`,
+    cmdLabel: 'Full SMART report and disk health for /dev/sda',
+    cmdExpl: 'SMART overall-health: PASSED = OK, FAILED = replace immediately. Reallocated_Sector_Ct > 0 = bad sectors found and remapped. Current_Pending_Sector > 0 = unstable sectors. Uncorrectable_Error > 0 = URGENT: data loss risk.',
+    steps: [
+      'Run smartctl -H /dev/sda — check overall-health status',
+      'Check critical attributes: smartctl -a /dev/sda | grep -E "Reallocated|Pending|Uncorrectable"',
+      'If Reallocated_Sector_Ct > 0: schedule disk replacement immediately',
+      'Backup all VMs NOW: vzdump --all --compress zstd --storage local',
+      'Monitor disk temp: smartctl -a /dev/sda | grep Temperature — should be < 50°C',
+    ],
+    longTerm: 'Install smartmontools: apt install smartmontools. Enable automatic SMART tests: smartd with /etc/smartd.conf. Schedule weekly short tests and monthly long tests. Replace any disk with Reallocated_Sector_Ct > 0 — it will fail. Target: SMART PASSED, 0 reallocated sectors.',
+    ref: 'pve.proxmox.com/wiki/SMART',
+  },
+  zfs: {
+    icon: '◈',
+    color: '#f97316',
+    label: 'ZFS ARC Cache',
+    thresholds: { warning: 80, critical: 60, target: 90 },
+    cmd: `arc_summary
+zpool status
+zpool iostat -v 1 3`,
+    cmdLabel: 'ZFS ARC cache hit rate and pool health',
+    cmdExpl: 'ARC hit rate < 80% means most I/O goes to physical disk — performance degrades significantly. zpool status shows DEGRADED/FAULTED pools. iostat shows read/write throughput per vdev. A healthy pool shows ONLINE for all disks.',
+    steps: [
+      'Run arc_summary — check ARC hit rate and size',
+      'If hit rate < 80%: increase ARC max size',
+      'Set ARC max to 50% of RAM: echo {bytes} > /sys/module/zfs/parameters/zfs_arc_max',
+      'Check pool health: zpool status — all vdevs should be ONLINE',
+      'If pool DEGRADED: check failed disk with zpool status -v',
+    ],
+    longTerm: 'Make ARC limit permanent: add options zfs zfs_arc_max={bytes} to /etc/modprobe.d/zfs.conf. Enable ZFS auto-scrub monthly: zpool set autoreplace=on {pool}. Monitor with: zpool iostat 5. Target: ARC hit rate > 90%, all vdevs ONLINE.',
+    ref: 'pve.proxmox.com/pve-docs/pve-admin-guide.html#sysadmin_zfs',
+  },
 }
 
 // Détecter le type de problème depuis le message/titre
 function detecterType(s) {
   const text = ((s.title || '') + ' ' + (s.description || '') + ' ' + (s.target || '')).toLowerCase()
-  if (text.includes('quorum') || text.includes('corosync'))    return 'quorum'
-  if (text.includes('temperature') || text.includes('temp'))   return 'temp'
-  if (text.includes('iowait') || text.includes('i/o wait'))    return 'iowait'
-  if (text.includes('swap'))                                    return 'swap'
-  if (text.includes('disk') || text.includes('storage'))       return 'disk'
-  if (text.includes('cpu') && !text.includes('iowait'))        return 'cpu'
+  if (text.includes('quorum') || text.includes('corosync'))                    return 'quorum'
+  if (text.includes('smart') || text.includes('reallocated') || text.includes('sector')) return 'smart'
+  if (text.includes('zfs') || text.includes('arc') || text.includes('zpool')) return 'zfs'
+  if (text.includes('temperature') || text.includes('temp'))                   return 'temp'
+  if (text.includes('network') || text.includes('packet') || text.includes('drop') || text.includes('net error')) return 'network'
+  if (text.includes('iowait') || text.includes('i/o wait'))                   return 'iowait'
+  if (text.includes('swap'))                                                    return 'swap'
+  if (text.includes('disk') || text.includes('storage'))                       return 'disk'
+  if (text.includes('cpu') && !text.includes('iowait'))                        return 'cpu'
   if (text.includes('ram') || text.includes('memory') || text.includes('mem')) return 'ram'
   if (text.includes('vm') && (text.includes('stop') || text.includes('down') || text.includes('not running'))) return 'vm_down'
-  // Fallback depuis anomaly detector
   const cible = (s.target || '').toLowerCase()
   if (cible.includes('ram') || cible.includes('mem'))  return 'ram'
   if (cible.includes('disk'))                          return 'disk'
   if (cible.includes('cpu'))                           return 'cpu'
   if (cible.includes('swap'))                          return 'swap'
+  if (cible.includes('network') || cible.includes('net')) return 'network'
   if (cible.includes('vm'))                            return 'vm_down'
-  return 'ram' // fallback
+  return 'ram'
 }
 
 // Extraire la valeur actuelle depuis le message LLM ou anomalie
@@ -271,6 +338,84 @@ function RecoCard({ s }) {
                   </div>
                 )}
               </div>
+
+              {/* Métriques complètes niveaux 1+2+3 si disponibles */}
+              {(s.swap_pct !== null || s.cpu_iowait_pct !== null || s.cpu_temp_max_c !== null || s.zfs_available || s.corosync_ok !== null) && (
+                <div style={{ marginBottom: 14, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                  {/* Niveau 2 — Swap */}
+                  {s.swap_pct !== null && (
+                    <div style={{ padding: '7px 10px', background: C.bg, borderRadius: 6, border: `1px solid ${C.border}` }}>
+                      <div style={{ fontSize: 9, color: C.muted, fontFamily: 'JetBrains Mono, monospace', marginBottom: 3 }}>SWAP</div>
+                      <div style={{ fontSize: 12, color: s.swap_pct > 50 ? C.red : s.swap_pct > 20 ? C.orange : C.green, fontWeight: 600 }}>
+                        {s.swap_pct}% {s.swap_used_gb !== null ? `(${s.swap_used_gb}GB)` : ''}
+                      </div>
+                    </div>
+                  )}
+                  {/* Niveau 2 — IOWait */}
+                  {s.cpu_iowait_pct !== null && (
+                    <div style={{ padding: '7px 10px', background: C.bg, borderRadius: 6, border: `1px solid ${C.border}` }}>
+                      <div style={{ fontSize: 9, color: C.muted, fontFamily: 'JetBrains Mono, monospace', marginBottom: 3 }}>I/O WAIT</div>
+                      <div style={{ fontSize: 12, color: s.cpu_iowait_pct > 30 ? C.red : s.cpu_iowait_pct > 10 ? C.orange : C.green, fontWeight: 600 }}>
+                        {s.cpu_iowait_pct}%
+                      </div>
+                    </div>
+                  )}
+                  {/* Niveau 2 — Disk latency */}
+                  {s.disk_read_latency_ms !== null && (
+                    <div style={{ padding: '7px 10px', background: C.bg, borderRadius: 6, border: `1px solid ${C.border}` }}>
+                      <div style={{ fontSize: 9, color: C.muted, fontFamily: 'JetBrains Mono, monospace', marginBottom: 3 }}>DISK LATENCY</div>
+                      <div style={{ fontSize: 12, color: s.disk_read_latency_ms > 20 ? C.red : s.disk_read_latency_ms > 10 ? C.orange : C.green, fontWeight: 600 }}>
+                        R:{s.disk_read_latency_ms}ms W:{s.disk_write_latency_ms}ms
+                      </div>
+                    </div>
+                  )}
+                  {/* Niveau 2 — Net errors */}
+                  {(s.net_errors_in !== null && (s.net_errors_in > 0 || s.net_errors_out > 0)) && (
+                    <div style={{ padding: '7px 10px', background: C.bg, borderRadius: 6, border: `1px solid ${C.red}40` }}>
+                      <div style={{ fontSize: 9, color: C.muted, fontFamily: 'JetBrains Mono, monospace', marginBottom: 3 }}>NET ERRORS</div>
+                      <div style={{ fontSize: 12, color: C.red, fontWeight: 600 }}>
+                        in:{s.net_errors_in} out:{s.net_errors_out}
+                      </div>
+                    </div>
+                  )}
+                  {/* Niveau 3 — Température */}
+                  {s.cpu_temp_max_c !== null && s.cpu_temp_max_c > 0 && (
+                    <div style={{ padding: '7px 10px', background: C.bg, borderRadius: 6, border: `1px solid ${C.border}` }}>
+                      <div style={{ fontSize: 9, color: C.muted, fontFamily: 'JetBrains Mono, monospace', marginBottom: 3 }}>CPU TEMP</div>
+                      <div style={{ fontSize: 12, color: s.cpu_temp_max_c > 85 ? C.red : s.cpu_temp_max_c > 75 ? C.orange : C.green, fontWeight: 600 }}>
+                        {s.cpu_temp_max_c}°C
+                      </div>
+                    </div>
+                  )}
+                  {/* Niveau 3 — SMART */}
+                  {s.smart_ok !== null && !s.smart_ok && (
+                    <div style={{ padding: '7px 10px', background: C.bg, borderRadius: 6, border: `1px solid ${C.red}40` }}>
+                      <div style={{ fontSize: 9, color: C.muted, fontFamily: 'JetBrains Mono, monospace', marginBottom: 3 }}>SMART</div>
+                      <div style={{ fontSize: 12, color: C.red, fontWeight: 600 }}>
+                        FAIL — {s.smart_reallocated_sectors} bad sectors
+                      </div>
+                    </div>
+                  )}
+                  {/* Niveau 3 — ZFS */}
+                  {s.zfs_available && s.zfs_arc_hit_rate !== null && (
+                    <div style={{ padding: '7px 10px', background: C.bg, borderRadius: 6, border: `1px solid ${C.border}` }}>
+                      <div style={{ fontSize: 9, color: C.muted, fontFamily: 'JetBrains Mono, monospace', marginBottom: 3 }}>ZFS ARC</div>
+                      <div style={{ fontSize: 12, color: s.zfs_arc_hit_rate < 70 ? C.red : s.zfs_arc_hit_rate < 85 ? C.orange : C.green, fontWeight: 600 }}>
+                        {s.zfs_arc_hit_rate}% hit · {s.zfs_arc_size_gb}GB
+                      </div>
+                    </div>
+                  )}
+                  {/* Niveau 3 — Corosync */}
+                  {s.corosync_ok !== null && !s.corosync_ok && (
+                    <div style={{ padding: '7px 10px', background: C.bg, borderRadius: 6, border: `1px solid ${C.red}40` }}>
+                      <div style={{ fontSize: 9, color: C.muted, fontFamily: 'JetBrains Mono, monospace', marginBottom: 3 }}>COROSYNC</div>
+                      <div style={{ fontSize: 12, color: C.red, fontWeight: 600 }}>
+                        DEGRADED — quorum {s.corosync_quorum_ok ? 'OK' : 'LOST'}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
 
               {/* Commande immédiate */}
               <div style={{ marginBottom: 14 }}>

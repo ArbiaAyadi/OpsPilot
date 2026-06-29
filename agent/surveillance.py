@@ -158,32 +158,83 @@ def _classifier_anomalies(anomalies: list) -> tuple:
 def _calculer_seuils_franchis(etat: dict) -> str:
     """
     Calcule pour chaque noeud quel seuil exact est franchi (WARNING ou CRITICAL).
-    Evite que le LLM confonde WARNING et CRITICAL dans son analyse.
-    Ex : RAM 82.3% est WARNING (>75%) mais pas encore CRITICAL (>85%).
+    Couvre les niveaux 1, 2 et 3 pour que le LLM ait le contexte complet.
     """
     lignes = []
     for n in etat.get("noeuds", []):
-        nom = n.get("nom", "?")
+        nom  = n.get("nom", "?")
         ram  = n.get("ram_pct", 0)
         cpu  = n.get("cpu_pct", 0)
         disk = n.get("disk_pct", 0)
         swap = n.get("swap_pct", 0)
+
+        # ── Niveau 1 ─────────────────────────────────────────────────────────
         if ram >= 85:
             lignes.append(f"  {nom} RAM: {ram:.1f}% — CRITICAL threshold breached (>=85%) — target <70%")
         elif ram >= 75:
             lignes.append(f"  {nom} RAM: {ram:.1f}% — WARNING threshold breached (>=75%) — NOT yet critical (<85%) — target <70%")
+
         if cpu >= 90:
             lignes.append(f"  {nom} CPU: {cpu:.1f}% — CRITICAL threshold breached (>=90%) — target <75%")
         elif cpu >= 80:
             lignes.append(f"  {nom} CPU: {cpu:.1f}% — WARNING threshold breached (>=80%) — NOT yet critical (<90%) — target <75%")
+
         if disk >= 90:
             lignes.append(f"  {nom} DISK: {disk:.1f}% — CRITICAL threshold breached (>=90%) — target <75%")
         elif disk >= 80:
             lignes.append(f"  {nom} DISK: {disk:.1f}% — WARNING threshold breached (>=80%) — NOT yet critical (<90%) — target <75%")
-        if swap >= 50:
-            lignes.append(f"  {nom} SWAP: {swap:.1f}% — CRITICAL threshold breached (>=50%) — target 0%")
-        elif swap >= 20:
-            lignes.append(f"  {nom} SWAP: {swap:.1f}% — WARNING threshold breached (>=20%) — target 0%")
+
+        # ── Niveau 2 ─────────────────────────────────────────────────────────
+        if swap >= 80:
+            lignes.append(f"  {nom} SWAP: {swap:.1f}% — CRITICAL threshold breached (>=80%) — target 0%")
+        elif swap >= 50:
+            lignes.append(f"  {nom} SWAP: {swap:.1f}% — WARNING threshold breached (>=50%) — target 0%")
+
+        iowait = n.get("cpu_iowait_pct", 0)
+        if iowait >= 30:
+            lignes.append(f"  {nom} IOWAIT: {iowait:.1f}% — CRITICAL threshold breached (>=30%) — target <5%")
+        elif iowait >= 15:
+            lignes.append(f"  {nom} IOWAIT: {iowait:.1f}% — WARNING threshold breached (>=15%) — NOT yet critical (<30%) — target <5%")
+
+        read_lat  = n.get("disk_read_latency_ms", 0)
+        write_lat = n.get("disk_write_latency_ms", 0)
+        if read_lat >= 50 or write_lat >= 50:
+            lignes.append(f"  {nom} DISK LATENCY: read={read_lat:.1f}ms write={write_lat:.1f}ms — CRITICAL (>=50ms) — target <10ms")
+        elif read_lat >= 20 or write_lat >= 20:
+            lignes.append(f"  {nom} DISK LATENCY: read={read_lat:.1f}ms write={write_lat:.1f}ms — WARNING (>=20ms) — target <10ms")
+
+        net_err = n.get("net_errors_in", 0) + n.get("net_errors_out", 0)
+        net_drop = n.get("net_drop_in", 0) + n.get("net_drop_out", 0)
+        if net_err > 10:
+            lignes.append(f"  {nom} NET ERRORS: {net_err:.0f}/s — CRITICAL (>10/s) — target 0")
+        elif net_err > 0:
+            lignes.append(f"  {nom} NET ERRORS: {net_err:.0f}/s — WARNING (>0) — target 0")
+        if net_drop > 0:
+            lignes.append(f"  {nom} NET DROPS: {net_drop:.0f}/s — WARNING — target 0")
+
+        # ── Niveau 3 ─────────────────────────────────────────────────────────
+        temp = n.get("cpu_temp_max_c", 0)
+        if temp >= 85:
+            lignes.append(f"  {nom} CPU TEMP: {temp:.0f}°C — CRITICAL threshold breached (>=85°C) — target <70°C")
+        elif temp >= 75:
+            lignes.append(f"  {nom} CPU TEMP: {temp:.0f}°C — WARNING threshold breached (>=75°C) — NOT yet critical (<85°C) — target <70°C")
+
+        if not n.get("smart_ok", True):
+            reallocated = n.get("smart_reallocated_sectors", 0)
+            uncorr      = n.get("smart_uncorrectable", 0)
+            lignes.append(f"  {nom} SMART: FAIL — reallocated sectors={reallocated} uncorrectable={uncorr} — REPLACE DISK IMMEDIATELY")
+
+        if n.get("zfs_available"):
+            zfs_hit = n.get("zfs_arc_hit_rate", 0)
+            if zfs_hit < 70:
+                lignes.append(f"  {nom} ZFS ARC: hit rate={zfs_hit:.1f}% — CRITICAL (<70%) — increase ARC size — target >90%")
+            elif zfs_hit < 85:
+                lignes.append(f"  {nom} ZFS ARC: hit rate={zfs_hit:.1f}% — WARNING (<85%) — target >90%")
+
+        if not n.get("corosync_ok", True):
+            quorum = "OK" if n.get("corosync_quorum_ok", True) else "LOST"
+            lignes.append(f"  {nom} COROSYNC: DEGRADED — quorum={quorum} — CRITICAL: cluster may stop VMs")
+
     return "\n".join(lignes) if lignes else "  All metrics within normal range"
 
 
@@ -195,13 +246,39 @@ def _construire_prompt_specifique(anomalies: list, etat: dict, lstm: dict) -> st
     for n in etat.get("noeuds", []):
         ram_free  = round(n.get("ram_total_gb", 0) - n.get("ram_used_gb", 0), 1)
         disk_free = round(n.get("disk_total_gb", 0) - n.get("disk_used_gb", 0), 1)
+        # Niveau 1
         noeuds_ctx += (
             f"  {n.get('nom','?')}: CPU={n.get('cpu_pct',0):.1f}% (cores={n.get('cpu_cores',0)}) "
             f"RAM={n.get('ram_pct',0):.1f}% ({n.get('ram_used_gb',0):.1f}/{n.get('ram_total_gb',0):.1f}GB FREE={ram_free}GB) "
             f"DISK={n.get('disk_pct',0):.1f}% ({n.get('disk_used_gb',0):.1f}/{n.get('disk_total_gb',0):.1f}GB FREE={disk_free}GB) "
-            f"SWAP={n.get('swap_pct',0):.1f}% IOWAIT={n.get('cpu_iowait_pct',0):.1f}% "
-            f"LOAD={n.get('load_avg_1m',0):.2f} TEMP={n.get('cpu_temp_max_c',0):.0f}C STATUS={n.get('statut','?')}\n"
+            f"STATUS={n.get('statut','?')}\n"
         )
+        # Niveau 2 — uniquement si valeurs non nulles
+        l2_parts = []
+        if n.get("swap_pct", 0) > 0:
+            l2_parts.append(f"SWAP={n.get('swap_pct',0):.1f}%")
+        if n.get("cpu_iowait_pct", 0) > 0:
+            l2_parts.append(f"IOWAIT={n.get('cpu_iowait_pct',0):.1f}%")
+        if n.get("disk_read_latency_ms", 0) > 0:
+            l2_parts.append(f"READ_LAT={n.get('disk_read_latency_ms',0):.1f}ms WRITE_LAT={n.get('disk_write_latency_ms',0):.1f}ms")
+        if n.get("net_errors_in", 0) > 0 or n.get("net_errors_out", 0) > 0:
+            l2_parts.append(f"NET_ERRORS={n.get('net_errors_in',0)+n.get('net_errors_out',0):.0f}/s")
+        if n.get("load_avg_1m", 0) > 0:
+            l2_parts.append(f"LOAD={n.get('load_avg_1m',0):.2f}")
+        if l2_parts:
+            noeuds_ctx += f"    L2: {' | '.join(l2_parts)}\n"
+        # Niveau 3 — uniquement si valeurs disponibles
+        l3_parts = []
+        if n.get("cpu_temp_max_c", 0) > 0:
+            l3_parts.append(f"TEMP={n.get('cpu_temp_max_c',0):.0f}°C")
+        if not n.get("smart_ok", True):
+            l3_parts.append(f"SMART=FAIL(reallocated={n.get('smart_reallocated_sectors',0)})")
+        if n.get("zfs_available"):
+            l3_parts.append(f"ZFS_ARC={n.get('zfs_arc_hit_rate',0):.0f}%hit")
+        if not n.get("corosync_ok", True):
+            l3_parts.append(f"COROSYNC=DEGRADED(quorum={'OK' if n.get('corosync_quorum_ok',True) else 'LOST'})")
+        if l3_parts:
+            noeuds_ctx += f"    L3: {' | '.join(l3_parts)}\n"
     vms_ctx = "".join(
         f"  VM{v.get('vmid','?')} {v.get('nom','?')} on {v.get('noeud','?')}: "
         f"status={v.get('statut','?')} CPU={v.get('cpu_pct',0):.1f}% RAM={v.get('ram_pct',0):.1f}% maxmem={v.get('maxmem_gb',0):.1f}GB\n"
