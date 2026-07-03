@@ -313,7 +313,7 @@ function RecoCard({ s }) {
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, flex: 1, marginRight: 12 }}>
               <span style={{ fontSize: 16, color: sol.color }}>{sol.icon}</span>
               <div>
-                <div style={{ fontSize: 14, fontWeight: 700, color: C.text, lineHeight: 1.3 }}>{s.title}</div>
+                <div style={{ fontSize: 15, fontWeight: 700, color: C.text, lineHeight: 1.3 }}>{s.title}</div>
                 <div style={{ fontSize: 11, color: C.muted, marginTop: 2, fontFamily: 'JetBrains Mono, monospace' }}>{sol.label} · {node}</div>
               </div>
             </div>
@@ -422,7 +422,7 @@ function RecoCard({ s }) {
                 <div style={{ fontSize: 10, fontWeight: 700, color: C.sub, letterSpacing: '0.08em', marginBottom: 7, fontFamily: 'JetBrains Mono, monospace' }}>IMMEDIATE ACTION — {sol.cmdLabel}</div>
                 <div style={{ background: '#070d18', borderRadius: 7, border: `1px solid ${C.border}`, overflow: 'hidden' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '6px 12px', borderBottom: `1px solid ${C.border}`, background: '#0a1220' }}>
-                    <span style={{ fontSize: 10, color: C.muted, fontFamily: 'JetBrains Mono, monospace' }}>bash · {node}</span>
+                    <span style={{ fontSize: 11, color: C.muted, fontFamily: 'JetBrains Mono, monospace' }}>bash · {node}</span>
                     <CopyButton text={sol.cmd} />
                   </div>
                   <pre style={{ margin: 0, padding: '11px 15px', fontFamily: 'JetBrains Mono, monospace', fontSize: 12, color: '#7dd3fc', whiteSpace: 'pre-wrap', lineHeight: 1.7 }}>
@@ -439,7 +439,7 @@ function RecoCard({ s }) {
                   {sol.steps.map((step, i) => (
                     <div key={i} style={{ display: 'flex', gap: 10, alignItems: 'flex-start' }}>
                       <span style={{ fontSize: 10, fontWeight: 700, color: sol.color, fontFamily: 'JetBrains Mono, monospace', width: 18, flexShrink: 0, paddingTop: 1 }}>{i + 1}.</span>
-                      <span style={{ fontSize: 12, color: C.sub, lineHeight: 1.5, flex: 1 }}>{step}</span>
+                      <span style={{ fontSize: 13, color: C.sub, lineHeight: 1.5, flex: 1 }}>{step}</span>
                     </div>
                   ))}
                 </div>
@@ -473,8 +473,8 @@ export function PageRecommendations({ suggestions }) {
       {/* Header */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end' }}>
         <div>
-          <h2 style={{ fontSize: 18, fontWeight: 700, color: C.text, marginBottom: 4 }}>Remediation Actions</h2>
-          <div style={{ fontSize: 12, color: C.sub }}>
+          <h2 style={{ fontSize: 22, fontWeight: 800, color: C.text, marginBottom: 6 }}>Remediation Actions</h2>
+          <div style={{ fontSize: 13, color: C.sub }}>
             Actionable remediation playbooks · Thresholds aligned with{' '}
             <a href="https://pve.proxmox.com/pve-docs/pve-admin-guide.html" target="_blank" rel="noopener noreferrer" style={{ color: C.blue, textDecoration: 'none' }}>
               Proxmox VE official standards
@@ -494,7 +494,7 @@ export function PageRecommendations({ suggestions }) {
       {suggestions.length === 0 ? (
         <Card style={{ padding: '60px 0', textAlign: 'center' }}>
           <div style={{ fontSize: 38, marginBottom: 14 }}>◈</div>
-          <div style={{ fontSize: 14, color: C.sub, marginBottom: 6 }}>No active recommendations</div>
+          <div style={{ fontSize: 15, color: C.sub, marginBottom: 6 }}>No active recommendations</div>
           <div style={{ fontSize: 12, color: C.muted }}>All resources are within Proxmox VE official thresholds</div>
         </Card>
       ) : (

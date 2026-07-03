@@ -449,26 +449,26 @@ class LSTMAnalyseur:
         print(f"[LSTM] Operationnel immediatement, s'affinera sur les donnees reelles")
 
     def vecteur(self, m: dict) -> np.ndarray:
-        return np.array([
-            m.get("cpu_pct",               0) / 100,
-            m.get("ram_pct",               0) / 100,
-            m.get("disk_pct",              0) / 100,
-            m.get("swap_pct",              0) / 100,
-            m.get("cpu_iowait_pct",        0) / 100,
-            min(m.get("disk_read_iops",    0), 10000) / 10000,
-            min(m.get("disk_write_iops",   0), 10000) / 10000,
-            min(m.get("disk_read_latency_ms",  0), 500) / 500,
-            min(m.get("disk_write_latency_ms", 0), 500) / 500,
-            min(m.get("net_in_mbps",       0), 1000) / 1000,
-            min(m.get("net_out_mbps",      0), 1000) / 1000,
-            min(m.get("net_errors_in",     0) + m.get("net_errors_out", 0), 100) / 100,
-            min(m.get("net_drop_in",       0) + m.get("net_drop_out",   0), 100) / 100,
-            min(m.get("vms_running",       0), 20) / 20,
-            min(m.get("load_avg_1m",       0), 32) / 32,
-            m.get("zfs_arc_hit_rate",      95) / 100,
-            min(m.get("cpu_temp_max_c",    0), 120) / 120,
-            m.get("fd_used_pct",           0) / 100,
-        ], dtype=np.float32)
+      return np.array([
+        (m.get("cpu_pct")               or 0) / 100,
+        (m.get("ram_pct")               or 0) / 100,
+        (m.get("disk_pct")              or 0) / 100,
+        (m.get("swap_pct")              or 0) / 100,
+        (m.get("cpu_iowait_pct")        or 0) / 100,
+        min(m.get("disk_read_iops")    or 0, 10000) / 10000,
+        min(m.get("disk_write_iops")   or 0, 10000) / 10000,
+        min(m.get("disk_read_latency_ms")  or 0, 500) / 500,
+        min(m.get("disk_write_latency_ms") or 0, 500) / 500,
+        min(m.get("net_in_mbps")       or 0, 1000) / 1000,
+        min(m.get("net_out_mbps")      or 0, 1000) / 1000,
+        min((m.get("net_errors_in")    or 0) + (m.get("net_errors_out") or 0), 100) / 100,
+        min((m.get("net_drop_in")      or 0) + (m.get("net_drop_out")   or 0), 100) / 100,
+        min(m.get("vms_running")       or 0, 20) / 20,
+        min(m.get("load_avg_1m")       or 0, 32) / 32,
+        (m.get("zfs_arc_hit_rate")     or 95) / 100,
+        min(m.get("cpu_temp_max_c")    or 0, 120) / 120,
+        (m.get("fd_used_pct")          or 0) / 100,
+    ], dtype=np.float32)
 
     def analyser(self, metriques: dict) -> tuple:
         v = self.vecteur(metriques)

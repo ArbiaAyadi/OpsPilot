@@ -219,7 +219,27 @@ export default function App() {
         const u=[...m]; u[idx]={...u[idx],content:data.content,edited:true}; return u.slice(0,idx+1)
       }); return
     }
-    if (data.type==='historique') { setChatMessages(data.messages.map(m=>({...m,type:m.role==='user'?'question':'reponse'}))); return }
+    if (data.type==='conversation_created') {
+      // Nouvelle conversation — vider les messages immédiatement
+      setChatMessages([])
+      return
+    }
+    if (data.type==='conversation_switched') {
+      // Charger les messages de la conversation sélectionnée
+      const msgs = data.messages || []
+      setChatMessages(msgs.map(m=>({...m, type:m.role==='user'?'question':'reponse'})))
+      return
+    }
+    if (data.type==='conversation_deleted') {
+      // Charger la nouvelle conversation active (vide si nouvelle)
+      const msgs = data.messages || []
+      setChatMessages(msgs.map(m=>({...m, type:m.role==='user'?'question':'reponse'})))
+      return
+    }
+    if (data.type==='historique') {
+      setChatMessages(data.messages.map(m=>({...m,type:m.role==='user'?'question':'reponse'})))
+      return
+    }
     if (data.type==='history_cleared') { setChatMessages([]); return }
   }, [addLog])
 
@@ -270,14 +290,20 @@ export default function App() {
     <div style={{ display:'flex', height:'100vh', background:'#050d1a', color:'#e2e8f0', fontFamily:"'Inter','Segoe UI',sans-serif", overflow:'hidden' }}>
       <style>{`
         *{box-sizing:border-box;margin:0;padding:0}
-        ::-webkit-scrollbar{width:4px;height:4px}
+        html,body{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;text-rendering:optimizeLegibility}
+        ::-webkit-scrollbar{width:5px;height:5px}
         ::-webkit-scrollbar-track{background:transparent}
-        ::-webkit-scrollbar-thumb{background:#1a2d44;border-radius:2px}
+        ::-webkit-scrollbar-thumb{background:#1a2d44;border-radius:3px}
+        ::-webkit-scrollbar-thumb:hover{background:#243650}
         @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
+        @keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+        @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
         textarea{resize:none;outline:none}
         button{font-family:inherit;cursor:pointer;border:none;background:none}
-        .nav-btn:hover { background: rgba(59,130,246,0.08) !important; color: #e2e8f0 !important; }
-        .nav-btn:hover svg { stroke: #3b82f6 !important; }
+        h1,h2,h3{font-weight:800;letter-spacing:-0.02em}
+        .nav-btn:hover{background:rgba(59,130,246,0.10) !important;color:#f1f5f9 !important}
+        .nav-btn:hover svg{stroke:#3b82f6 !important}
+        .nav-btn{transition:all 0.12s}
       `}</style>
 
       {/* ══════════════════════════ SIDEBAR ══════════════════════════ */}
@@ -297,7 +323,7 @@ export default function App() {
             </svg>
             <div>
               <div style={{
-                fontSize: 16,
+                fontSize: 18,
                 fontWeight: 800,
                 letterSpacing: '-0.04em',
                 background: 'linear-gradient(90deg, #60a5fa 0%, #a78bfa 100%)',
@@ -307,7 +333,7 @@ export default function App() {
               }}>
                 OpsPilot
               </div>
-              <div style={{ fontSize:9, color:C_MUTED, letterSpacing:'0.14em', fontFamily:'JetBrains Mono, monospace', marginTop:3 }}>
+              <div style={{ fontSize:10, color:C_MUTED, letterSpacing:'0.14em', fontFamily:'JetBrains Mono, monospace', marginTop:3 }}>
                 CLUSTER INTELLIGENCE
               </div>
             </div>
@@ -316,7 +342,7 @@ export default function App() {
 
         {/* ── Navigation ── */}
         <div style={{ flex:1, padding:'8px 8px', display:'flex', flexDirection:'column', gap:1, overflowY:'auto' }}>
-          <div style={{ fontSize:9, color:C_MUTED, letterSpacing:'0.13em', fontFamily:'JetBrains Mono, monospace', padding:'10px 8px 5px' }}>
+          <div style={{ fontSize:10, color:C_MUTED, letterSpacing:'0.13em', fontFamily:'JetBrains Mono, monospace', padding:'10px 8px 5px' }}>
             NAVIGATION
           </div>
 
@@ -334,7 +360,7 @@ export default function App() {
                   background: active ? 'rgba(59,130,246,0.12)' : 'transparent',
                   border:`1px solid ${active ? 'rgba(59,130,246,0.3)' : 'transparent'}`,
                   color: active ? '#e2e8f0' : C_SUB,
-                  fontSize:13, textAlign:'left', transition:'all 0.12s',
+                  fontSize:14, textAlign:'left', transition:'all 0.12s',
                   width:'100%', justifyContent:'space-between',
                 }}
               >
@@ -361,7 +387,7 @@ export default function App() {
 
         {/* ── Infrastructure Status dynamique ── */}
         <div style={{ padding:'12px 14px 14px', borderTop:`1px solid ${C_BORDER}` }}>
-          <div style={{ fontSize:9, color:C_MUTED, letterSpacing:'0.13em', fontFamily:'JetBrains Mono, monospace', marginBottom:9 }}>
+          <div style={{ fontSize:10, color:C_MUTED, letterSpacing:'0.13em', fontFamily:'JetBrains Mono, monospace', marginBottom:9 }}>
             INFRASTRUCTURE STATUS
           </div>
 
@@ -377,10 +403,10 @@ export default function App() {
             allAssets.map(({ label, type, online }) => (
               <div key={label} style={{ display:'flex', alignItems:'center', gap:8, marginBottom:6 }}>
                 <div style={{ width:7, height:7, borderRadius:'50%', flexShrink:0, background: online ? C_GREEN : C_RED }}/>
-                <span style={{ fontSize:11, color: online ? C_SUB : C_MUTED, fontFamily:'JetBrains Mono, monospace', flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
+                <span style={{ fontSize:12, color: online ? C_SUB : C_MUTED, fontFamily:'JetBrains Mono, monospace', flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
                   {label}
                 </span>
-                <span style={{ fontSize:9, color:C_MUTED, fontFamily:'JetBrains Mono, monospace', flexShrink:0 }}>
+                <span style={{ fontSize:10, color:C_MUTED, fontFamily:'JetBrains Mono, monospace', flexShrink:0 }}>
                   {type}
                 </span>
               </div>
@@ -388,7 +414,7 @@ export default function App() {
           )}
 
           {/* Connexion + uptime */}
-          <div style={{ marginTop:10, paddingTop:10, borderTop:`1px solid ${C_BORDER}`, display:'flex', justifyContent:'space-between', alignItems:'center', fontSize:10, color:C_MUTED, fontFamily:'JetBrains Mono, monospace' }}>
+          <div style={{ marginTop:10, paddingTop:10, borderTop:`1px solid ${C_BORDER}`, display:'flex', justifyContent:'space-between', alignItems:'center', fontSize:11, color:C_MUTED, fontFamily:'JetBrains Mono, monospace' }}>
             <div style={{ display:'flex', alignItems:'center', gap:5 }}>
               <div style={{ width:6, height:6, borderRadius:'50%', background: connected ? C_GREEN : C_YELLOW, animation: connected ? 'none' : 'pulse 1.5s infinite' }}/>
               <span style={{ color: connected ? C_GREEN : C_YELLOW }}>{connected ? 'Live' : 'Reconnecting'}</span>
@@ -406,8 +432,8 @@ export default function App() {
           <div style={{ display:'flex', alignItems:'center', gap:10 }}>
             {Icons[currentPage?.icon]?.(true, C_BLUE)}
             <div>
-              <span style={{ fontWeight:700, fontSize:15, color:'#e2e8f0' }}>{currentPage?.label}</span>
-              <span style={{ fontSize:11, color:C_MUTED, marginLeft:10 }}>{currentPage?.desc}</span>
+              <span style={{ fontWeight:800, fontSize:16, color:'#f1f5f9' }}>{currentPage?.label}</span>
+              <span style={{ fontSize:12, color:C_MUTED, marginLeft:10 }}>{currentPage?.desc}</span>
             </div>
           </div>
           <div style={{ display:'flex', alignItems:'center', gap:14 }}>
@@ -438,7 +464,7 @@ export default function App() {
           {page==='rules'           && <PageMonitoringRules reglesDynamiques={reglesDyn}/>}
           {page==='recommendations' && <PageRecommendations suggestions={suggestions}/>}
           {page==='log'             && <PageSystemLog       agentLog={agentLog}/>}
-          {page==='assistant'       && <PageAssistant messages={chatMessages} thinking={thinking} input={chatInput} setInput={setChatInput} onSend={sendChat} onEdit={editChat} onClear={clearChat} connected={connected}/>}
+          {page==='assistant'       && <PageAssistant messages={chatMessages} thinking={thinking} input={chatInput} setInput={setChatInput} onSend={sendChat} onEdit={editChat} onClear={clearChat} connected={connected} send={send}/>}
         </main>
       </div>
 

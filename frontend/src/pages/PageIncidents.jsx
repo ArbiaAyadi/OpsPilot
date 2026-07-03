@@ -146,7 +146,7 @@ function MdTable({ text }) {
         <thead>
           <tr style={{ background:'#040d1a' }}>
             {headers.map((h,i) => (
-              <th key={i} style={{ padding:'8px 14px', textAlign:'left', color:'#64748b', fontSize:10, fontWeight:700, letterSpacing:'0.08em', fontFamily:'JetBrains Mono,monospace', borderBottom:`1px solid ${C.border}` }}>{h}</th>
+              <th key={i} style={{ padding:'8px 14px', textAlign:'left', color:'#64748b', fontSize:11, fontWeight:700, letterSpacing:'0.08em', fontFamily:'JetBrains Mono,monospace', borderBottom:`1px solid ${C.border}` }}>{h}</th>
             ))}
           </tr>
         </thead>
@@ -234,7 +234,7 @@ function ReportViewer({ content, reportName }) {
             <span style={{ padding:'4px 14px', borderRadius:20, fontSize:11, fontWeight:800, letterSpacing:'0.08em', background:sevColor+'20', border:`1px solid ${sevColor}50`, color:sevColor }}>
               {SEV_ICON[severity]} {severity}
             </span>
-            <span style={{ fontSize:10, color:C.muted, fontFamily:'JetBrains Mono,monospace' }}>AI Score: {aiScore}</span>
+            <span style={{ fontSize:11, color:C.muted, fontFamily:'JetBrains Mono,monospace' }}>AI Score: {aiScore}</span>
           </div>
         </div>
         <div style={{ display:'flex', gap:20, fontSize:11, color:C.muted, fontFamily:'JetBrains Mono,monospace', flexWrap:'wrap' }}>
@@ -275,19 +275,19 @@ function ReportViewer({ content, reportName }) {
                 <div style={{ display:'flex', flexDirection:'column', gap:12 }}>
                   {anomContent.crit && anomContent.crit !== '_None_' && (
                     <div style={{ background:'#ef444410', border:'1px solid #ef444430', borderRadius:8, padding:'10px 14px' }}>
-                      <div style={{ fontSize:10, fontWeight:700, color:C.red, marginBottom:8, fontFamily:'JetBrains Mono,monospace', letterSpacing:'0.1em' }}>● CRITICAL</div>
+                      <div style={{ fontSize:11, fontWeight:700, color:C.red, marginBottom:8, fontFamily:'JetBrains Mono,monospace', letterSpacing:'0.1em' }}>● CRITICAL</div>
                       <TextBlock text={anomContent.crit} color={C.sub}/>
                     </div>
                   )}
                   {anomContent.high && anomContent.high !== '_None_' && (
                     <div style={{ background:'#f9731610', border:'1px solid #f9731630', borderRadius:8, padding:'10px 14px' }}>
-                      <div style={{ fontSize:10, fontWeight:700, color:C.orange, marginBottom:8, fontFamily:'JetBrains Mono,monospace', letterSpacing:'0.1em' }}>● HIGH</div>
+                      <div style={{ fontSize:11, fontWeight:700, color:C.orange, marginBottom:8, fontFamily:'JetBrains Mono,monospace', letterSpacing:'0.1em' }}>● HIGH</div>
                       <TextBlock text={anomContent.high} color={C.sub}/>
                     </div>
                   )}
                   {anomContent.mon && anomContent.mon !== '_None_' && (
                     <div style={{ background:'#eab30810', border:'1px solid #eab30830', borderRadius:8, padding:'10px 14px' }}>
-                      <div style={{ fontSize:10, fontWeight:700, color:C.yellow, marginBottom:8, fontFamily:'JetBrains Mono,monospace', letterSpacing:'0.1em' }}>● MONITORING</div>
+                      <div style={{ fontSize:11, fontWeight:700, color:C.yellow, marginBottom:8, fontFamily:'JetBrains Mono,monospace', letterSpacing:'0.1em' }}>● MONITORING</div>
                       <TextBlock text={anomContent.mon} color={C.sub}/>
                     </div>
                   )}
@@ -354,8 +354,8 @@ export function PageIncidents({ incidents }) {
     <div style={{ display:'flex', flexDirection:'column', gap:16 }}>
       <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start' }}>
         <div>
-          <h2 style={{ fontSize:18, fontWeight:700, color:C.text, marginBottom:4 }}>Incident Management</h2>
-          <div style={{ fontSize:12, color:C.sub }}>AI-detected infrastructure events · Click any incident to view analysis</div>
+          <h2 style={{ fontSize:22, fontWeight:800, color:C.text, marginBottom:6 }}>Incident Management</h2>
+          <div style={{ fontSize:13, color:C.sub }}>AI-detected infrastructure events · Click any incident to view analysis</div>
         </div>
         <div style={{ display:'flex', gap:8 }}>
           {critCount > 0 && <Chip label={`${critCount} CRITICAL`}  color={C.red}/>}
@@ -403,7 +403,7 @@ export function PageIncidents({ incidents }) {
                     <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', gap:8, marginBottom:6 }}>
                       <div style={{ display:'flex', gap:8, alignItems:'flex-start', flex:1 }}>
                         <span style={{ fontSize:12, flexShrink:0, marginTop:2 }}>{SEV_ICON[sev]||'⚪'}</span>
-                        <span style={{ fontSize:13, color:C.text, fontWeight:600, lineHeight:1.4 }}>{inc.message||'Anomaly detected'}</span>
+                        <span style={{ fontSize:14, color:C.text, fontWeight:700, lineHeight:1.4 }}>{inc.message||'Anomaly detected'}</span>
                       </div>
                       <Chip label={sev} color={sevColor}/>
                     </div>
@@ -423,7 +423,7 @@ export function PageIncidents({ incidents }) {
                   <Card style={{ padding:'18px 20px', borderLeft:`3px solid ${severityColor(getSeverity(selected))}` }}>
                     <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:14 }}>
                       <div>
-                        <div style={{ fontSize:14, fontWeight:700, color:C.text, marginBottom:3 }}>Incident Details</div>
+                        <div style={{ fontSize:15, fontWeight:700, color:C.text, marginBottom:3 }}>Incident Details</div>
                         <div style={{ fontSize:11, color:C.muted, fontFamily:'JetBrains Mono,monospace' }}>
                           {selected.timestamp?.slice(0,19).replace('T',' ')}
                           {selected.score > 0 && <span style={{ marginLeft:12, color:C.purple }}>AI {selected.score?.toFixed(4)}</span>}
@@ -442,7 +442,7 @@ export function PageIncidents({ incidents }) {
                     )}
                     {recoText && (
                       <div style={{ marginTop:14, background:'#0a1a0e', border:`1px solid ${C.green}25`, borderRadius:8, padding:'12px 14px' }}>
-                        <div style={{ fontSize:10, fontWeight:700, color:C.green, letterSpacing:'0.1em', marginBottom:8, fontFamily:'JetBrains Mono,monospace' }}>
+                        <div style={{ fontSize:11, fontWeight:700, color:C.green, letterSpacing:'0.1em', marginBottom:8, fontFamily:'JetBrains Mono,monospace' }}>
                           RECOMMENDED ACTION
                         </div>
                         <MixedContent text={recoText}/>
@@ -456,7 +456,7 @@ export function PageIncidents({ incidents }) {
                     <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
                       <div>
                         <div style={{ fontSize:12, fontWeight:600, color:C.yellow, marginBottom:3 }}>📄 Full Incident Report</div>
-                        <div style={{ fontSize:10, color:C.muted, fontFamily:'JetBrains Mono,monospace' }}>{selected.rapport}</div>
+                        <div style={{ fontSize:11, color:C.muted, fontFamily:'JetBrains Mono,monospace' }}>{selected.rapport}</div>
                       </div>
                       <button onClick={()=>reportOpen?closeReport():openReport(selected.rapport)}
                         style={{ padding:'7px 16px', borderRadius:7, fontSize:12, fontWeight:600, fontFamily:'JetBrains Mono,monospace', cursor:'pointer', border:`1px solid ${C.yellow}60`, background:reportOpen?C.yellow+'20':C.bg, color:C.yellow, transition:'all 0.15s', flexShrink:0 }}>

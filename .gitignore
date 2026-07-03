@@ -53,3 +53,23 @@ Thumbs.db
 *.pkl
 *.joblib
 models/
+
+# Données conversations (privées + pollués par les tests)
+conversations.json
+
+# Modèle LSTM PyTorch (trop lourd + régénéré automatiquement)
+*.pt
+lstm_ae_model.pt
+
+# Résultats de tests
+.coverage
+resultats.txt
+htmlcov/
+coverage.xml
+
+# Backup pytest créé par conftest.py
+*.pytest_backup
+
+# Fichiers temporaires Windows
+*.tmp
+desktop.ini

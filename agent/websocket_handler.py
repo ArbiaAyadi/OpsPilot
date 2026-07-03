@@ -5,7 +5,8 @@ from fastapi import WebSocket, WebSocketDisconnect
 
 from agent.chat_history import (
     ajouter_message, editer_message, get_messages_llm,
-    vider_historique, get_historique_complet, charger_depuis_db, next_id
+    vider_historique, get_historique_complet, charger_depuis_db, next_id,
+    nouvelle_conversation, changer_conversation, supprimer_conversation, lister_conversations
 )
 from agent.groq_client  import appeler_groq, GROQ_MODEL, GROQ_OK
 from agent.prompts      import system_prompt_chat
@@ -65,6 +66,8 @@ def _verifier_ressources_vm(question: str, etat: dict) -> str | None:
     mots_vm       = ['vm', 'virtual machine', 'machine virtuelle', 'container',
                      'lxc', 'conteneur', 'instance', 'nœud', 'node']
 
+    mots_lxc      = ['lxc', 'conteneur', 'container', 'ct']
+    is_lxc      = any(m in q for m in mots_lxc)
     is_creation = any(m in q for m in mots_creation) and any(m in q for m in mots_vm)
     if not is_creation:
         return None
@@ -80,8 +83,9 @@ def _verifier_ressources_vm(question: str, etat: dict) -> str | None:
         return None
 
     lang        = _detecter_langue(question)
-    RAM_MIN_GB  = 1.0
-    DISK_MIN_GB = 10.0
+    # LXC beaucoup plus léger qu'une VM — minimums différents
+    RAM_MIN_GB  = 0.25 if is_lxc else 1.0   # 256MB pour LXC, 1GB pour VM
+    DISK_MIN_GB = 5.0  if is_lxc else 10.0  # 5GB pour LXC, 10GB pour VM
 
     for n in noeuds_mentionnes:
         nom    = n.get("nom", "?")
@@ -139,12 +143,87 @@ def _verifier_ressources_vm(question: str, etat: dict) -> str | None:
     return None
 
 
+import re as _re
+
+def _corriger_reponse_llm(reponse: str, next_vmid: int) -> str:
+    """
+    Corrige les erreurs systématiques du LLM llama-3.1-8b-instant.
+    Appliqué après chaque réponse avant envoi au frontend.
+    """
+    import re as _re2
+
+    # Plancher VMID — pve2 OFFLINE cache linux-vm2 (103)
+    # On force un minimum de 104 pour ne jamais suggérer 101/102/103
+    if next_vmid <= 103:
+        next_vmid = 104
+
+    # 1. Corriger pct create <vmid> → pct create <next_vmid>
+    reponse = _re2.sub(
+        r'(pct create\s+)\d+',
+        lambda m: f"{m.group(1)}{next_vmid}",
+        reponse
+    )
+
+    # 2. Corriger pct start <vmid> → pct start <next_vmid>
+    reponse = _re2.sub(
+        r'(pct start\s+)\d+',
+        lambda m: f"{m.group(1)}{next_vmid}",
+        reponse
+    )
+
+    # 3. Corriger --hostname avec mauvais VMID
+    reponse = _re2.sub(
+        r'(--hostname\s+\S*?)\d+\b',
+        lambda m: m.group(0).rsplit(
+            m.group(0).rstrip().split()[-1].lstrip('abcdefghijklmnopqrstuvwxyz-_'), 1
+        )[0] + str(next_vmid),
+        reponse
+    )
+
+    # 4. Supprimer --disk dans pct create (paramètre invalide)
+    reponse = _re2.sub(r'\s*--disk\s+\S+', '', reponse)
+
+    # 5. Corriger --cpu X → --cores X
+    reponse = _re2.sub(r'--cpu\s+(\d+)', r'--cores \1', reponse)
+
+    # 6. Corriger --net0 vmbr0 seul → --net0 name=eth0,bridge=vmbr0,ip=dhcp
+    reponse = _re2.sub(
+        r'--net0\s+(?!name=)(\w+)',
+        r'--net0 name=eth0,bridge=\1,ip=dhcp',
+        reponse
+    )
+
+    # 7. Supprimer --template X (invalide pour pct create)
+    reponse = _re2.sub(r'\s*--template\s+\S+', '', reponse)
+
+    # 8. Corriger qm set sur VMIDs inexistants
+    reponse = _re2.sub(
+        r'qm set\s+(?!101\b)(\d{3,})',
+        'qm set 101',
+        reponse
+    )
+
+    # 9. Corriger pveam download avec template invalide
+    reponse = _re2.sub(
+        r'pveam download local\s+(?!debian-12)(\S+)',
+        'pveam download local debian-12-standard_12.7-1_amd64.tar.zst',
+        reponse
+    )
+
+    # 10. Corriger --rootfs local-lvm:1 → minimum 2GB
+    reponse = _re2.sub(
+        r'(--rootfs\s+\S+:)([01])(\s|$)',
+        r'\g<1>2\3',
+        reponse
+    )
+
+    return reponse
+
+
 async def repondre_question(question: str, msg_id_edition: str = None) -> tuple:
     """
-    Appelle le LLM avec contexte complet :
-    - Vérification ressources (sans appel LLM si refus)
-    - Etat cluster Proxmox niveaux 1+2+3
-    - Ressources PC hôte Windows (metriques_pc_hote.py)
+    Appelle le LLM avec contexte complet puis corrige les erreurs
+    systématiques du modèle avant de retourner la réponse.
     """
     etat    = surveillance.dernier_etat
     pc_hote = _get_pc_hote()
@@ -155,13 +234,27 @@ async def repondre_question(question: str, msg_id_edition: str = None) -> tuple:
         msg = ajouter_message("assistant", refus)
         return refus, msg["id"]
 
-    system = system_prompt_chat(etat, surveillance.dernier_lstm, pc_hote)
-    msgs   = get_messages_llm(jusqu_a_id=msg_id_edition) if msg_id_edition else get_messages_llm()
+    system = system_prompt_chat(etat, surveillance.dernier_lstm, pc_hote, question)
+    # Limiter à 10 messages — évite les prompts trop longs qui ralentissent Groq
+    msgs_all = get_messages_llm(jusqu_a_id=msg_id_edition) if msg_id_edition else get_messages_llm()
+    msgs = msgs_all[-10:] if len(msgs_all) > 10 else msgs_all
+
+    # Calculer next_vmid depuis l'état en mémoire — JAMAIS appeler get_etat_cluster()
+    vmids_connus = [
+        int(v.get("vmid", 0))
+        for v in (etat or {}).get("vms", [])
+        if str(v.get("vmid","")).isdigit()
+    ]
+    next_vmid = max(vmids_connus) + 1 if vmids_connus else 104
 
     loop    = asyncio.get_event_loop()
     reponse = await loop.run_in_executor(
         None, lambda: appeler_groq(system, msgs, question, max_tokens=1200)
     )
+
+    # Corriger les erreurs systématiques du LLM
+    reponse = _corriger_reponse_llm(reponse, next_vmid)
+
     msg = ajouter_message("assistant", reponse)
     return reponse, msg["id"]
 
@@ -179,21 +272,8 @@ async def handle_connection(ws: WebSocket):
         "content":   "connected",
     })
 
-    if not get_historique_complet():
-        try:
-            from database import get_chat_history
-            hist_db = get_chat_history(limit=50)
-            if hist_db:
-                charger_depuis_db(hist_db)
-        except Exception:
-            pass
-
-    if get_historique_complet():
-        await ws.send_json({
-            "type":      "historique",
-            "messages":  get_historique_complet()[-50:],
-            "timestamp": datetime.now().isoformat(),
-        })
+    # Pas de restauration automatique au démarrage
+    # L'utilisateur voit l'écran d'accueil et choisit dans la sidebar
 
     if surveillance.dernier_etat:
         await ws.send_json({
@@ -269,6 +349,38 @@ async def handle_connection(ws: WebSocket):
                     "lstm":      surveillance.dernier_lstm,
                     "llm":       "groq",
                     "model":     GROQ_MODEL,
+                })
+
+            elif msg_type == "new_conversation":
+                conv_id = nouvelle_conversation()
+                await ws.send_json({
+                    "type":          "conversation_created",
+                    "conv_id":       conv_id,
+                    "messages":      [],
+                    "conversations": lister_conversations(),
+                    "timestamp":     datetime.now().isoformat(),
+                })
+
+            elif msg_type == "switch_conversation":
+                conv_id = data.get("conv_id", "")
+                ok = changer_conversation(conv_id)
+                if ok:
+                    await ws.send_json({
+                        "type":          "conversation_switched",
+                        "conv_id":       conv_id,
+                        "messages":      get_historique_complet(),
+                        "conversations": lister_conversations(),
+                        "timestamp":     datetime.now().isoformat(),
+                    })
+
+            elif msg_type == "delete_conversation":
+                conv_id = data.get("conv_id", "")
+                supprimer_conversation(conv_id)
+                await ws.send_json({
+                    "type":          "conversation_deleted",
+                    "messages":      get_historique_complet(),
+                    "conversations": lister_conversations(),
+                    "timestamp":     datetime.now().isoformat(),
                 })
 
             elif msg_type == "clear_history":

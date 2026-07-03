@@ -32,7 +32,7 @@ function MiniBar({ value = 0, warn = 75, crit = 90 }) {
       <div style={{ width: 60, height: 3, background: C.border, borderRadius: 2 }}>
         <div style={{ width: `${Math.min(100, value)}%`, height: '100%', background: color, borderRadius: 2, transition: 'width 0.7s ease' }}/>
       </div>
-      <span style={{ fontSize: 11, color, fontFamily: 'JetBrains Mono, monospace', fontWeight: 700, minWidth: 36 }}>{value?.toFixed(1)}%</span>
+      <span style={{ fontSize: 12, color, fontFamily: 'JetBrains Mono, monospace', fontWeight: 700, minWidth: 40 }}>{value?.toFixed(1)}%</span>
     </div>
   )
 }
@@ -52,8 +52,8 @@ function NodeSummaryCard({ n }) {
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <OnlineDot online={isOnline}/>
           <div>
-            <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{n.nom}</div>
-            <div style={{ fontSize: 10, color: C.muted, fontFamily: 'JetBrains Mono, monospace' }}>
+            <div style={{ fontSize: 14, fontWeight: 800, color: C.text }}>{n.nom}</div>
+            <div style={{ fontSize: 12, color: C.muted, fontFamily: 'JetBrains Mono, monospace' }}>
               {n.cpu_cores || '?'} cores · {n.ram_total_gb || 0} GB RAM
               {n.uptime_h > 0 && ` · up ${fmtUptime(n.uptime_h)}`}
             </div>
@@ -67,13 +67,13 @@ function NodeSummaryCard({ n }) {
         </div>
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 11, color: C.sub }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 12, color: C.sub }}>
             <span>CPU</span><MiniBar value={n.cpu_pct} warn={65} crit={80}/>
           </div>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 11, color: C.sub }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 12, color: C.sub }}>
             <span>RAM</span><MiniBar value={n.ram_pct} warn={75} crit={85}/>
           </div>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 11, color: C.sub }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 12, color: C.sub }}>
             <span>Disk</span><MiniBar value={n.disk_pct} warn={80} crit={90}/>
           </div>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 3 }}>
@@ -153,8 +153,8 @@ export function PageDashboard({
       <div style={{ background: healthColor + '0d', border: `1px solid ${healthColor}30`, borderRadius: 10, padding: '12px 20px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
           <OnlineDot online={health === 'OPERATIONAL'}/>
-          <span style={{ fontWeight: 700, color: healthColor, fontSize: 14 }}>System Status: {health}</span>
-          <span style={{ color: C.sub, fontSize: 12 }}>Last check: {new Date().toLocaleTimeString('fr-FR')}</span>
+          <span style={{ fontWeight: 800, color: healthColor, fontSize: 15 }}>System Status: {health}</span>
+          <span style={{ color: C.sub, fontSize: 13 }}>Last check: {new Date().toLocaleTimeString('fr-FR')}</span>
         </div>
         <div style={{ display: 'flex', gap: 16, fontSize: 11, color: C.sub, fontFamily: 'JetBrains Mono, monospace', alignItems: 'center' }}>
           {clusterUptimeH > 0 && <span>↑ {fmtUptime(clusterUptimeH)}</span>}
@@ -180,9 +180,9 @@ export function PageDashboard({
           { label: 'Open Incidents',    value: incidents.length, color: incidents.length ? C.red : C.green, sub: `${critAlertes.length} critical` },
         ].map(({ label, value, color, sub }) => (
           <Card key={label} glow={color !== C.green && color !== C.muted ? color : undefined} style={{ padding: '16px 18px' }}>
-            <div style={{ fontSize: 10, color: C.muted, fontFamily: 'JetBrains Mono, monospace', letterSpacing: '0.1em', marginBottom: 8 }}>{label.toUpperCase()}</div>
-            <div style={{ fontSize: 26, fontWeight: 800, color, fontFamily: 'JetBrains Mono, monospace', marginBottom: 4 }}>{value}</div>
-            <div style={{ fontSize: 11, color: C.sub }}>{sub}</div>
+            <div style={{ fontSize: 12, color: C.muted, fontFamily: 'JetBrains Mono, monospace', letterSpacing: '0.1em', marginBottom: 8 }}>{label.toUpperCase()}</div>
+            <div style={{ fontSize: 28, fontWeight: 800, color, fontFamily: 'JetBrains Mono, monospace', marginBottom: 4 }}>{value}</div>
+            <div style={{ fontSize: 12, color: C.sub }}>{sub}</div>
           </Card>
         ))}
       </div>
@@ -195,7 +195,7 @@ export function PageDashboard({
             <div style={{ fontWeight: 700, color: C.red, fontSize: 13 }}>
               {!quorumOk ? 'CLUSTER QUORUM LOST — VMs may shut down automatically' : 'Corosync degraded — cluster communication impaired'}
             </div>
-            <div style={{ fontSize: 11, color: C.muted, fontFamily: 'JetBrains Mono, monospace', marginTop: 3 }}>
+            <div style={{ fontSize: 12, color: C.muted, fontFamily: 'JetBrains Mono, monospace', marginTop: 3 }}>
               Run: pvecm status · corosync-cfgtool -s · journalctl -u corosync
             </div>
           </div>
@@ -207,7 +207,7 @@ export function PageDashboard({
         <Card style={{ padding: '12px 16px', display: 'flex', alignItems: 'center', gap: 12 }}>
           <div style={{ width: 8, height: 8, borderRadius: '50%', background: clusterOk ? C.green : C.red, flexShrink: 0 }}/>
           <div>
-            <div style={{ fontSize: 10, color: C.muted, fontFamily: 'JetBrains Mono, monospace', letterSpacing: '0.08em', marginBottom: 2 }}>COROSYNC / QUORUM</div>
+            <div style={{ fontSize: 12, color: C.muted, fontFamily: 'JetBrains Mono, monospace', letterSpacing: '0.08em', marginBottom: 2 }}>COROSYNC / QUORUM</div>
             <div style={{ fontSize: 13, fontWeight: 700, color: clusterOk ? C.green : C.red }}>
               {clusterOk ? 'Healthy' : !quorumOk ? 'QUORUM LOST' : 'Degraded'}
             </div>
@@ -217,9 +217,9 @@ export function PageDashboard({
         <Card style={{ padding: '12px 16px', display: 'flex', alignItems: 'center', gap: 12 }}>
           <div style={{ width: 8, height: 8, borderRadius: '50%', background: aiColor, flexShrink: 0 }}/>
           <div style={{ flex: 1 }}>
-            <div style={{ fontSize: 10, color: C.muted, fontFamily: 'JetBrains Mono, monospace', letterSpacing: '0.08em', marginBottom: 2 }}>AI ANOMALY SCORE</div>
+            <div style={{ fontSize: 12, color: C.muted, fontFamily: 'JetBrains Mono, monospace', letterSpacing: '0.08em', marginBottom: 2 }}>AI ANOMALY SCORE</div>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
-              <div style={{ fontSize: 13, fontWeight: 700, color: aiColor }}>{aiLabel}</div>
+              <div style={{ fontSize: 14, fontWeight: 700, color: aiColor }}>{aiLabel}</div>
               <div style={{ fontSize: 16, fontWeight: 800, color: aiColor, fontFamily: 'JetBrains Mono, monospace' }}>{(aiScore * 100).toFixed(0)}%</div>
             </div>
             <div style={{ height: 2, background: C.border, borderRadius: 1, marginTop: 6 }}>
@@ -230,8 +230,8 @@ export function PageDashboard({
         <Card style={{ padding: '12px 16px', display: 'flex', alignItems: 'center', gap: 12 }}>
           <div style={{ width: 8, height: 8, borderRadius: '50%', background: C.blue, flexShrink: 0 }}/>
           <div>
-            <div style={{ fontSize: 10, color: C.muted, fontFamily: 'JetBrains Mono, monospace', letterSpacing: '0.08em', marginBottom: 2 }}>CLUSTER UPTIME</div>
-            <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{clusterUptimeH > 0 ? fmtUptime(clusterUptimeH) : '—'}</div>
+            <div style={{ fontSize: 12, color: C.muted, fontFamily: 'JetBrains Mono, monospace', letterSpacing: '0.08em', marginBottom: 2 }}>CLUSTER UPTIME</div>
+            <div style={{ fontSize: 14, fontWeight: 800, color: C.text }}>{clusterUptimeH > 0 ? fmtUptime(clusterUptimeH) : '—'}</div>
             <div style={{ fontSize: 10, color: C.muted }}>{noeudsActifs.length > 0 ? 'longest running node' : 'no active nodes'}</div>
           </div>
         </Card>
@@ -244,7 +244,7 @@ export function PageDashboard({
           <div style={{ display: 'flex', gap: 4, background: C.bg, borderRadius: 7, padding: 3 }}>
             {['cluster', ...noeuds.map(n => n.nom)].map(scope => (
               <button key={scope} onClick={() => setChartScope(scope)}
-                style={{ padding: '4px 11px', borderRadius: 5, fontSize: 11, fontFamily: 'JetBrains Mono, monospace', fontWeight: 600, border: 'none', cursor: 'pointer', background: chartScope === scope ? C.blue : 'transparent', color: chartScope === scope ? '#fff' : C.sub, transition: 'all 0.15s' }}>
+                style={{ padding: '4px 11px', borderRadius: 5, fontSize: 12, fontFamily: 'JetBrains Mono, monospace', fontWeight: 700, border: 'none', cursor: 'pointer', background: chartScope === scope ? C.blue : 'transparent', color: chartScope === scope ? '#fff' : C.sub, transition: 'all 0.15s' }}>
                 {scope === 'cluster' ? 'Cluster' : scope}
               </button>
             ))}
@@ -279,7 +279,7 @@ export function PageDashboard({
         <div style={{ display: 'grid', gridTemplateColumns: `repeat(${Math.min(noeuds.length, 3)}, 1fr)`, gap: 12 }}>
           {noeuds.map((n, i) => <NodeSummaryCard key={i} n={n}/>)}
         </div>
-        <div style={{ fontSize: 11, color: C.muted, marginTop: 8, display: 'flex', alignItems: 'center', gap: 6 }}>
+        <div style={{ fontSize: 12, color: C.muted, marginTop: 8, display: 'flex', alignItems: 'center', gap: 6 }}>
           <span style={{ color: C.borderHi }}>▸</span>
           <span>Detailed per-node metrics available in the</span>
           <span style={{ color: C.blue, fontWeight: 600, fontFamily: 'JetBrains Mono, monospace', fontSize: 11 }}>Infrastructure</span>
@@ -300,8 +300,8 @@ export function PageDashboard({
                 <div key={i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '9px 14px', borderRadius: 8, background: C.bg, border: `1px solid ${C.border}`, opacity: running ? 1 : 0.65 }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                     <OnlineDot online={running}/>
-                    <span style={{ fontSize: 13, color: C.text, fontWeight: 600 }}>{v.nom}</span>
-                    <span style={{ fontSize: 11, color: C.muted, fontFamily: 'JetBrains Mono, monospace' }}>VMID {v.vmid} · {v.noeud}</span>
+                    <span style={{ fontSize: 14, color: C.text, fontWeight: 700 }}>{v.nom}</span>
+                    <span style={{ fontSize: 12, color: C.muted, fontFamily: 'JetBrains Mono, monospace' }}>VMID {v.vmid} · {v.noeud}</span>
                   </div>
                   <div style={{ display: 'flex', gap: 14, alignItems: 'center', fontSize: 11, fontFamily: 'JetBrains Mono, monospace' }}>
                     {running ? (
@@ -330,7 +330,7 @@ export function PageDashboard({
               <div key={i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: C.bg, borderRadius: 8, padding: '10px 14px', border: `1px solid ${severityColor(a.niveau)}25` }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                   <span style={{ width: 6, height: 6, borderRadius: '50%', background: severityColor(a.niveau), flexShrink: 0 }}/>
-                  <span style={{ fontSize: 13, color: C.text }}>{a.message}</span>
+                  <span style={{ fontSize: 14, color: C.text }}>{a.message}</span>
                 </div>
                 <Chip label={normalizeSeverity(a.niveau)} color={severityColor(a.niveau)}/>
               </div>

@@ -96,8 +96,8 @@ export function PageMonitoringRules({ reglesDynamiques = [] }) {
     return (
       <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
         <div style={{ display:'flex', alignItems:'center', gap:8, padding:'8px 0 4px' }}>
-          <div style={{ width:8, height:8, borderRadius:'50%', background:color, flexShrink:0 }}/>
-          <span style={{ fontSize:10, fontWeight:700, letterSpacing:'0.12em', color, fontFamily:'JetBrains Mono,monospace' }}>
+          <div style={{ width:9, height:9, borderRadius:'50%', background:color, flexShrink:0 }}/>
+          <span style={{ fontSize:11, fontWeight:800, letterSpacing:'0.12em', color, fontFamily:'JetBrains Mono,monospace' }}>
             {title} — {rules.length} RULE{rules.length>1?'S':''}
           </span>
           <div style={{ flex:1, height:1, background:color+'25' }}/>
@@ -114,19 +114,23 @@ export function PageMonitoringRules({ reglesDynamiques = [] }) {
     <div style={{ display:'flex', flexDirection:'column', gap:16 }}>
       <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start' }}>
         <div>
-          <h2 style={{ fontSize:18, fontWeight:700, color:C.text, marginBottom:4 }}>Monitoring Rules</h2>
-          <div style={{ fontSize:12, color:C.sub }}>
+          {/* ← SEUL CHANGEMENT : 18→22, 700→800 */}
+          <h2 style={{ fontSize:22, fontWeight:800, color:C.text, marginBottom:6 }}>Monitoring Rules</h2>
+          {/* ← SEUL CHANGEMENT : 12→13 */}
+          <div style={{ fontSize:13, color:C.sub }}>
             {isAI ? `${regles.length} AI-generated rules · click to expand` : `${regles.length} rules from Proxmox official docs · click to expand`}
           </div>
         </div>
         <div style={{ display:'flex', gap:10, alignItems:'center' }}>
-          <div style={{ display:'flex', gap:10, fontSize:11, fontFamily:'JetBrains Mono,monospace' }}>
+          {/* ← SEUL CHANGEMENT : 11→12 */}
+          <div style={{ display:'flex', gap:10, fontSize:12, fontFamily:'JetBrains Mono,monospace', fontWeight:600 }}>
             <span style={{ color:'#ef4444' }}>{crit.length} critical</span>
             <span style={{ color:'#f97316' }}>{high.length} high</span>
             <span style={{ color:'#eab308' }}>{mon.length} monitoring</span>
           </div>
+          {/* ← SEUL CHANGEMENT : 11→12 */}
           <button onClick={regenerer} disabled={regenerating}
-            style={{ display:'flex', alignItems:'center', gap:6, padding:'6px 14px', borderRadius:7, border:`1px solid ${C.borderHi}`, background:regenerated?'#22c55e18':C.card, color:regenerated?'#22c55e':C.sub, cursor:'pointer', fontSize:11, fontFamily:'JetBrains Mono,monospace', transition:'all 0.2s' }}
+            style={{ display:'flex', alignItems:'center', gap:6, padding:'7px 16px', borderRadius:7, border:`1px solid ${C.borderHi}`, background:regenerated?'#22c55e18':C.card, color:regenerated?'#22c55e':C.sub, cursor:'pointer', fontSize:12, fontFamily:'JetBrains Mono,monospace', fontWeight:600, transition:'all 0.2s' }}
             onMouseEnter={e=>{ if(!regenerating) e.currentTarget.style.borderColor='#a855f7' }}
             onMouseLeave={e=>{ e.currentTarget.style.borderColor=C.borderHi }}
           >
@@ -136,17 +140,18 @@ export function PageMonitoringRules({ reglesDynamiques = [] }) {
         </div>
       </div>
 
+      {/* ← SEUL CHANGEMENT : 12→13 pour le texte */}
       <div style={{ background:'#3b82f608', border:'1px solid #3b82f620', borderRadius:8, padding:'9px 14px', display:'flex', gap:10, alignItems:'center' }}>
-        <span style={{ color:'#3b82f6', fontSize:13 }}>ℹ</span>
-        <span style={{ fontSize:12, color:C.sub, lineHeight:1.6 }}>
+        <span style={{ color:'#3b82f6', fontSize:15 }}>ℹ</span>
+        <span style={{ fontSize:13, color:C.sub, lineHeight:1.6 }}>
           Rules define <strong style={{ color:C.text }}>when OpsPilot triggers an alert</strong>. Applied continuously to live metrics.
           <strong style={{ color:C.text }}> Click any rule</strong> to see description and diagnostic commands.
           <strong style={{ color:C.text }}> Regenerate</strong> to adapt thresholds to your cluster baseline.
         </span>
       </div>
 
-      <Group title="CRITICAL" color="#ef4444" rules={crit}/>
-      <Group title="HIGH"     color="#f97316" rules={high}/>
+      <Group title="CRITICAL"   color="#ef4444" rules={crit}/>
+      <Group title="HIGH"       color="#f97316" rules={high}/>
       <Group title="MONITORING" color="#eab308" rules={mon}/>
     </div>
   )

@@ -25,6 +25,33 @@ def api_cluster():
         return {"error": str(e)}
 
 
+@router.get("/api/conversations")
+def api_conversations():
+    from agent.chat_history import lister_conversations
+    return {"conversations": lister_conversations()}
+
+
+@router.post("/api/conversations")
+def api_nouvelle_conversation():
+    from agent.chat_history import nouvelle_conversation
+    conv_id = nouvelle_conversation()
+    return {"conv_id": conv_id}
+
+
+@router.put("/api/conversations/{conv_id}")
+def api_changer_conversation(conv_id: str):
+    from agent.chat_history import changer_conversation
+    ok = changer_conversation(conv_id)
+    return {"ok": ok}
+
+
+@router.delete("/api/conversations/{conv_id}")
+def api_supprimer_conversation(conv_id: str):
+    from agent.chat_history import supprimer_conversation
+    supprimer_conversation(conv_id)
+    return {"ok": True}
+
+
 @router.get("/api/historique_chat")
 def api_historique():
     return {"messages": get_historique_complet(), "count": len(get_historique_complet())}
@@ -70,19 +97,21 @@ def api_rapports():
 
 @router.get("/api/rapports/{nom}")
 def api_rapport(nom: str):
-    """
-    Retourne le contenu du rapport nettoyé des artefacts LLM.
-    Le nettoyage ici est la dernière ligne de défense — garantit
-    que même les anciens rapports .md écrits avant le fix de
-    report_writer.py s'affichent proprement dans PageIncidents.
-    """
+    # ── SÉCURITÉ : bloquer path traversal ──────────────────────────
+    from pathlib import Path as _Path
+    from fastapi import HTTPException   # ← CETTE LIGNE MANQUAIT
+    base  = _Path("rapports").resolve()
+    cible = (base / nom).resolve()
+    if not str(cible).startswith(str(base)):
+        raise HTTPException(status_code=403, detail="Accès refusé")
+    if not cible.exists():
+        raise HTTPException(status_code=404, detail="Rapport non trouvé")
+    # ── Lecture + nettoyage artefacts LLM ────────────────────────
     data = lire_rapport(nom)
     if "contenu" in data and data["contenu"]:
         c = data["contenu"]
-        # Pattern principal : ```bash\nCopy\ncommande```
         c = _re.sub(r'```bash\s*\nCopy\s*\n',    '```bash\n', c)
         c = _re.sub(r'```bash\s*\ncopier\s*\n',  '```bash\n', c)
-        # Variantes sans backticks
         c = c.replace('bash\nCopy\n',  '')
         c = c.replace('bash\nCopy',    '')
         c = c.replace('bashCopy\n',    '')
