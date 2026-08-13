@@ -1,0 +1,699 @@
+"""
+incident_prompt.py — Classification des anomalies et construction du prompt
+envoye au LLM pour generer l'analyse d'incident.
+
+← REFONTE MAJEURE (format de sortie) : le LLM ne produit plus un texte libre
+(---INCIDENT---/---RECOMMENDATION---, parsé ensuite par regex côté
+frontend) mais un OBJET JSON structuré -- même technique que
+rules_engine.py, déjà prouvée fiable avec ce modèle (llama-3.1-8b-instant
+via Groq). Deux problèmes concrets que ça corrige :
+
+1. La "Standard Playbook" affichée côté frontend (PageRecommendations.jsx)
+   était un texte figé écrit une fois pour chaque type de problème --
+   jamais générée par le LLM, jamais liée aux vraies métriques ni à la
+   vraie recherche web. Le nouveau format demande explicitement une liste
+   d'étapes (immediate/short_term/long_term), remplie par le LLM lui-même
+   à partir du contexte réel -- plus besoin de ce filet de secours statique.
+
+2. Le nœud/VMID cible d'une action était extrait par regex depuis le texte
+   libre généré par le LLM (fragile : dépend de la formulation exacte).
+   Le nouveau format donne ces champs directement, structurés, remplis par
+   le LLM à partir de ce qu'il sait déjà avec certitude (CLUSTER STATE),
+   pas à deviner après coup depuis une phrase.
+
+← RETRAIT de l'ancienne règle stricte #7 ("Use ONLY the command from
+PROBLEM TYPE GUIDANCE — no other command") -- elle empêchait
+structurellement le LLM d'utiliser la vraie doc Proxmox récupérée par
+Tavily (doc_context, déjà injectée, déjà fonctionnelle), même si "IMMEDIATE
+COMMAND: ps aux..." (jamais reconsidéré) contredisait ce que la doc
+recommandait pour CE cas précis. Remplacée par un MENU d'actions sûres
+(_construire_menu_actions(), générée depuis action_executor.ACTION_META --
+jamais recopiée à la main, toujours synchronisée avec les actions
+réellement exécutables) que le LLM peut choisir, combiner et ordonner
+librement selon les métriques et la recherche disponibles.
+
+← AJOUT (validation post-génération) : parser_reponse_llm() extrait le
+JSON ; _valider_step() vérifie ensuite, PAR ÉTAPE, que action_id existe
+vraiment dans ACTION_META et que tous ses paramètres requis sont remplis
+-- sinon action_id est mis à None (l'étape reste affichée comme texte
+informatif, mais aucun bouton "Accepter & Exécuter" qui échouerait
+silencieusement à l'exécution). Le LLM propose, le code valide -- jamais
+une confiance aveugle dans ce qu'il a rempli.
+
+Extrait de surveillance.py (devenu trop long, ~700 lignes, plusieurs
+responsabilites melangees) -- avec UNE correction reelle au passage :
+classifier_anomalies() priorise desormais une panne de service complete
+(ex: "PostgreSQL is DOWN") au-dessus du nombre d'anomalies des autres
+categories. Avant ce correctif, 2 alertes RAM pouvaient faire passer une
+base de donnees injoignable au second plan dans l'analyse du LLM, meme si
+le titre de la notification parlait de la base de donnees -- d'ou des
+emails ou le titre et le contenu ne correspondaient pas.
+"""
+import json
+import re
+
+try:
+    from web_search import rechercher_doc_proxmox, get_doc_url
+    WEB_SEARCH_OK = True
+except ImportError:
+    WEB_SEARCH_OK = False
+    def get_doc_url(type_probleme: str) -> str:
+        return "https://pve.proxmox.com/wiki/Main_Page"
+
+try:
+    from action_executor import ACTION_META
+    ACTIONS_OK = True
+except ImportError:
+    ACTIONS_OK = False
+    ACTION_META = {}
+
+
+# ── Commandes de diagnostic par service ─────────────────────────────────────
+# Table extensible : un service reconnu ici obtient une commande précise ;
+# un service absent (n'importe lequel, détecté plus tard par le futur
+# catalogue générique) retombe sur "default" -- systemctl/journalctl
+# fonctionnent pour n'importe quel service systemd, sans le connaître à
+# l'avance. Ceci reste informatif (contexte pour le LLM), aucune de ces
+# commandes n'est un action_id exécutable -- redémarrer un service
+# n'est pas encore dans action_executor.ACTION_REGISTRY.
+SERVICE_COMMANDS = {
+    "postgresql": (
+        "systemctl status postgresql ; sudo -u postgres psql -c 'SELECT 1;' "
+        "-- target: service responding, database reachable"
+    ),
+    "default": (
+        "systemctl status <service_name> ; journalctl -u <service_name> --no-pager -n 30 "
+        "-- target: service active (running), no repeated errors in recent logs"
+    ),
+}
+
+
+def classifier_anomalies(anomalies: list) -> tuple:
+    types = {k: [] for k in ["service","ram","disk","cpu","swap","iowait","temp","vm","quorum","network","ai"]}
+    for a in anomalies:
+        msg   = a.get("message", "").lower()
+        cible = a.get("cible", "").lower()
+        t     = a.get("type", "")
+        if t == "ai_score":                    types["ai"].append(a)
+        elif t == "service_down":              types["service"].append(a)
+        elif "quorum" in msg:                  types["quorum"].append(a)
+        elif "temp" in msg:                    types["temp"].append(a)
+        elif "iowait" in msg or "latency" in msg: types["iowait"].append(a)
+        elif "swap" in msg:                    types["swap"].append(a)
+        elif "disk" in msg:                    types["disk"].append(a)
+        elif "ram" in msg or "memory" in msg:  types["ram"].append(a)
+        elif "cpu" in msg:                     types["cpu"].append(a)
+        elif "vm" in msg or "vm" in cible:     types["vm"].append(a)
+        elif "net" in msg:                     types["network"].append(a)
+        else:
+            if "ram" in cible:    types["ram"].append(a)
+            elif "disk" in cible: types["disk"].append(a)
+            elif "cpu" in cible:  types["cpu"].append(a)
+            else:                 types["ram"].append(a)
+
+    if types["service"]:
+        return types, "service"
+
+    dominant = max((k for k in types if k != "ai"), key=lambda k: len(types[k]), default="ram")
+    if not types[dominant]:
+        dominant = "ram"
+    return types, dominant
+
+
+def calculer_seuils_franchis(etat: dict) -> str:
+    """
+    Calcule pour chaque noeud quel seuil exact est franchi (WARNING ou CRITICAL).
+    Couvre les niveaux 1, 2 et 3 pour que le LLM ait le contexte complet.
+    """
+    lignes = []
+    for n in etat.get("noeuds", []):
+        nom  = n.get("nom", "?")
+        ram  = n.get("ram_pct", 0)
+        cpu  = n.get("cpu_pct", 0)
+        disk = n.get("disk_pct", 0)
+        swap = n.get("swap_pct", 0)
+
+        if ram >= 85:
+            lignes.append(f"  {nom} RAM: {ram:.1f}% — CRITICAL threshold breached (>=85%) — target <70%")
+        elif ram >= 75:
+            lignes.append(f"  {nom} RAM: {ram:.1f}% — WARNING threshold breached (>=75%) — NOT yet critical (<85%) — target <70%")
+
+        if cpu >= 90:
+            lignes.append(f"  {nom} CPU: {cpu:.1f}% — CRITICAL threshold breached (>=90%) — target <75%")
+        elif cpu >= 80:
+            lignes.append(f"  {nom} CPU: {cpu:.1f}% — WARNING threshold breached (>=80%) — NOT yet critical (<90%) — target <75%")
+
+        if disk >= 90:
+            lignes.append(f"  {nom} DISK: {disk:.1f}% — CRITICAL threshold breached (>=90%) — target <75%")
+        elif disk >= 80:
+            lignes.append(f"  {nom} DISK: {disk:.1f}% — WARNING threshold breached (>=80%) — NOT yet critical (<90%) — target <75%")
+
+        if swap >= 80:
+            lignes.append(f"  {nom} SWAP: {swap:.1f}% — CRITICAL threshold breached (>=80%) — target 0%")
+        elif swap >= 50:
+            lignes.append(f"  {nom} SWAP: {swap:.1f}% — WARNING threshold breached (>=50%) — target 0%")
+
+        iowait = n.get("cpu_iowait_pct", 0)
+        if iowait >= 30:
+            lignes.append(f"  {nom} IOWAIT: {iowait:.1f}% — CRITICAL threshold breached (>=30%) — target <5%")
+        elif iowait >= 15:
+            lignes.append(f"  {nom} IOWAIT: {iowait:.1f}% — WARNING threshold breached (>=15%) — NOT yet critical (<30%) — target <5%")
+
+        steal = n.get("cpu_steal_pct", 0)
+        if steal >= 20:
+            lignes.append(f"  {nom} CPU STEAL: {steal:.1f}% — CRITICAL threshold breached (>=20%) — host-level contention (VMware Workstation), not a node/VM issue — target <2%")
+        elif steal >= 10:
+            lignes.append(f"  {nom} CPU STEAL: {steal:.1f}% — WARNING threshold breached (>=10%) — NOT yet critical (<20%) — host-level contention (VMware Workstation), not a node/VM issue — target <2%")
+
+        read_lat  = n.get("disk_read_latency_ms", 0)
+        write_lat = n.get("disk_write_latency_ms", 0)
+        if read_lat >= 50 or write_lat >= 50:
+            lignes.append(f"  {nom} DISK LATENCY: read={read_lat:.1f}ms write={write_lat:.1f}ms — CRITICAL (>=50ms) — target <10ms")
+        elif read_lat >= 20 or write_lat >= 20:
+            lignes.append(f"  {nom} DISK LATENCY: read={read_lat:.1f}ms write={write_lat:.1f}ms — WARNING (>=20ms) — target <10ms")
+
+        net_err = n.get("net_errors_in", 0) + n.get("net_errors_out", 0)
+        net_drop = n.get("net_drop_in", 0) + n.get("net_drop_out", 0)
+        if net_err > 10:
+            lignes.append(f"  {nom} NET ERRORS: {net_err:.0f}/s — CRITICAL (>10/s) — target 0")
+        elif net_err > 0:
+            lignes.append(f"  {nom} NET ERRORS: {net_err:.0f}/s — WARNING (>0) — target 0")
+        if net_drop > 0:
+            lignes.append(f"  {nom} NET DROPS: {net_drop:.0f}/s — WARNING — target 0")
+
+        temp = n.get("cpu_temp_max_c", 0)
+        if temp >= 85:
+            lignes.append(f"  {nom} CPU TEMP: {temp:.0f}°C — CRITICAL threshold breached (>=85°C) — target <70°C")
+        elif temp >= 75:
+            lignes.append(f"  {nom} CPU TEMP: {temp:.0f}°C — WARNING threshold breached (>=75°C) — NOT yet critical (<85°C) — target <70°C")
+
+        if not n.get("smart_ok", True):
+            reallocated = n.get("smart_reallocated_sectors", 0)
+            uncorr      = n.get("smart_uncorrectable", 0)
+            lignes.append(f"  {nom} SMART: FAIL — reallocated sectors={reallocated} uncorrectable={uncorr} — REPLACE DISK IMMEDIATELY")
+
+        if n.get("zfs_available"):
+            zfs_hit = n.get("zfs_arc_hit_rate", 0)
+            if zfs_hit < 70:
+                lignes.append(f"  {nom} ZFS ARC: hit rate={zfs_hit:.1f}% — CRITICAL (<70%) — increase ARC size — target >90%")
+            elif zfs_hit < 85:
+                lignes.append(f"  {nom} ZFS ARC: hit rate={zfs_hit:.1f}% — WARNING (<85%) — target >90%")
+
+        if not n.get("corosync_ok", True):
+            quorum = "OK" if n.get("corosync_quorum_ok", True) else "LOST"
+            lignes.append(f"  {nom} COROSYNC: DEGRADED — quorum={quorum} — CRITICAL: cluster may stop VMs")
+
+    return "\n".join(lignes) if lignes else "  All metrics within normal range"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Menu d'actions sûres — généré depuis action_executor.ACTION_META, jamais
+# recopié à la main. Si un jour une action est ajoutée/retirée côté
+# action_executor.py, ce menu suit automatiquement, sans toucher ce fichier.
+# ══════════════════════════════════════════════════════════════════════════════
+def _construire_menu_actions() -> str:
+    if not ACTIONS_OK or not ACTION_META:
+        return "  (no pre-approved one-click actions available in this environment)"
+    lignes = []
+    for action_id, meta in ACTION_META.items():
+        params = ", ".join(meta.get("params", []))
+        avertissement = f" WARNING: {meta['warning']}" if meta.get("warning") else ""
+        lignes.append(
+            f'  - action_id="{action_id}" ({meta["label"]}, risk={meta["risk"]}): '
+            f'{meta["description"]}. Required action_params keys: {{{params}}}.{avertissement}'
+        )
+    return "\n".join(lignes)
+
+
+# Repères de sécurité par type de problème -- PAS des commandes imposées.
+# Le LLM choisit librement quelles actions du menu ci-dessus appliquer, dans
+# quel ordre, avec quels paramètres -- ceci ne fait que rappeler les
+# contraintes non négociables et la cible chiffrée par catégorie.
+GARDE_FOUS = {
+    "service": "No action_id applies to restarting an arbitrary service (not yet in the executable catalog) -- describe diagnostic/fix steps as informational (action_id=null), using the diagnostic command context provided below.",
+    "ram":     "FORBIDDEN: never suggest reducing VM RAM, maxmem, or vCPU in production -- this crashes running applications. Always set the warning field to state this explicitly when RAM is the dominant problem. TARGET: host RAM < 70%.",
+    "disk":    "clean_logs is safe and reversible for cache/old logs. Deleting specific backups needs a human decision (real path, real size) -- describe as an informational step (action_id=null) with the real command, not a one-click action. TARGET: disk < 75%.",
+    "cpu":     "If CPU STEAL is present in EXACT THRESHOLD STATUS, this is a host-level (VMware Workstation) issue -- do not attribute it to a specific VM or recommend migrating/limiting a VM for that specific cause. set_cpu_limit only for non-critical/dev VMs. TARGET: CPU < 75%.",
+    "swap":    "Swap usage on a hypervisor node means RAM is genuinely exhausted -- treat the underlying cause as a RAM problem (see ram guidance) even though the anomaly is labeled swap. TARGET: swap 0%.",
+    "iowait":  "No action_id applies directly -- storage bottleneck diagnosis needs a human to read iostat output first. Describe as informational steps. TARGET: iowait < 5%, latency < 10ms.",
+    "temp":    "No action_id applies -- thermal issues need physical inspection. Describe as informational steps (sensors, dmesg throttle check, airflow). TARGET: < 70°C.",
+    "vm":      "No action_id applies to restarting a stopped VM directly (not yet in the executable catalog) -- describe as an informational step with the real qm command. Investigate the stop cause (OOM, disk full) before restarting.",
+    "quorum":  "No action_id applies -- quorum/Corosync issues need careful manual diagnosis (pvecm status, network check) before any corrective action. Never suggest 'pvecm expected 1' unless the anomaly explicitly confirms the other node is truly offline.",
+    "network": "No action_id applies -- network hardware/driver issues need manual diagnosis (ip -s link, ethtool). Describe as informational steps.",
+    "ai":      "This is a statistical anomaly (LSTM/Isolation Forest), not a specific metric breach -- correlate with EXACT THRESHOLD STATUS and CLUSTER STATE to explain what's actually happening, don't invent a cause not supported by the data above.",
+}
+
+
+def construire_prompt_specifique(anomalies: list, etat: dict, lstm: dict) -> str:
+    anomalies_str        = "\n".join([f"- [{a['niveau']}] {a['message']}" for a in anomalies])
+    types_classified, dominant = classifier_anomalies(anomalies)
+    seuils_franchis       = calculer_seuils_franchis(etat)
+    noeuds_ctx = ""
+    for n in etat.get("noeuds", []):
+        ram_free  = round(n.get("ram_total_gb", 0) - n.get("ram_used_gb", 0), 1)
+        disk_free = round(n.get("disk_total_gb", 0) - n.get("disk_used_gb", 0), 1)
+        noeuds_ctx += (
+            f"  {n.get('nom','?')}: CPU={n.get('cpu_pct',0):.1f}% (cores={n.get('cpu_cores',0)}) "
+            f"RAM={n.get('ram_pct',0):.1f}% ({n.get('ram_used_gb',0):.1f}/{n.get('ram_total_gb',0):.1f}GB FREE={ram_free}GB) "
+            f"DISK={n.get('disk_pct',0):.1f}% ({n.get('disk_used_gb',0):.1f}/{n.get('disk_total_gb',0):.1f}GB FREE={disk_free}GB) "
+            f"STATUS={n.get('statut','?')}\n"
+        )
+        l2_parts = []
+        if n.get("swap_pct", 0) > 0:
+            l2_parts.append(f"SWAP={n.get('swap_pct',0):.1f}%")
+        if n.get("cpu_iowait_pct", 0) > 0:
+            l2_parts.append(f"IOWAIT={n.get('cpu_iowait_pct',0):.1f}%")
+        if n.get("cpu_steal_pct", 0) > 0:
+            l2_parts.append(f"STEAL={n.get('cpu_steal_pct',0):.1f}%")
+        if n.get("disk_read_latency_ms", 0) > 0:
+            l2_parts.append(f"READ_LAT={n.get('disk_read_latency_ms',0):.1f}ms WRITE_LAT={n.get('disk_write_latency_ms',0):.1f}ms")
+        if n.get("net_errors_in", 0) > 0 or n.get("net_errors_out", 0) > 0:
+            l2_parts.append(f"NET_ERRORS={n.get('net_errors_in',0)+n.get('net_errors_out',0):.0f}/s")
+        if n.get("load_avg_1m", 0) > 0:
+            l2_parts.append(f"LOAD={n.get('load_avg_1m',0):.2f}")
+        if l2_parts:
+            noeuds_ctx += f"    L2: {' | '.join(l2_parts)}\n"
+        l3_parts = []
+        if n.get("cpu_temp_max_c", 0) > 0:
+            l3_parts.append(f"TEMP={n.get('cpu_temp_max_c',0):.0f}°C")
+        if not n.get("smart_ok", True):
+            l3_parts.append(f"SMART=FAIL(reallocated={n.get('smart_reallocated_sectors',0)})")
+        if n.get("zfs_available"):
+            l3_parts.append(f"ZFS_ARC={n.get('zfs_arc_hit_rate',0):.0f}%hit")
+        if not n.get("corosync_ok", True):
+            l3_parts.append(f"COROSYNC=DEGRADED(quorum={'OK' if n.get('corosync_quorum_ok',True) else 'LOST'})")
+        if l3_parts:
+            noeuds_ctx += f"    L3: {' | '.join(l3_parts)}\n"
+
+    EXIGENCES_SERVICES = {
+        "PostgreSQL":    "typically wants >=1GB RAM for comfortable operation, more under real query load",
+        "Docker":        "overhead varies with running containers; each container adds its own RAM/CPU footprint on top",
+        "Nginx":         "lightweight, usually <100MB RAM even under moderate traffic",
+        "Apache":        "moderate footprint, scales with worker processes/connections",
+        "Redis":         "RAM-bound by design — dataset size determines requirement directly",
+        "MySQL":         "typically wants >=512MB RAM minimum, more for InnoDB buffer pool efficiency",
+        "MariaDB":       "typically wants >=512MB RAM minimum, more for InnoDB buffer pool efficiency",
+        "MongoDB":       "typically wants >=1GB RAM, WiredTiger cache scales with available memory",
+        "Elasticsearch": "JVM-based, typically wants >=2GB RAM heap minimum — heavy for a small VM",
+        "RabbitMQ":      "moderate footprint, ~256-512MB RAM typical for light workloads",
+        "Grafana":       "lightweight, usually <200MB RAM",
+        "MinIO":         "moderate footprint, scales with concurrent object operations",
+        "Prometheus":    "RAM scales with number of scraped series and retention — can grow significantly over time",
+        "Alertmanager":  "lightweight, usually <100MB RAM",
+    }
+    vms_ctx = ""
+    for v in etat.get("vms", []):
+        services = v.get("services_detectes", [])
+        metriques_services = v.get("metriques_services", {})
+        services_str = f" | services: {', '.join(services)}" if services else ""
+        vms_ctx += (
+            f"  VM{v.get('vmid','?')} {v.get('nom','?')} on {v.get('noeud','?')}: "
+            f"status={v.get('statut','?')} CPU={v.get('cpu_pct',0):.1f}% RAM={v.get('ram_pct',0):.1f}% "
+            f"maxmem={v.get('maxmem_gb',0):.1f}GB{services_str}\n"
+        )
+        for s in services:
+            m = metriques_services.get(s)
+            if m:
+                ligne = (
+                    f"    {s} ACTUAL measured usage: RAM={m.get('ram_mb',0):.0f}MB "
+                    f"CPU={m.get('cpu_pct',0):.1f}%"
+                )
+                if m.get("cpu_pct_vm") is not None:
+                    ligne += f" ({m['cpu_pct_vm']:.1f}% of this VM's total vCPU capacity)"
+                ligne += (
+                    f" disk_read={m.get('disk_read_mbps',0):.2f}MB/s "
+                    f"disk_write={m.get('disk_write_mbps',0):.2f}MB/s processes={m.get('num_procs',0)}\n"
+                )
+                vms_ctx += ligne
+                cles_generiques = {"ram_mb", "cpu_pct", "cpu_pct_vm",
+                                    "disk_read_mbps", "disk_write_mbps", "num_procs"}
+                extras = {k: v for k, v in m.items() if k not in cles_generiques and v is not None}
+                if extras:
+                    extras_str = " | ".join(f"{k}={v}" for k, v in extras.items())
+                    vms_ctx += f"    {s} internal metrics: {extras_str}\n"
+            elif s in EXIGENCES_SERVICES:
+                vms_ctx += f"    {s} sizing guidance (no live measurement yet): {EXIGENCES_SERVICES[s]}\n"
+    vms_ctx = vms_ctx or "  No VM data\n"
+
+    hote_ctx = ""
+    hote = etat.get("hote_physique") if isinstance(etat.get("hote_physique"), dict) else {}
+    if hote.get("disponible"):
+        alloc = hote.get("vmware_allocation", {})
+        hote_ctx = (
+            f"  Physical host (Windows PC running VMware Workstation): "
+            f"RAM {hote.get('ram_used_gb',0):.1f}/{hote.get('ram_total_gb',0):.1f}GB "
+            f"({hote.get('ram_pct_used',0):.0f}% used, {hote.get('ram_available_gb',0):.1f}GB free) | "
+            f"CPU {hote.get('cpu_pct_used',0):.0f}% used ({hote.get('cpu_cores',0)} cores) | "
+            f"Disk {hote.get('disk_free_gb',0):.1f}GB free of {hote.get('disk_total_gb',0):.1f}GB\n"
+            f"  Headroom currently allocatable to VMware beyond Windows' own reserve: "
+            f"{alloc.get('total_allouable_ram_gb',0):.1f}GB RAM, "
+            f"{alloc.get('total_allouable_cores',0)} cores, "
+            f"{alloc.get('total_allouable_disk_gb',0):.1f}GB disk\n"
+        )
+    else:
+        hote_ctx = "  Physical host metrics not available this cycle\n"
+
+    hyp_metriques = etat.get("hyperviseur_metriques") if isinstance(etat.get("hyperviseur_metriques"), dict) else {}
+    if hyp_metriques.get("disponible"):
+        ram_alloc  = hyp_metriques.get("vms_ram_allouee_gb") or 0.0
+        disk_alloc = hyp_metriques.get("vms_disk_allouee_gb") or 0.0
+        hote_ctx += (
+            f"  Virtualization layer itself ({hyp_metriques.get('vm_count',0)} VM(s) running under "
+            f"{etat.get('hyperviseur',{}).get('produit','the hypervisor')}): "
+            f"CPU {hyp_metriques.get('vms_cpu_pct_hote',0):.1f}% of total host CPU capacity "
+            f"({hyp_metriques.get('vms_cpu_pct',0):.1f}% raw, summed per-core across "
+            f"{hyp_metriques.get('vm_count',0)} VM process(es), not normalized) | "
+            f"RAM allocated to VMs: {ram_alloc:.1f}GB | Disk allocated to VMs: {disk_alloc:.1f}GB | "
+            f"{hyp_metriques.get('overhead_ram_mb',0):.0f}MB hypervisor software overhead (UI/services, "
+            f"separate from the VMs' allocated RAM above)\n"
+        )
+        vmdk_reel = hyp_metriques.get("vmdk_reel_gb")
+        if vmdk_reel is not None:
+            ecart = disk_alloc - vmdk_reel
+            if ecart > 0.5:
+                hote_ctx += (
+                    f"  Actual .vmdk size on physical disk (measured directly, not an estimate): "
+                    f"{vmdk_reel:.1f}GB (vs {disk_alloc:.1f}GB allocated -- thin provisioning is saving "
+                    f"~{ecart:.1f}GB right now)\n"
+                )
+            elif ecart < -0.5:
+                hote_ctx += (
+                    f"  Actual .vmdk size on physical disk (measured directly, not an estimate): "
+                    f"{vmdk_reel:.1f}GB -- EXCEEDS the {disk_alloc:.1f}GB allocated by ~{-ecart:.1f}GB. "
+                    f"This is a known, benign VMware behavior: thin-provisioned virtual disks grow as data is "
+                    f"written but do not automatically shrink when that data is later deleted inside the guest. "
+                    f"If reclaiming physical disk space matters, this can be recommended: VMware Workstation → "
+                    f"shut down the VM → VM Settings → Hard Disk → Utilities → Compact, or `fstrim` run inside "
+                    f"the guest if its virtual disk supports TRIM/discard. Not a data integrity issue.\n"
+                )
+            else:
+                hote_ctx += (
+                    f"  Actual .vmdk size on physical disk (measured directly, not an estimate): "
+                    f"{vmdk_reel:.1f}GB -- close to the {disk_alloc:.1f}GB allocated, no meaningful thin-"
+                    f"provisioning savings currently.\n"
+                )
+        if hyp_metriques.get("ram_non_mesurable"):
+            hote_ctx += (
+                "  NOTE: the RAM/Disk figures above are ALLOCATED capacity (what the hypervisor has "
+                "reserved for these VMs, from their own reported total), not a LIVE measurement of actual "
+                "host-side usage -- that live figure cannot be reliably read from the host process for this "
+                "hypervisor type. Do NOT assume actual usage is lower than the allocated figure just because "
+                "no live number is given. Rely on PHYSICAL HOST total RAM usage above as the source of truth "
+                "for how much RAM is actually in use on this machine right now.\n"
+            )
+        marge = hyp_metriques.get("marge_reelle_ram_gb")
+        if marge is not None:
+            if marge < 0:
+                hote_ctx += (
+                    f"  REAL RAM HEADROOM: {marge:.1f}GB -- NEGATIVE. The Windows reserve target plus what's "
+                    f"already allocated to the VMs already EXCEEDS total host RAM. This directly explains "
+                    f"chronic host RAM pressure -- there is structurally NO safe margin left for growth "
+                    f"without either freeing RAM elsewhere, adding physical RAM to the host, or lowering the "
+                    f"Windows reserve target. Treat any recommendation to add a new VM or grow an existing "
+                    f"one's RAM as infeasible right now without addressing this first.\n"
+                )
+            else:
+                hote_ctx += (
+                    f"  Real RAM headroom (host total minus Windows reserve minus RAM already allocated to "
+                    f"VMs): {marge:.1f}GB\n"
+                )
+
+    commande_service = SERVICE_COMMANDS["default"]
+    if dominant == "service" and types_classified.get("service"):
+        cible = types_classified["service"][0].get("cible", "")
+        nom_service = cible.split("/")[-1].strip().lower() if cible else ""
+        commande_service = SERVICE_COMMANDS.get(nom_service, SERVICE_COMMANDS["default"])
+
+    garde_fou = GARDE_FOUS.get(dominant, GARDE_FOUS["ram"])
+    if dominant == "service":
+        garde_fou += f"\nDiagnostic command for this exact service: {commande_service}"
+
+    doc_context = ""
+    if WEB_SEARCH_OK:
+        try:
+            doc_raw = rechercher_doc_proxmox(dominant)
+            if doc_raw:
+                doc_context = f"""
+OFFICIAL PROXMOX DOCUMENTATION (fetched in real-time from pve.proxmox.com / forum.proxmox.com):
+{doc_raw[:1000]}
+
+Base your Causes and Steps on this documentation where it applies to the current situation --
+prefer it over generic assumptions when they differ.
+"""
+                print(f"[WebSearch] Doc Proxmox chargée pour '{dominant}' ({len(doc_raw)} chars)")
+        except Exception as e:
+            print(f"[WebSearch] Erreur: {e}")
+
+    hyperviseur_ctx = ""
+    try:
+        hyp = etat.get("hyperviseur", {})
+        if hyp.get("type") and hyp["type"] != "unknown":
+            hyperviseur_ctx = (
+                f"Infrastructure type: Proxmox running on {hyp['type'].upper()} "
+                f"({hyp['produit']})\n"
+                f"RAM recommendation: {hyp.get('recommandation_ram', '')}\n"
+                f"CPU recommendation: {hyp.get('recommandation_cpu', '')}\n"
+                f"Disk recommendation: {hyp.get('recommandation_disk', '')}"
+            )
+    except Exception:
+        pass
+
+    menu_actions = _construire_menu_actions()
+
+    prompt = f"""You are a senior Proxmox VE infrastructure engineer. Analyze this incident and generate a
+precise, tailored recommendation -- grounded in the exact metrics and documentation below, not a
+generic template. Respond ONLY with a valid JSON object, no markdown fences, no text before or after.
+
+CLUSTER STATE:
+{noeuds_ctx}
+VMs:
+{vms_ctx}
+ANOMALIES:
+{anomalies_str}
+AI Score: {lstm['score']:.4f} / threshold {lstm['seuil']:.4f}
+
+EXACT THRESHOLD STATUS — COPY THESE VALUES VERBATIM, NEVER CHANGE A NUMBER:
+{seuils_franchis}
+
+HYPERVISOR CONTEXT:
+{hyperviseur_ctx}
+
+PHYSICAL HOST (underlying Windows PC — determines real headroom for hardware-dependent recommendations):
+{hote_ctx}
+
+SAFETY CONSTRAINTS AND TARGET FOR THIS PROBLEM TYPE ({dominant}):
+{garde_fou}
+
+PRE-APPROVED ONE-CLICK ACTIONS (use action_id + action_params ONLY from this exact list when a step
+matches one of these -- otherwise action_id must be null, the step stays informational):
+{menu_actions}
+{doc_context}
+
+RULES:
+1. pve1/pve2 are HYPERVISOR NODES — NEVER use pct commands on them
+2. Copy threshold values verbatim from EXACT THRESHOLD STATUS above — never round up or invent
+3. severity must be "CRITICAL" if a CRITICAL threshold was breached, "HIGH" if only WARNING was breached
+4. target_node / target_vmid at the top level identify the PRIMARY resource this incident is about (from CLUSTER STATE, not guessed from prose)
+5. "ACTUAL measured usage" lines are REAL, live measurements for that specific service -- use them directly. If a VM's RAM% is high but a detected service's actual usage is low, that service is NOT the cause -- say so explicitly in causes instead of blaming it by default
+6. If CPU STEAL is present in EXACT THRESHOLD STATUS, treat it as a host-level (VMware Workstation) issue, never as a reason to resize/migrate a VM
+7. Check PHYSICAL HOST headroom before proposing hardware-dependent steps: if allocatable RAM/cores is already near zero or negative, say so explicitly in causes and prioritize non-hardware steps
+8. Every step's action_id must come from PRE-APPROVED ONE-CLICK ACTIONS above, with ALL of its required action_params keys filled with real values from CLUSTER STATE -- or action_id must be null
+9. Provide at least one "immediate" step. Include "short_term"/"long_term" steps only when genuinely relevant to this specific incident
+10. Max 4 steps total. causes: 1-3 bullet points. summary: 1 sentence
+11. For steps WITHOUT an action_id: only use REAL, standard Proxmox/Linux commands (qm, pct, pvesh, pvecm, vzdump, pveam, pvesm, systemctl, journalctl, apt, standard bash utilities) -- NEVER invent a tool name or syntax that does not exist. If genuinely unsure of the exact correct syntax for something, describe the action in the "action" field in plain words and set "command" to null rather than guess at a command
+12. Output PURE JSON only -- never add // or /* */ comments anywhere inside the JSON, even to note an assumption. If you need to explain an assumption (e.g. a default value you picked), put that explanation in the "action" text itself, not as a code comment -- a comment anywhere breaks the entire JSON and discards your whole response
+
+Respond with EXACTLY this JSON shape (fill every field, use null where genuinely not applicable):
+{{
+  "severity": "CRITICAL" or "HIGH",
+  "target_node": "pve1" or "pve2" or null,
+  "target_vmid": 103 or null,
+  "summary": "one sentence: what is wrong, the exact value, the threshold breached, the business risk",
+  "causes": ["cause 1 grounded in the data above", "cause 2 if relevant"],
+  "fix_title": "max 8 words, action-oriented",
+  "warning": "explicit safety warning if this problem type has one (e.g. never reduce VM RAM), else null",
+  "steps": [
+    {{
+      "phase": "immediate",
+      "action": "one sentence describing this step",
+      "command": "exact shell/Proxmox command, or null if not applicable",
+      "risk": "low, medium, or high",
+      "action_id": "an id from PRE-APPROVED ONE-CLICK ACTIONS above, or null",
+      "action_params": {{"node": "pve2", "vmid": 103}} or null
+    }}
+  ]
+}}"""
+    # ← MODIFIÉ : retourne aussi "dominant" -- surveillance.py en a besoin
+    # pour calculer doc_url (get_doc_url(dominant), voir web_search.py) et
+    # rétablir le lien "docs" dans PageRecommendations.jsx, retiré par
+    # inadvertance lors du retrait de l'ancienne bibliothèque SOLUTIONS.
+    return prompt, dominant
+
+
+def obtenir_doc_url(dominant: str) -> str:
+    """
+    Fine enveloppe autour de web_search.get_doc_url() -- pour que
+    surveillance.py continue d'importer uniquement depuis ce module,
+    cohérent avec ses autres imports (classifier_anomalies,
+    construire_prompt_specifique, parser_reponse_llm).
+    """
+    return get_doc_url(dominant)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Parsing + validation de la réponse JSON du LLM
+# ══════════════════════════════════════════════════════════════════════════════
+def _commande_reelle(action_id: str, params: dict) -> str | None:
+    """
+    Reconstruit la VRAIE commande, de façon déterministe, à partir de
+    action_id + action_params déjà validés -- ne fait JAMAIS confiance au
+    texte que le LLM a mis dans step["command"] pour une action
+    pré-approuvée. Trouvé en pratique : le LLM (llama-3.1-8b-instant) a
+    inventé un outil cohérent mais inexistant ("pveadm enable-ksm pve2")
+    pour TOUTES les actions d'un même incident -- le menu d'actions ne
+    donnait que description/paramètres/risque, jamais le texte exact de la
+    commande (ACTION_META ne le stocke même pas, il n'existe que codé en
+    dur à l'intérieur de chaque fonction Python d'action_executor.py). Le
+    bouton "Accepter & Exécuter" restait sûr malgré ça (il envoie
+    action_id + params, jamais ce texte, à /api/actions/execute) -- mais le
+    texte affiché/copiable était faux. Ces commandes DOIVENT rester
+    synchronisées avec celles réellement exécutées dans action_executor.py
+    -- même commande, deux endroits : ici pour l'affichage, là-bas pour
+    l'exécution réelle.
+    """
+    if action_id == "enable_ksm":
+        return "echo 1 > /sys/kernel/mm/ksm/run"
+    if action_id == "enable_balloon":
+        return f"qm set {params.get('vmid','<vmid>')} --balloon {params.get('min_mb', 512)}"
+    if action_id == "migrate_vm":
+        return f"qm migrate {params.get('vmid','<vmid>')} {params.get('target_node','<target_node>')} --online"
+    if action_id == "set_cpu_limit":
+        return f"qm set {params.get('vmid','<vmid>')} --cpulimit {params.get('limit', 1.0)}"
+    if action_id == "clean_logs":
+        return "journalctl --vacuum-size=200M && apt-get clean -y"
+    return None
+
+
+def _valider_step(step: dict) -> dict:
+    """
+    Ne fait jamais confiance aveuglément à ce que le LLM a rempli pour
+    action_id/action_params : si l'action_id n'existe pas vraiment dans
+    ACTION_META, ou si un paramètre requis manque, l'action_id est mis à
+    None -- l'étape reste affichée comme texte informatif, mais aucun
+    bouton "Accepter & Exécuter" qui échouerait silencieusement à
+    l'exécution ne peut apparaître pour elle.
+
+    ← AJOUT : pour toute action_id valide, step["command"] est ÉCRASÉ par
+    _commande_reelle() -- jamais le texte du LLM pour ces cas précis (voir
+    docstring de _commande_reelle ci-dessus). Seules les étapes SANS
+    action_id (purement informatives, ex: "add physical RAM") gardent le
+    texte de commande du LLM, faute d'alternative déterministe.
+    """
+    action_id = step.get("action_id")
+    if not action_id or action_id not in ACTION_META:
+        step["action_id"] = None
+        step["action_params"] = None
+        return step
+
+    requis  = set(ACTION_META[action_id].get("params", []))
+    params  = step.get("action_params") if isinstance(step.get("action_params"), dict) else {}
+    fournis = {k for k, v in params.items() if v is not None and v != ""}
+    if not requis.issubset(fournis):
+        step["action_id"] = None
+        step["action_params"] = None
+    else:
+        step["action_params"] = {k: params[k] for k in requis}
+        vraie_commande = _commande_reelle(action_id, step["action_params"])
+        if vraie_commande:
+            step["command"] = vraie_commande
+    return step
+
+
+def _retirer_commentaires_js(texte: str) -> str:
+    """
+    Retire les commentaires style JavaScript (// ...) qu'un LLM ajoute
+    parfois dans son JSON malgré la consigne stricte de n'en pas mettre --
+    rend cassant un JSON par ailleurs valide. Repère les limites de
+    chaînes JSON caractère par caractère pour ne JAMAIS retirer un "//"
+    qui fait partie du CONTENU d'une chaîne (ex: une URL "https://...")
+    plutôt qu'un vrai commentaire. S'arrête au prochain caractère
+    structurel JSON ({ } [ ] , " ou fin de ligne) -- PAS seulement fin de
+    ligne : les réponses du LLM arrivent souvent sur une seule ligne
+    continue sans vrais retours à la ligne, ce qui supprimerait tout le
+    reste du JSON par erreur si on s'arrêtait uniquement sur \\n.
+    Testé contre un cas réel observé en production (commentaire au milieu
+    d'un action_params) avant intégration ici.
+    """
+    resultat = []
+    dans_chaine = False
+    echap = False
+    i = 0
+    n = len(texte)
+    while i < n:
+        c = texte[i]
+        if dans_chaine:
+            resultat.append(c)
+            if echap:
+                echap = False
+            elif c == '\\':
+                echap = True
+            elif c == '"':
+                dans_chaine = False
+            i += 1
+            continue
+        if c == '"':
+            dans_chaine = True
+            resultat.append(c)
+            i += 1
+            continue
+        if c == '/' and i + 1 < n and texte[i + 1] == '/':
+            i += 2
+            while i < n and texte[i] not in '{}[],"\n':
+                i += 1
+            continue
+        resultat.append(c)
+        i += 1
+    return ''.join(resultat)
+
+
+_RE_RESUME_SECOURS = re.compile(r'"summary"\s*:\s*"((?:[^"\\]|\\.)*)"')
+_RE_TITRE_SECOURS  = re.compile(r'"fix_title"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+
+def parser_reponse_llm(reponse: str) -> dict:
+    """
+    Extrait et valide l'objet JSON retourné par le LLM. En cas d'échec de
+    parsing (JSON malformé, réponse vide...), retourne un dict avec
+    "_parse_failed": True et le texte brut conservé sous "_raw" -- jamais
+    d'exception vers l'appelant, jamais un JSON inventé pour combler.
+
+    ← MODIFIÉ : retire d'abord les commentaires style JS que le LLM ajoute
+    parfois (ex: "// assuming a minimum of 128MB" au milieu d'un objet) --
+    du JSON par ailleurs parfaitement valide échouait à cause de ça seul.
+
+    ← AJOUT : si le parsing échoue malgré tout (autre cause), tente une
+    extraction de secours de "summary"/"fix_title" par regex simple --
+    évite d'afficher un pavé de JSON brut illisible à l'utilisateur quand
+    seul UN champ du JSON pose problème alors que le reste est exploitable.
+    """
+    try:
+        match = re.search(r'\{.*\}', reponse, re.DOTALL)
+        if not match:
+            return {"_parse_failed": True, "_raw": reponse}
+        json_nettoye = _retirer_commentaires_js(match.group())
+        donnees = json.loads(json_nettoye)
+    except Exception as e:
+        print(f"[Incident] Erreur parsing JSON: {e}")
+        m_resume = _RE_RESUME_SECOURS.search(reponse)
+        m_titre  = _RE_TITRE_SECOURS.search(reponse)
+        if m_resume:
+            return {
+                "_parse_failed": True,
+                "_raw": m_resume.group(1),
+                "summary": m_resume.group(1),
+                "fix_title": m_titre.group(1) if m_titre else None,
+            }
+        return {"_parse_failed": True, "_raw": reponse}
+
+    donnees["steps"] = [_valider_step(s) for s in donnees.get("steps", []) if isinstance(s, dict)]
+    return donnees

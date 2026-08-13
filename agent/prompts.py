@@ -1,12 +1,33 @@
+import re
+
 from agent.groq_client import GROQ_MODEL
 
 
 def _detect_intent(question: str) -> str:
-    """Détecte l'intention de la question pour choisir le bon prompt."""
+    """
+    Détecte l'intention de la question pour choisir le bon prompt.
+
+    ← CORRECTION : comparaison par mot ENTIER (\\b...\\b), pas par
+    sous-chaîne. Avant, 'vm' en sous-chaîne matchait "vm1", "VMs", "vmware"
+    -- n'importe quelle question mentionnant une VM déjà existante
+    (migration, diagnostic, optimisation mémoire...) tombait à tort dans
+    l'intention 'creation' et recevait le prompt LXC (syntaxe pct create,
+    NEXT VMID, règles de nommage) au lieu du prompt général. Confirmé
+    concrètement sur 3 des 8 boutons "Quick Start" de PageAssistant.jsx :
+    "migrate linux-vm1...", "optimize memory usage across VMs...", "A VM
+    has permanently high CPU..." -- aucun n'est une demande de création,
+    les trois étaient classées 'creation' avant ce correctif. Le bug ne
+    provoque aucune erreur visible : juste une réponse hors-sujet, ce qui
+    le rend invisible en usage normal.
+    """
     q = question.lower()
-    if any(w in q for w in ['create','build','créer','construire','lxc','vm','container','deploy','new']):
+
+    def _contient_mot(mots):
+        return any(re.search(rf'\b{re.escape(m)}\b', q) for m in mots)
+
+    if _contient_mot(['create', 'build', 'créer', 'construire', 'lxc', 'vm', 'container', 'deploy', 'new']):
         return 'creation'
-    if any(w in q for w in ['vmware','configure','allocation','ram pc','ressource pc','how much','combien']):
+    if _contient_mot(['vmware', 'configure', 'allocation', 'ram pc', 'ressource pc', 'how much', 'combien']):
         return 'sizing'
     return 'general'
 
@@ -63,9 +84,13 @@ def system_prompt_chat(etat: dict = None, dernier_lstm: dict = None,
 
     cluster_ctx = "\n".join(cluster_lines) if cluster_lines else "No cluster data"
 
-    # ── Bloc PC hôte — uniquement si question sizing VMware ──────────────────
+    # ── Bloc PC hôte — question sizing OU création ────────────────────────────
+    # ← CORRECTION : incluait ce bloc uniquement pour intent == 'sizing'.
+    # Une question de création ("I want to create a VM...") a exactement
+    # autant besoin de connaître la marge physique du PC hôte -- c'est le
+    # moment où de nouvelles ressources vont justement être allouées.
     pc_bloc = ""
-    if intent == 'sizing' and pc_hote and pc_hote.get("disponible"):
+    if intent in ('sizing', 'creation') and pc_hote and pc_hote.get("disponible"):
         alloc  = pc_hote.get("vmware_allocation", {})
         pve1_r = alloc.get("pve1", {})
         pve2_r = alloc.get("pve2", {})

@@ -2,6 +2,13 @@
  * OpsPilot Enterprise — Infrastructure AI Platform
  * Point d'entree : gere le WebSocket, le state global de l'app,
  * la sidebar de navigation, et route vers la bonne page.
+ *
+ * ← MODIFIÉ (bloc "alerte") : lit maintenant data.structured directement
+ * (JSON généré par le LLM, voir incident_prompt.py + surveillance.py) au
+ * lieu de découper data.content par ---INCIDENT---/---RECOMMENDATION--- et
+ * d'extraire le titre par regex. target_node/target_vmid viennent du champ
+ * structuré (déjà connu avec certitude côté backend), plus jamais devinés
+ * depuis un texte libre.
  */
 import { useState, useCallback, useEffect } from 'react'
 import { C } from './utils/colors'
@@ -89,6 +96,30 @@ const PAGES = [
   { id:'assistant',       icon:'assistant',       label:'AI Assistant',     desc:'Infrastructure chat'       },
 ]
 
+// ← AJOUT : sorti du composant (portée module) pour être réutilisable à la
+// fois par le chargement initial (useEffect) et loadMoreHistory (déclenché
+// par le bouton "Load more" dans PageIncidents.jsx) sans dupliquer cette
+// logique de conversion à deux endroits.
+const NIVEAU_VERS_SEVERITE = { critique:'CRITICAL', important:'HIGH', surveillance:'MONITORING' }
+function rapportVersIncident(r) {
+  const m = r.nom.match(/report_(\d{8})_(\d{6})_(\w+)\.md/)
+  const niveau = m ? m[3] : 'surveillance'
+  return {
+    anomalies: [],
+    timestamp: r.date,
+    score:     0,
+    rapport:   r.nom,
+    structured: {
+      severity:  NIVEAU_VERS_SEVERITE[niveau] || 'MONITORING',
+      summary:   r.resume || null,
+      fix_title: r.titre || null,
+      _parse_failed: true,
+      _source: 'history',
+      _raw: r.resume || 'Historical incident — open the full report below for the complete analysis.',
+    },
+  }
+}
+
 export default function App() {
   const { connected, send, handlerRef } = useWebSocket(`ws://${window.location.host}/ws`)
   const [page,         setPage]         = useState('dashboard')
@@ -102,8 +133,17 @@ export default function App() {
   const [thinking,     setThinking]     = useState(false)
   const [uptime,       setUptime]       = useState(0)
   const [rapports,     setRapports]     = useState([])
+  // ← AJOUT : pagination de l'historique -- total/offset viennent du
+  // backend (compter_rapports), loadingMore pour l'état du bouton "Load
+  // more history".
+  const [historyTotal,   setHistoryTotal]   = useState(0)
+  const [historyOffset,  setHistoryOffset]  = useState(0)
+  const [loadingMore,    setLoadingMore]    = useState(false)
   const [dernierLstm,  setDernierLstm]  = useState({ score:0, seuil:0.5, score_if:0, score_lstm:0, lstm_ready:false, drift:false })
   const [reglesDyn,    setReglesDyn]    = useState([])
+  // ← NOUVEAU : suit si les règles en cache sont périmées (Proxmox injoignable
+  // au dernier cycle de surveillance) — vient de /api/regles → regles_perimees
+  const [reglesStale,  setReglesStale]  = useState(false)
 
   const logTime = () => new Date().toLocaleTimeString('fr-FR', { hour:'2-digit', minute:'2-digit', second:'2-digit' })
   const addLog  = useCallback((label, msg, color='#64748b') => { setAgentLog(l=>[...l,{time:logTime(),label,msg,color}]) }, [])
@@ -127,48 +167,36 @@ export default function App() {
     if (data.type==='alerte') {
       if (data.lstm) setDernierLstm(prev => ({...prev, ...data.lstm}))
 
-      // Nettoyer les marqueurs LLM bruts sous toutes leurs formes
-      const rawContent = data.content || ''
-      const cleanContent = rawContent
-        .replace(/---INCIDENT---/g, '')
-        .replace(/---RECOMMENDATION---/g, '')
-        .replace(/\*\*Severity:\*\*\s*(CRITICAL|HIGH|MONITORING|IMPORTANT|CRITIQUE|SURVEILLANCE)\s*\n?/gi, '')
-        .replace(/```bash\s*\nCopy\s*\n/g, '```bash\n')
-        .replace(/bashcopier/g, '')
-        .replace(/bash\nCopy\n/g, '')
-        .replace(/bash\nCopy/g, '')
-        .trim()
-
-      // Parser les sections depuis le contenu brut (avant nettoyage complet)
-      // pour extraire correctement incident et reco
-      const incidentPart = rawContent.includes('---RECOMMENDATION---')
-        ? rawContent.split('---RECOMMENDATION---')[0].replace('---INCIDENT---','').trim()
-        : rawContent
-      const recoPart = rawContent.includes('---RECOMMENDATION---')
-        ? rawContent.split('---RECOMMENDATION---')[1].trim()
-        : rawContent
-      const titleMatch = recoPart.match(/\*\*Fix title:\*\*\s*(.+)/)
-      const recoTitle  = titleMatch ? titleMatch[1].trim() : (data.anomalies?.[0]?.message || 'Infrastructure Issue')
+      // ← MODIFIÉ : data.structured est le JSON généré par le LLM (voir
+      // incident_prompt.py), déjà validé côté backend (action_id/params).
+      // data.content reste un texte markdown lisible (surveillance._rendre_markdown,
+      // rendu déterministe depuis structured -- jamais une 2e requête LLM),
+      // utilisé ici pour le fil de chat et comme repli si le parsing JSON a échoué.
+      const structured   = data.structured || {}
+      const parseFailed  = !!structured._parse_failed
+      const cleanContent = (data.content || '').trim()
 
       setChatMessages(m=>[...m,{...data, content: cleanContent, id:data.id||`alert_${Date.now()}`}])
 
       // Récupérer les métriques complètes du nœud concerné (niveaux 1+2+3)
-      // pour les injecter dans la carte Recommendations
-      const cibleNom   = data.anomalies?.[0]?.cible || ''
+      // pour les injecter dans la carte Recommendations -- target_node vient
+      // maintenant directement du LLM (champ structuré, validé côté
+      // backend), plus jamais deviné depuis une phrase.
+      const cibleNoeud = structured.target_node || data.anomalies?.[0]?.cible || ''
       const noeudLive  = cluster?.noeuds?.find(n =>
-        n.nom?.toLowerCase() === cibleNom?.toLowerCase() ||
-        cibleNom?.toLowerCase().includes(n.nom?.toLowerCase())
+        n.nom?.toLowerCase() === cibleNoeud?.toLowerCase() ||
+        cibleNoeud?.toLowerCase().includes(n.nom?.toLowerCase())
       ) || cluster?.noeuds?.[0] || {}
 
       setSuggestions(s=>[...s, {
-        title:       recoTitle,
-        description: recoPart,
-        severity:    data.anomalies?.[0]?.niveau || 'HIGH',
+        structured,
+        title:       structured.fix_title || data.anomalies?.[0]?.message || 'Infrastructure Issue',
+        severity:    structured.severity || data.anomalies?.[0]?.niveau || 'HIGH',
         status:      'OPEN',
         timestamp:   data.timestamp,
-        target:      data.anomalies?.[0]?.cible || 'cluster',
+        target:      structured.target_node || data.anomalies?.[0]?.cible || 'cluster',
+        target_vmid: structured.target_vmid ?? null,
         rapport:     data.rapport,
-        incident:    incidentPart,
         // Métriques niveau 1
         cpu_pct:     noeudLive.cpu_pct     ?? null,
         ram_pct:     noeudLive.ram_pct     ?? null,
@@ -188,25 +216,37 @@ export default function App() {
         net_drop_in:           noeudLive.net_drop_in           ?? null,
         net_drop_out:          noeudLive.net_drop_out          ?? null,
         // Métriques niveau 3
-        cpu_temp_max_c:          noeudLive.cpu_temp_max_c          ?? null,
-        smart_ok:                noeudLive.smart_ok                ?? null,
-        smart_reallocated_sectors:noeudLive.smart_reallocated_sectors?? null,
-        zfs_arc_hit_rate:        noeudLive.zfs_arc_hit_rate        ?? null,
-        zfs_arc_size_gb:         noeudLive.zfs_arc_size_gb         ?? null,
-        zfs_available:           noeudLive.zfs_available            ?? null,
-        corosync_ok:             noeudLive.corosync_ok              ?? null,
-        corosync_quorum_ok:      noeudLive.corosync_quorum_ok       ?? null,
-        load_avg_1m:             noeudLive.load_avg_1m              ?? null,
+        cpu_temp_max_c:            noeudLive.cpu_temp_max_c            ?? null,
+        smart_ok:                  noeudLive.smart_ok                  ?? null,
+        smart_reallocated_sectors: noeudLive.smart_reallocated_sectors ?? null,
+        zfs_arc_hit_rate:          noeudLive.zfs_arc_hit_rate          ?? null,
+        zfs_arc_size_gb:           noeudLive.zfs_arc_size_gb           ?? null,
+        zfs_available:             noeudLive.zfs_available             ?? null,
+        corosync_ok:               noeudLive.corosync_ok               ?? null,
+        corosync_quorum_ok:        noeudLive.corosync_quorum_ok        ?? null,
+        load_avg_1m:               noeudLive.load_avg_1m               ?? null,
       }])
 
-      setIncidents(a=>[...a,...(data.anomalies||[]).map(an=>({
-        ...an,
+      // ← CORRIGÉ : UNE seule entrée par événement "alerte" (une analyse
+      // LLM = un incident), pas une par anomalie brute dans .map(). Avant,
+      // 7 anomalies détectées au même cycle créaient 7 cartes distinctes
+      // dans Incidents, toutes avec le MÊME "structured" collé dessus --
+      // cliquer sur n'importe laquelle affichait un contenu identique,
+      // donnant l'impression trompeuse d'une répétition sans fin. Même
+      // principe que suggestions (PageRecommendations) juste au-dessus,
+      // qui faisait déjà ça correctement -- les deux pages représentent
+      // maintenant la même chose : une occurrence d'incident, pas une
+      // anomalie individuelle. La liste complète des anomalies reste
+      // disponible via inc.anomalies (tableau), affichée en plus dans
+      // PageIncidents.jsx -- une info que Recommendations ne montre pas
+      // (elle, ne montre que les causes retenues par le LLM).
+      setIncidents(a=>[...a, {
+        anomalies: data.anomalies || [],
         timestamp: data.timestamp,
         score:     data.lstm?.score ?? 0.0,
         rapport:   data.rapport,
-        incident:  incidentPart,
-        vms:       []
-      }))])
+        structured,
+      }])
       addLog('AI Engine',`Incident: ${data.anomalies?.[0]?.message?.slice(0,50)||'anomaly'}`,'#ef4444')
       return
     }
@@ -245,14 +285,105 @@ export default function App() {
 
   useEffect(() => {
     fetch('/api/cluster').then(r=>r.json()).then(d=>{if(!d.error)setCluster(d)}).catch(()=>{})
-    const loadRegles=()=>fetch('/api/regles').then(r=>r.json()).then(d=>{if(d.regles&&d.regles.length>0)setReglesDyn(d.regles)}).catch(()=>{})
+    // ← MODIFIÉ : on lit maintenant aussi regles_perimees dans la réponse
+    // (point 3/9 — bandeau "STALE" dans PageMonitoringRules)
+    const loadRegles=()=>fetch('/api/regles').then(r=>r.json()).then(d=>{
+      if(d.regles&&d.regles.length>0)setReglesDyn(d.regles)
+      setReglesStale(!!d.regles_perimees)
+    }).catch(()=>{})
     loadRegles()
+    // ← AJOUT : charge l'historique des incidents depuis /api/rapports
+    // (déjà existant côté backend, jamais appelé jusqu'ici -- exactement
+    // le même trou que /api/regles avant son propre correctif). Chaque
+    // rapport .md encode déjà tout ce qu'il faut dans son propre nom de
+    // fichier ("report_20260811_023953_critique.md" -> date + sévérité) --
+    // reconstruire depuis ça est plus simple et plus fiable que regrouper
+    // des lignes d'anomalies éparses depuis /api/anomalies/historique.
+    // Ces entrées historiques n'ont pas le JSON structuré complet (jamais
+    // persisté séparément, seulement rendu dans le texte du .md) -- la
+    // liste "anomalies" reste vide et "structured" absent pour elles ;
+    // PageIncidents.jsx gère déjà ce cas (repli propre), le bouton
+    // "Open report" reste pleinement fonctionnel pour voir l'analyse
+    // complète depuis le fichier persisté.
+    // ← MODIFIÉ (pagination) : /api/rapports retourne maintenant
+    // {rapports, total, offset, limit} au lieu d'un tableau brut -- charge
+    // 100 rapports au démarrage (rapide), avec loadMoreHistory()
+    // permettant de charger les suivants à la demande plutôt que tout
+    // d'un coup, indispensable après des mois d'utilisation avec des
+    // milliers de rapports accumulés.
+    fetch('/api/rapports?limit=100&offset=0').then(r=>r.json()).then(data=>{
+      const rapports = data.rapports || []
+      setHistoryTotal(data.total || 0)
+      setHistoryOffset(rapports.length)
+      if (rapports.length === 0) return
+      const historique = rapports.map(rapportVersIncident).reverse() // plus recent au plus ancien -> reverse() car PageIncidents affiche déjà [...incidents].reverse()
+      // ← CORRIGÉ (course critique) : avant, setIncidents(historique)
+      // REMPLAÇAIT tout l'état -- si un incident arrivait EN DIRECT (avec
+      // ses données riches) pendant que cet appel réseau était encore en
+      // cours, et que l'appel se terminait APRÈS, il écrasait cet
+      // incident fraîchement arrivé par sa version dégradée (juste le
+      // résumé, déjà réécrite sur disque à ce moment-là). Fusionne
+      // maintenant avec ce qui existe déjà -- dédoublonné par nom de
+      // rapport, la version EN DIRECT (plus riche) est toujours
+      // prioritaire sur le doublon venant de l'historique.
+      //
+      // ← RETIRÉ : Recommendations n'a volontairement PAS de rechargement
+      // d'historique, contrairement à Incidents. Essayé une fois, retiré --
+      // ça affichait des centaines d'entrées "PAST" sans bouton
+      // fonctionnel, étiquetées par erreur "AI response could not be
+      // parsed" (message FAUX : l'IA n'a jamais échoué, l'analyse complète
+      // n'a simplement jamais été sauvegardée nulle part de récupérable).
+      // Recommendations reste l'espace de travail pour ce qui est
+      // actionnable MAINTENANT -- l'historique complet, avec son vrai
+      // contexte, reste consultable sur la page Incidents et via le
+      // rapport persisté, sans dupliquer (en pire) ce même contenu ici.
+      setIncidents(actuels => {
+        const rapportsExistants = new Set(actuels.map(inc => inc.rapport).filter(Boolean))
+        const historiqueSansDoublons = historique.filter(h => !rapportsExistants.has(h.rapport))
+        return [...historiqueSansDoublons, ...actuels]
+      })
+    }).catch(()=>{})
     const t1=setInterval(()=>setUptime(u=>u+1),1000), t3=setInterval(loadRegles,300000)
     addLog('System','OpsPilot initialized','#3b82f6')
     addLog('Connectivity','Cluster connection established','#22c55e')
     return()=>{clearInterval(t1);clearInterval(t3)}
   }, [])
   useEffect(()=>{if(connected)addLog('Network','Real-time stream active','#22c55e')},[connected])
+  // ← AJOUT : document.title suit maintenant la page active -- avant,
+  // rien ne le mettait à jour nulle part dans le code vu cette session,
+  // il restait figé sur un ancien nom de projet ("Agent AI — Monitoring
+  // Autonome", antérieur au renommage en OpsPilot). Ce useEffect écrase
+  // ce titre statique dès le montage, puis le met à jour à chaque
+  // changement de page.
+  useEffect(()=>{
+    const p = PAGES.find(x=>x.id===page)
+    document.title = p ? `OpsPilot — ${p.label}` : 'OpsPilot'
+  },[page])
+
+  // ← AJOUT : charge le lot suivant de rapports historiques à la demande
+  // (bouton "Load more" dans PageIncidents.jsx) -- plutôt que de tout
+  // charger au démarrage, indispensable une fois des mois de rapports
+  // accumulés.
+  const loadMoreHistory = useCallback(async () => {
+    if (loadingMore) return
+    setLoadingMore(true)
+    try {
+      const r = await fetch(`/api/rapports?limit=100&offset=${historyOffset}`)
+      const data = await r.json()
+      const rapports = data.rapports || []
+      setHistoryTotal(data.total || 0)
+      setHistoryOffset(o => o + rapports.length)
+      if (rapports.length > 0) {
+        const nouveaux = rapports.map(rapportVersIncident).reverse()
+        setIncidents(actuels => {
+          const rapportsExistants = new Set(actuels.map(inc => inc.rapport).filter(Boolean))
+          const sansDoublons = nouveaux.filter(h => !rapportsExistants.has(h.rapport))
+          return [...sansDoublons, ...actuels]
+        })
+      }
+    } catch { /* silencieux -- le bouton reste disponible pour réessayer */ }
+    finally { setLoadingMore(false) }
+  }, [historyOffset, loadingMore])
 
   const sendChat = useCallback((text=chatInput)=>{
     const q=(text||chatInput).trim(); if(!q||thinking) return
@@ -460,9 +591,10 @@ export default function App() {
         <main style={{ flex:1, overflow:page==='assistant'?'hidden':'auto', padding:'20px 24px', display:'flex', flexDirection:'column' }}>
           {page==='dashboard'       && <PageDashboard       cluster={cluster} history={history} incidents={incidents} agentLog={agentLog} dernier_lstm={dernierLstm}/>}
           {page==='infrastructure'  && <PageInfrastructure  cluster={cluster} history={history}/>}
-          {page==='incidents'       && <PageIncidents       incidents={incidents}/>}
-          {page==='rules'           && <PageMonitoringRules reglesDynamiques={reglesDyn}/>}
-          {page==='recommendations' && <PageRecommendations suggestions={suggestions}/>}
+          {page==='incidents'       && <PageIncidents       incidents={incidents} historyTotal={historyTotal} historyOffset={historyOffset} loadingMore={loadingMore} onLoadMore={loadMoreHistory}/>}
+          {/* ← MODIFIÉ : ajout de stale={reglesStale} (point 3/9, bandeau STALE) */}
+          {page==='rules'           && <PageMonitoringRules reglesDynamiques={reglesDyn} stale={reglesStale}/>}
+          {page==='recommendations' && <PageRecommendations suggestions={suggestions} vms={vmsLive} hasHistory={incidents.length > 0}/>}
           {page==='log'             && <PageSystemLog       agentLog={agentLog}/>}
           {page==='assistant'       && <PageAssistant messages={chatMessages} thinking={thinking} input={chatInput} setInput={setChatInput} onSend={sendChat} onEdit={editChat} onClear={clearChat} connected={connected} send={send}/>}
         </main>

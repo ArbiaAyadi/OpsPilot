@@ -6,15 +6,25 @@ Tables :
   metrics_history    → métriques cluster toutes les 60s (hypertable TimescaleDB)
   anomalies          → incidents détectés
   alert_rules        → règles générées par le LLM
-  recommendations    → recommandations avec statut
+  recommendations    → recommandations avec statut (schéma créé, PAS ENCORE UTILISÉ --
+                        aucune fonction n'écrit/lit cette table dans ce fichier,
+                        confirmé en le relisant intégralement -- à brancher ou
+                        retirer selon ce qui est décidé)
   chat_history       → historique conversations
   reports            → rapports markdown générés
+  action_history     → ← AJOUT : actions de remédiation exécutées (Human-in-the-Loop,
+                        voir action_executor.py). Avant cet ajout, cet historique ne
+                        vivait qu'en mémoire (_action_history, une liste Python dans
+                        action_executor.py) -- perdu à chaque redémarrage de l'agent.
+                        Pour un outil comparé à PagerDuty/Datadog, la piste d'audit de
+                        "quelle action a été exécutée, quand, avec quel résultat"
+                        devrait survivre à un redémarrage, comme le reste.
 
 Install :
   pip install psycopg2-binary --break-system-packages
   
 Config .env :
-  DB_HOST=localhost
+  DB_HOST=192.168.138.133
   DB_PORT=5432
   DB_NAME=opspilot
   DB_USER=opspilot
@@ -42,7 +52,7 @@ except ImportError:
 # Configuration
 # ══════════════════════════════════════════════════════════════════════════════
 DB_CONFIG = {
-    "host":     os.getenv("DB_HOST", "localhost"),
+    "host":     os.getenv("DB_HOST", "192.168.138.133"),
     "port":     int(os.getenv("DB_PORT", "5432")),
     "dbname":   os.getenv("DB_NAME", "opspilot"),
     "user":     os.getenv("DB_USER", "opspilot"),
@@ -59,6 +69,7 @@ _mem_alert_rules:     list = []
 _mem_recommendations: list = []
 _mem_chat_history:    list = []
 _mem_reports:         list = []
+_mem_action_history:  list = []  # ← AJOUT : repli mémoire pour action_history
 _mem_lock = threading.Lock()
 
 
@@ -187,10 +198,29 @@ def init_db() -> bool:
         );
         """)
 
+        # ← AJOUT : action_history -- actions de remédiation exécutées
+        # (Human-in-the-Loop, voir action_executor.py). params en JSONB --
+        # les paramètres varient par action (node/vmid/target_node/limit/
+        # min_mb selon l'action_id), JSONB est le type PostgreSQL naturel
+        # pour une forme de données variable comme celle-ci.
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS action_history (
+            id          SERIAL PRIMARY KEY,
+            time        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            action_id   TEXT NOT NULL,
+            params      JSONB,
+            success     BOOLEAN NOT NULL,
+            message     TEXT
+        );
+        """)
+
         # Index pour performances
         cur.execute("CREATE INDEX IF NOT EXISTS idx_metrics_noeud ON metrics_history(noeud, time DESC);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_anomalies_statut ON anomalies(statut, time DESC);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_rules_actif ON alert_rules(actif);")
+        # ← AJOUT : index pour action_history, même schéma que les autres --
+        # les requêtes de lecture sont toujours "les N plus récentes"
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_actions_time ON action_history(time DESC);")
 
         conn.commit()
         cur.close()
@@ -556,6 +586,66 @@ def get_rapports_db(limit: int = 30) -> list:
         finally:
             release_conn(conn)
     return []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Historique des actions de remédiation (Human-in-the-Loop)
+# ══════════════════════════════════════════════════════════════════════════════
+# ← AJOUT : avant, action_executor.py gardait cet historique UNIQUEMENT
+# dans _action_history (liste Python en mémoire) -- perdu à chaque
+# redémarrage de l'agent. Même schéma try/except + repli mémoire que le
+# reste de ce fichier -- rien de nouveau conceptuellement, juste appliqué
+# à cette donnée précise qui ne l'avait pas encore.
+def sauvegarder_action(action_id: str, params: dict, success: bool, message: str):
+    """Sauvegarde une action de remédiation exécutée (Human-in-the-Loop)."""
+    if DB_OK:
+        conn = get_conn()
+        if not conn:
+            return
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+            INSERT INTO action_history (action_id, params, success, message)
+            VALUES (%s, %s, %s, %s)
+            """, (action_id, psycopg2.extras.Json(params or {}), success, message))
+            conn.commit()
+            cur.close()
+        except Exception as e:
+            print(f"[DB] Erreur action: {e}")
+            conn.rollback()
+        finally:
+            release_conn(conn)
+    else:
+        with _mem_lock:
+            _mem_action_history.append({
+                "time":      datetime.now().isoformat(),
+                "action_id": action_id,
+                "params":    params,
+                "success":   success,
+                "message":   message,
+            })
+
+
+def get_action_history_db(limit: int = 50) -> list:
+    """Récupère l'historique des actions de remédiation exécutées."""
+    if DB_OK:
+        conn = get_conn()
+        if not conn:
+            return []
+        try:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute("SELECT * FROM action_history ORDER BY time DESC LIMIT %s", (limit,))
+            rows = cur.fetchall()
+            cur.close()
+            return [dict(r) for r in rows]
+        except Exception as e:
+            print(f"[DB] Erreur get actions: {e}")
+            return []
+        finally:
+            release_conn(conn)
+    else:
+        with _mem_lock:
+            return list(reversed(_mem_action_history[-limit:]))
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -1,3 +1,31 @@
+"""
+surveillance.py — Boucle principale de l'agent.
+
+← AJOUT (format JSON structuré, voir incident_prompt.py) : analyser_anomalie_llm()
+retourne maintenant un dict {"markdown": str, "structured": dict} au lieu
+d'un simple str. "markdown" est un rendu déterministe (Python, jamais une
+2e requête LLM) du JSON structuré, pour ne RIEN casser côté
+report_writer.py/notifications.py qui attendaient déjà du texte lisible.
+"structured" est le nouveau JSON complet (causes, steps avec action_id
+validés, target_node/vmid) transmis en plus au frontend via le websocket
+-- PageRecommendations.jsx peut l'utiliser directement, sans plus jamais
+deviner un nœud/VMID par regex sur du texte libre.
+
+← AJOUT (ré-escalade du score IA) : la vérification "AI score >= seuil"
+n'avait AUCUNE protection contre la répétition, contrairement au reste des
+anomalies (voir anomaly_detector.py) -- si le score restait élevé sur
+plusieurs cycles (ce qui arrive précisément quand un problème métrique
+reste critique longtemps), "nouvelles" n'était jamais vide, redéclenchant
+un nouveau rapport/alerte dès la fin de chaque cooldown, en continu. Même
+principe palier+ré-escalade que anomaly_detector.py appliqué ici : un
+changement de palier (nouveau/désescalade/escalade) déclenche toujours,
+un palier CRITIQUE soutenu ré-déclenche après INTERVALLE_REESCALADE_AI_S,
+rester dans le même palier IMPORTANT ne redéclenche plus rien entre-temps.
+
+Le reste de ce fichier (fusion Prometheus, hyperviseur, PC hôte, marge
+réelle, alertes services...) est inchangé -- voir les commentaires "← AJOUT"
+existants ci-dessous pour l'historique de ces sections.
+"""
 import asyncio
 import sys
 import threading
@@ -14,14 +42,32 @@ from agent.config        import (SURVEILLANCE_INTERVAL, SCORE_MIN_LLM,
 from agent.groq_client   import appeler_groq, rate_limiter
 from agent.prompts       import system_prompt_surveillance
 from agent.anomaly_detector import detecter_anomalies
-from agent.rules_engine  import generer_regles_ia, regles_necessitent_regeneration
+from agent.rules_engine  import generer_regles_ia, regles_necessitent_regeneration, marquer_etat_accessibilite
 from agent.report_writer import sauvegarder_rapport
+from agent.etat_normalizer import normaliser_etat
+# ← AJOUT : parser_reponse_llm (voir incident_prompt.py -- extrait et
+# valide le JSON structuré retourné par le LLM), obtenir_doc_url (rétablit
+# le lien "docs" retiré par inadvertance côté frontend)
+from agent.incident_prompt import classifier_anomalies, construire_prompt_specifique, parser_reponse_llm, obtenir_doc_url
+
+# ← Alias de compatibilite : agent/routes.py fait
+# "from agent.surveillance import _normaliser_etat" -- garde ce nom utilisable
+# ici pour ne rien casser ailleurs dans le projet.
+_normaliser_etat = normaliser_etat
 
 dernier_etat  = {}
 dernier_lstm  = {"score": 0.0, "seuil": 0.5, "drift": False,
                  "score_if": 0.0, "score_lstm": 0.0, "lstm_ready": False}
 dernier_rapport_ts = 0.0
 ws_queue: asyncio.Queue = None
+
+# ← AJOUT : suivi du palier du score IA d'un cycle à l'autre, pour la
+# ré-escalade -- même principe que anomaly_detector._derniere_alerte_par_cle,
+# mais localisé ici car cette vérification vit directement dans la boucle
+# de surveillance, pas dans detecter_anomalies().
+_dernier_ai_niveau = None
+_derniere_alerte_ai_ts = 0.0
+INTERVALLE_REESCALADE_AI_S = 1800  # 30 min -- cohérent avec anomaly_detector.py
 
 
 def set_ws_queue(q: asyncio.Queue):
@@ -44,323 +90,99 @@ def _proxmox_accessible(etat: dict) -> bool:
     return online >= MIN_NOEUDS_ONLINE_POUR_ALERTE
 
 
-def _normaliser_etat(etat: dict) -> dict:
-    if not etat:
-        return {}
-    normalized = dict(etat)
-    noeuds = etat.get("noeuds") or etat.get("nodes") or []
-    noeuds_norm = []
-    for n in noeuds:
-        ram_used  = float(n.get("ram_used_gb")  or n.get("mem_used_gb")  or 0)
-        ram_total = float(n.get("ram_total_gb") or n.get("mem_total_gb") or 0)
-        n_norm = {
-            "nom":           n.get("nom") or n.get("name") or n.get("node") or "unknown",
-            "statut":        n.get("statut") or n.get("status") or "unknown",
-            "cpu_pct":       float(n.get("cpu_pct") or n.get("cpu") or 0),
-            "cpu_cores":     int(n["cpu_cores"]) if n.get("cpu_cores") else int(n.get("maxcpu", 0)),
-            "ram_pct":       float(n.get("ram_pct") or n.get("mem_pct") or 0),
-            "ram_used_gb":   ram_used,
-            "ram_total_gb":  ram_total,
-            "disk_pct":      float(n.get("disk_pct") or 0),
-            "disk_used_gb":  float(n.get("disk_used_gb") or 0),
-            "disk_total_gb": float(n.get("disk_total_gb") or 0),
-            "net_in_mbps":   float(n.get("net_in_mbps") or 0),
-            "net_out_mbps":  float(n.get("net_out_mbps") or 0),
-            "uptime_h":      float(n.get("uptime_h") or (n.get("uptime", 0) / 3600)),
-            "vms_running":   int(n.get("vms_running") or 0),
-            "swap_pct":              float(n.get("swap_pct", 0)),
-            "cpu_iowait_pct":        float(n.get("cpu_iowait_pct", 0)),
-            "disk_read_iops":        float(n.get("disk_read_iops", 0)),
-            "disk_write_iops":       float(n.get("disk_write_iops", 0)),
-            "disk_read_latency_ms":  float(n.get("disk_read_latency_ms", 0)),
-            "disk_write_latency_ms": float(n.get("disk_write_latency_ms", 0)),
-            "net_errors_in":         float(n.get("net_errors_in", 0)),
-            "net_errors_out":        float(n.get("net_errors_out", 0)),
-            "net_drop_in":           float(n.get("net_drop_in", 0)),
-            "net_drop_out":          float(n.get("net_drop_out", 0)),
-            "cpu_temp_max_c":            float(n.get("cpu_temp_max_c", 0)),
-            "smart_ok":                  bool(n.get("smart_ok", True)),
-            "smart_reallocated_sectors": int(n.get("smart_reallocated_sectors", 0)),
-            "smart_uncorrectable":       int(n.get("smart_uncorrectable", 0)),
-            "smart_pending_sectors":     int(n.get("smart_pending_sectors", 0)),
-            "smart_disks_monitored":     int(n.get("smart_disks_monitored", 0)),
-            "zfs_arc_hit_rate":          float(n.get("zfs_arc_hit_rate", 0)),
-            "zfs_arc_size_gb":           float(n.get("zfs_arc_size_gb", 0)),
-            "zfs_available":             bool(n.get("zfs_available", False)),
-            "corosync_ok":               bool(n.get("corosync_ok", True)),
-            "corosync_quorum_ok":        bool(n.get("corosync_quorum_ok", True)),
-            "fd_used_pct":               float(n.get("fd_used_pct", 0)),
-            "load_avg_1m":               float(n.get("load_avg_1m", 0)),
-            "procs_running":             int(n.get("procs_running", 0)),
-            "net_available":             bool(n.get("net_available", False)),
-            "io_available":              bool(n.get("io_available", False)),
-            "hw_available":              bool(n.get("hw_available", False)),
-            "smart_available":           bool(n.get("smart_available", False)),
-        }
-        if n_norm["ram_pct"] == 0 and ram_total > 0:
-            n_norm["ram_pct"] = round(ram_used / ram_total * 100, 2)
-        noeuds_norm.append(n_norm)
-    normalized["noeuds"] = noeuds_norm
-    vms = etat.get("vms") or []
-    normalized["vms"] = [{
-        "vmid":        str(v.get("vmid") or ""),
-        "nom":         v.get("nom") or v.get("name") or str(v.get("vmid", "?")),
-        "statut":      v.get("statut") or v.get("status") or "unknown",
-        "noeud":       v.get("noeud") or v.get("node") or "unknown",
-        "vcpus":       int(v.get("vcpus") or v.get("cpus") or 0),
-        "maxmem_gb":   float(v.get("maxmem_gb") or (v.get("maxmem", 0) / 1e9)),
-        "maxdisk_gb":  float(v.get("maxdisk_gb") or (v.get("maxdisk", 0) / 1e9)),
-        "cpu_pct":     float(v.get("cpu_pct") or v.get("cpu", 0) * 100),
-        "ram_pct":     float(v.get("ram_pct") or 0),
-        "net_in_mbps": float(v.get("net_in_mbps") or 0),
-        "net_out_mbps":float(v.get("net_out_mbps") or 0),
-        "uptime_h":    float(v.get("uptime_h") or 0),
-    } for v in vms]
-    normalized["net_in_mbps"]  = round(sum(n.get("net_in_mbps", 0)  for n in noeuds_norm), 3)
-    normalized["net_out_mbps"] = round(sum(n.get("net_out_mbps", 0) for n in noeuds_norm), 3)
-    normalized["vms_running"]  = int(
-        etat.get("vms_running") or
-        sum(1 for v in normalized["vms"] if v["statut"] in ("running", "en cours")) or
-        sum(n.get("vms_running", 0) for n in noeuds_norm)
-    )
-    if "alertes" not in normalized:
-        normalized["alertes"] = etat.get("alerts") or []
-    return normalized
-
-
-def _classifier_anomalies(anomalies: list) -> tuple:
-    types = {k: [] for k in ["ram","disk","cpu","swap","iowait","temp","vm","quorum","network","ai"]}
-    for a in anomalies:
-        msg   = a.get("message", "").lower()
-        cible = a.get("cible", "").lower()
-        t     = a.get("type", "")
-        if t == "ai_score":                    types["ai"].append(a)
-        elif "quorum" in msg:                  types["quorum"].append(a)
-        elif "temp" in msg:                    types["temp"].append(a)
-        elif "iowait" in msg or "latency" in msg: types["iowait"].append(a)
-        elif "swap" in msg:                    types["swap"].append(a)
-        elif "disk" in msg:                    types["disk"].append(a)
-        elif "ram" in msg or "memory" in msg:  types["ram"].append(a)
-        elif "cpu" in msg:                     types["cpu"].append(a)
-        elif "vm" in msg or "vm" in cible:     types["vm"].append(a)
-        elif "net" in msg:                     types["network"].append(a)
-        else:
-            if "ram" in cible:    types["ram"].append(a)
-            elif "disk" in cible: types["disk"].append(a)
-            elif "cpu" in cible:  types["cpu"].append(a)
-            else:                 types["ram"].append(a)
-    dominant = max((k for k in types if k != "ai"), key=lambda k: len(types[k]), default="ram")
-    if not types[dominant]:
-        dominant = "ram"
-    return types, dominant
-
-
-def _calculer_seuils_franchis(etat: dict) -> str:
+def _cle_dedup_anomalie(a: dict) -> tuple:
     """
-    Calcule pour chaque noeud quel seuil exact est franchi (WARNING ou CRITICAL).
-    Couvre les niveaux 1, 2 et 3 pour que le LLM ait le contexte complet.
+    Cle de deduplication pour une anomalie du cycle courant. Cas particulier
+    "service_down" : deux sources independantes peuvent detecter la MEME
+    panne. Toute autre anomalie garde la cle d'origine (cible, message).
     """
-    lignes = []
-    for n in etat.get("noeuds", []):
-        nom  = n.get("nom", "?")
-        ram  = n.get("ram_pct", 0)
-        cpu  = n.get("cpu_pct", 0)
-        disk = n.get("disk_pct", 0)
-        swap = n.get("swap_pct", 0)
-
-        # ── Niveau 1 ─────────────────────────────────────────────────────────
-        if ram >= 85:
-            lignes.append(f"  {nom} RAM: {ram:.1f}% — CRITICAL threshold breached (>=85%) — target <70%")
-        elif ram >= 75:
-            lignes.append(f"  {nom} RAM: {ram:.1f}% — WARNING threshold breached (>=75%) — NOT yet critical (<85%) — target <70%")
-
-        if cpu >= 90:
-            lignes.append(f"  {nom} CPU: {cpu:.1f}% — CRITICAL threshold breached (>=90%) — target <75%")
-        elif cpu >= 80:
-            lignes.append(f"  {nom} CPU: {cpu:.1f}% — WARNING threshold breached (>=80%) — NOT yet critical (<90%) — target <75%")
-
-        if disk >= 90:
-            lignes.append(f"  {nom} DISK: {disk:.1f}% — CRITICAL threshold breached (>=90%) — target <75%")
-        elif disk >= 80:
-            lignes.append(f"  {nom} DISK: {disk:.1f}% — WARNING threshold breached (>=80%) — NOT yet critical (<90%) — target <75%")
-
-        # ── Niveau 2 ─────────────────────────────────────────────────────────
-        if swap >= 80:
-            lignes.append(f"  {nom} SWAP: {swap:.1f}% — CRITICAL threshold breached (>=80%) — target 0%")
-        elif swap >= 50:
-            lignes.append(f"  {nom} SWAP: {swap:.1f}% — WARNING threshold breached (>=50%) — target 0%")
-
-        iowait = n.get("cpu_iowait_pct", 0)
-        if iowait >= 30:
-            lignes.append(f"  {nom} IOWAIT: {iowait:.1f}% — CRITICAL threshold breached (>=30%) — target <5%")
-        elif iowait >= 15:
-            lignes.append(f"  {nom} IOWAIT: {iowait:.1f}% — WARNING threshold breached (>=15%) — NOT yet critical (<30%) — target <5%")
-
-        read_lat  = n.get("disk_read_latency_ms", 0)
-        write_lat = n.get("disk_write_latency_ms", 0)
-        if read_lat >= 50 or write_lat >= 50:
-            lignes.append(f"  {nom} DISK LATENCY: read={read_lat:.1f}ms write={write_lat:.1f}ms — CRITICAL (>=50ms) — target <10ms")
-        elif read_lat >= 20 or write_lat >= 20:
-            lignes.append(f"  {nom} DISK LATENCY: read={read_lat:.1f}ms write={write_lat:.1f}ms — WARNING (>=20ms) — target <10ms")
-
-        net_err = n.get("net_errors_in", 0) + n.get("net_errors_out", 0)
-        net_drop = n.get("net_drop_in", 0) + n.get("net_drop_out", 0)
-        if net_err > 10:
-            lignes.append(f"  {nom} NET ERRORS: {net_err:.0f}/s — CRITICAL (>10/s) — target 0")
-        elif net_err > 0:
-            lignes.append(f"  {nom} NET ERRORS: {net_err:.0f}/s — WARNING (>0) — target 0")
-        if net_drop > 0:
-            lignes.append(f"  {nom} NET DROPS: {net_drop:.0f}/s — WARNING — target 0")
-
-        # ── Niveau 3 ─────────────────────────────────────────────────────────
-        temp = n.get("cpu_temp_max_c", 0)
-        if temp >= 85:
-            lignes.append(f"  {nom} CPU TEMP: {temp:.0f}°C — CRITICAL threshold breached (>=85°C) — target <70°C")
-        elif temp >= 75:
-            lignes.append(f"  {nom} CPU TEMP: {temp:.0f}°C — WARNING threshold breached (>=75°C) — NOT yet critical (<85°C) — target <70°C")
-
-        if not n.get("smart_ok", True):
-            reallocated = n.get("smart_reallocated_sectors", 0)
-            uncorr      = n.get("smart_uncorrectable", 0)
-            lignes.append(f"  {nom} SMART: FAIL — reallocated sectors={reallocated} uncorrectable={uncorr} — REPLACE DISK IMMEDIATELY")
-
-        if n.get("zfs_available"):
-            zfs_hit = n.get("zfs_arc_hit_rate", 0)
-            if zfs_hit < 70:
-                lignes.append(f"  {nom} ZFS ARC: hit rate={zfs_hit:.1f}% — CRITICAL (<70%) — increase ARC size — target >90%")
-            elif zfs_hit < 85:
-                lignes.append(f"  {nom} ZFS ARC: hit rate={zfs_hit:.1f}% — WARNING (<85%) — target >90%")
-
-        if not n.get("corosync_ok", True):
-            quorum = "OK" if n.get("corosync_quorum_ok", True) else "LOST"
-            lignes.append(f"  {nom} COROSYNC: DEGRADED — quorum={quorum} — CRITICAL: cluster may stop VMs")
-
-    return "\n".join(lignes) if lignes else "  All metrics within normal range"
+    if a.get("type") == "service_down":
+        cible   = a.get("cible", "")
+        service = cible.split("/")[-1].strip().lower() if cible else a.get("message", "").lower()
+        return ("service_down", service)
+    return (a.get("cible", ""), a.get("message", "").lower().strip())
 
 
-def _construire_prompt_specifique(anomalies: list, etat: dict, lstm: dict) -> str:
-    anomalies_str   = "\n".join([f"- [{a['niveau']}] {a['message']}" for a in anomalies])
-    _, dominant     = _classifier_anomalies(anomalies)
-    seuils_franchis = _calculer_seuils_franchis(etat)
-    noeuds_ctx = ""
-    for n in etat.get("noeuds", []):
-        ram_free  = round(n.get("ram_total_gb", 0) - n.get("ram_used_gb", 0), 1)
-        disk_free = round(n.get("disk_total_gb", 0) - n.get("disk_used_gb", 0), 1)
-        # Niveau 1
-        noeuds_ctx += (
-            f"  {n.get('nom','?')}: CPU={n.get('cpu_pct',0):.1f}% (cores={n.get('cpu_cores',0)}) "
-            f"RAM={n.get('ram_pct',0):.1f}% ({n.get('ram_used_gb',0):.1f}/{n.get('ram_total_gb',0):.1f}GB FREE={ram_free}GB) "
-            f"DISK={n.get('disk_pct',0):.1f}% ({n.get('disk_used_gb',0):.1f}/{n.get('disk_total_gb',0):.1f}GB FREE={disk_free}GB) "
-            f"STATUS={n.get('statut','?')}\n"
-        )
-        # Niveau 2 — uniquement si valeurs non nulles
-        l2_parts = []
-        if n.get("swap_pct", 0) > 0:
-            l2_parts.append(f"SWAP={n.get('swap_pct',0):.1f}%")
-        if n.get("cpu_iowait_pct", 0) > 0:
-            l2_parts.append(f"IOWAIT={n.get('cpu_iowait_pct',0):.1f}%")
-        if n.get("disk_read_latency_ms", 0) > 0:
-            l2_parts.append(f"READ_LAT={n.get('disk_read_latency_ms',0):.1f}ms WRITE_LAT={n.get('disk_write_latency_ms',0):.1f}ms")
-        if n.get("net_errors_in", 0) > 0 or n.get("net_errors_out", 0) > 0:
-            l2_parts.append(f"NET_ERRORS={n.get('net_errors_in',0)+n.get('net_errors_out',0):.0f}/s")
-        if n.get("load_avg_1m", 0) > 0:
-            l2_parts.append(f"LOAD={n.get('load_avg_1m',0):.2f}")
-        if l2_parts:
-            noeuds_ctx += f"    L2: {' | '.join(l2_parts)}\n"
-        # Niveau 3 — uniquement si valeurs disponibles
-        l3_parts = []
-        if n.get("cpu_temp_max_c", 0) > 0:
-            l3_parts.append(f"TEMP={n.get('cpu_temp_max_c',0):.0f}°C")
-        if not n.get("smart_ok", True):
-            l3_parts.append(f"SMART=FAIL(reallocated={n.get('smart_reallocated_sectors',0)})")
-        if n.get("zfs_available"):
-            l3_parts.append(f"ZFS_ARC={n.get('zfs_arc_hit_rate',0):.0f}%hit")
-        if not n.get("corosync_ok", True):
-            l3_parts.append(f"COROSYNC=DEGRADED(quorum={'OK' if n.get('corosync_quorum_ok',True) else 'LOST'})")
-        if l3_parts:
-            noeuds_ctx += f"    L3: {' | '.join(l3_parts)}\n"
-    vms_ctx = "".join(
-        f"  VM{v.get('vmid','?')} {v.get('nom','?')} on {v.get('noeud','?')}: "
-        f"status={v.get('statut','?')} CPU={v.get('cpu_pct',0):.1f}% RAM={v.get('ram_pct',0):.1f}% maxmem={v.get('maxmem_gb',0):.1f}GB\n"
-        for v in etat.get("vms", [])
-    ) or "  No VM data\n"
-    specific = {
-        "ram":     "IMMEDIATE COMMAND: ps aux --sort=-%mem | head -15\nTARGET: RAM < 70% | THRESHOLDS: WARNING 75% CRITICAL 85%\nLONG-TERM: qm set <vmid> --balloon <min_mb> && echo 1 > /sys/kernel/mm/ksm/run",
-        "disk":    "IMMEDIATE COMMAND: du -sh /var/lib/vz/dump/* 2>/dev/null | sort -rh | head -10 && df -h /\nTARGET: DISK < 75% | THRESHOLDS: WARNING 80% CRITICAL 90%\nLONG-TERM: apt clean && journalctl --vacuum-size=500M -- keep last 2 backups",
-        "cpu":     "IMMEDIATE COMMAND: top -b -n1 | head -20\nTARGET: CPU < 75% | THRESHOLDS: WARNING 80% CRITICAL 90%\nLONG-TERM: qm set <vmid> --cpulimit 1.0 or reduce vCPUs",
-        "swap":    "IMMEDIATE COMMAND: free -h && swapon --show && dmesg | grep -i 'out of memory' | tail -5\nTARGET: SWAP 0% | THRESHOLDS: WARNING 20% CRITICAL 50%\nLONG-TERM: qm set <vmid> --balloon <min_mb>",
-        "iowait":  "IMMEDIATE COMMAND: iostat -x 1 3\nTARGET: IOWAIT < 5% await < 10ms | THRESHOLDS: WARNING 10% CRITICAL 20%\nLONG-TERM: qm set <vmid> --ide0 local:<disk>,mbps_rd=100,mbps_wr=50",
-        "temp":    "IMMEDIATE COMMAND: sensors && dmesg | grep -i 'throttl' | tail -5\nTARGET: TEMP < 70C | THRESHOLDS: WARNING 75C CRITICAL 85C\nLONG-TERM: apt install lm-sensors && sensors-detect",
-        "vm":      "IMMEDIATE COMMAND: qm list && journalctl -u qmeventd --since '1 hour ago' | tail -20\nTARGET: All critical VMs running\nLONG-TERM: PVE GUI -> Datacenter -> HA -> Add for critical VMs",
-        "quorum":  "IMMEDIATE COMMAND: pvecm status && corosync-cfgtool -s\nTARGET: Quorate: Yes\nLONG-TERM: pvecm qdevice setup <ip>",
-        "network": "IMMEDIATE COMMAND: ip -s link show && ethtool eth0\nTARGET: 0 errors 0 drops\nLONG-TERM: verify switch port config",
-        "ai":      "IMMEDIATE COMMAND: pvesh get /nodes/pve1/status && pvesh get /nodes/pve2/status\nTARGET: AI score < 0.50\nLONG-TERM: check recent changes (new VMs, updates)",
-    }.get(dominant, "IMMEDIATE COMMAND: ps aux --sort=-%mem | head -15\nTARGET: RAM < 70%")
+def _rendre_markdown(donnees: dict) -> str:
+    """
+    Convertit le JSON structuré (voir incident_prompt.parser_reponse_llm)
+    en texte markdown lisible -- déterministe, en Python, JAMAIS une 2e
+    requête au LLM. Sert à report_writer.py (rapports .md sur disque) et
+    notifications.py (corps des emails/Ntfy), qui attendaient déjà du
+    texte avant ce changement -- leur comportement reste identique, seule
+    la SOURCE du texte change.
+    """
+    if donnees.get("_parse_failed"):
+        return donnees.get("_raw", "Erreur: réponse LLM illisible.")
 
-    return f"""You are a senior Proxmox VE infrastructure engineer. Generate a precise incident report.
+    lignes = [
+        f"**Severity:** {donnees.get('severity','?')}",
+        f"**Summary:** {donnees.get('summary','')}",
+        "",
+        "**Causes:**",
+    ]
+    for c in donnees.get("causes", []) or []:
+        lignes.append(f"- {c}")
 
-CLUSTER STATE:
-{noeuds_ctx}
-VMs:
-{vms_ctx}
-ANOMALIES:
-{anomalies_str}
-AI Score: {lstm['score']:.4f} / threshold {lstm['seuil']:.4f}
+    lignes += ["", f"### {donnees.get('fix_title') or 'Recommended Action'}", ""]
+    if donnees.get("warning"):
+        lignes.append(f"⚠️ **{donnees['warning']}**")
+        lignes.append("")
 
-EXACT THRESHOLD STATUS — COPY THESE VERBATIM, DO NOT CHANGE ANY NUMBER:
-{seuils_franchis}
+    for step in donnees.get("steps", []) or []:
+        phase = (step.get("phase") or "").upper().replace("_", " ")
+        lignes.append(f"**[{phase}]** {step.get('action','')}")
+        if step.get("command"):
+            lignes.append(f"```bash\n{step['command']}\n```")
+        lignes.append("")
 
-PROBLEM TYPE GUIDANCE:
-{specific}
-
-STRICT RULES — VIOLATION = WRONG ANSWER:
-1. pve1/pve2 are HYPERVISOR NODES — NEVER use pct commands on them
-2. COPY threshold values verbatim from EXACT THRESHOLD STATUS above — never round up or invent
-3. If EXACT THRESHOLD STATUS says "WARNING threshold breached (>=75%)" — write WARNING, NOT CRITICAL
-4. If EXACT THRESHOLD STATUS says "CRITICAL threshold breached (>=85%)" — write CRITICAL
-5. **Severity** in ---INCIDENT--- MUST match: WARNING breach = HIGH, CRITICAL breach = CRITICAL
-6. **target** in ---RECOMMENDATION--- MUST always be the value from PROBLEM TYPE GUIDANCE (e.g. <70% for RAM), NOT the threshold value
-7. Use ONLY the command from PROBLEM TYPE GUIDANCE — no other command
-8. Write ONLY the command inside the bash block — no comments, no labels
-9. Max 200 words total
-
-Format:
----INCIDENT---
-**Severity:** [CRITICAL if metric>=critical_threshold, HIGH if metric>=warning_threshold only]
-**Summary:** [node name] [metric] at [exact value from CLUSTER STATE] [breaches WARNING/CRITICAL] threshold ([threshold value]) — [business risk]
-**Causes:**
-- [copy from EXACT THRESHOLD STATUS verbatim]
-
----RECOMMENDATION---
-**Fix title:** [max 8 words, action-oriented]
-**Problem:** [exact value] exceeds [warning OR critical] threshold ([threshold]) on [node] — target: [target from PROBLEM TYPE GUIDANCE]
-**Immediate action:**
-```bash
-[EXACT COMMAND from PROBLEM TYPE GUIDANCE]
-```
-[What this command shows — 1 sentence]
-**Long-term:** [1 concrete Proxmox command with timeline]"""
+    return "\n".join(lignes)
 
 
-async def analyser_anomalie_llm(anomalies: list, etat: dict) -> str:
-    lstm   = dernier_lstm
-    prompt = _construire_prompt_specifique(anomalies, etat, lstm)
-    loop   = asyncio.get_event_loop()
-    return await loop.run_in_executor(
+async def analyser_anomalie_llm(anomalies: list, etat: dict) -> dict:
+    """
+    ← MODIFIÉ : retourne maintenant {"markdown": str, "structured": dict}
+    au lieu d'un simple str. Le prompt demande désormais un objet JSON --
+    parser_reponse_llm() l'extrait et valide chaque action_id proposé
+    contre action_executor.ACTION_META avant de le renvoyer.
+
+    ← AJOUT : "doc_url" injecté dans les données structurées après coup, en
+    Python (jamais par le LLM) -- via obtenir_doc_url(dominant), calculée
+    de façon déterministe. Rétablit le lien "docs" retiré par inadvertance
+    côté PageRecommendations.jsx quand l'ancienne bibliothèque SOLUTIONS
+    (qui portait ce lien) a été retirée.
+    """
+    lstm = dernier_lstm
+    # ← MODIFIÉ : construire_prompt_specifique retourne maintenant
+    # (prompt, dominant), pas juste prompt.
+    prompt, dominant = construire_prompt_specifique(anomalies, etat, lstm)
+    loop = asyncio.get_event_loop()
+    reponse_brute = await loop.run_in_executor(
         None,
-        lambda: appeler_groq(system_prompt_surveillance(etat, lstm), [], prompt, 900),
+        lambda: appeler_groq(system_prompt_surveillance(etat, lstm), [], prompt, 1400),
     )
+    donnees = parser_reponse_llm(reponse_brute)
+    if not donnees.get("_parse_failed"):
+        try:
+            donnees["doc_url"] = obtenir_doc_url(dominant)
+        except Exception:
+            donnees["doc_url"] = None
+    return {
+        "markdown":   _rendre_markdown(donnees),
+        "structured": donnees,
+    }
 
 
 def _boucle_surveillance(loop: asyncio.AbstractEventLoop):
-    global dernier_etat, dernier_lstm, dernier_rapport_ts
+    global dernier_etat, dernier_lstm, dernier_rapport_ts, _dernier_ai_niveau, _derniere_alerte_ai_ts
 
     try:
-        from proxmox_api import get_etat_cluster
+        from proxmox_api import get_etat_cluster, get_etat_tous_clusters
         PROXMOX_OK = True
     except Exception:
         PROXMOX_OK = False
         def get_etat_cluster(): return {}
+        def get_etat_tous_clusters(): return {}
 
     try:
         from metriques_proxmox import collecter_metriques_cluster
@@ -369,7 +191,41 @@ def _boucle_surveillance(loop: asyncio.AbstractEventLoop):
         PROMETHEUS_OK = False
         def collecter_metriques_cluster(): return {}
 
+    try:
+        from hypervisor_detect import get_hypervisor_context
+        HYPERVISOR_OK = True
+    except Exception as e:
+        HYPERVISOR_OK = False
+        print(f"[Hypervisor] Module non disponible: {e}")
+        def get_hypervisor_context():
+            return {"type": "unknown", "recommandation_ram": "Check systemd-detect-virt on the node."}
+
+    try:
+        from metriques_pc_hote import collecter_ressources_pc_hote
+        HOTE_PC_OK = True
+    except Exception as e:
+        HOTE_PC_OK = False
+        print(f"[PC Host] Module non disponible: {e}")
+        def collecter_ressources_pc_hote(): return {"disponible": False}
+
+    try:
+        from hypervisor_metrics import collecter_metriques_hyperviseur
+        HYPERVISOR_METRICS_OK = True
+    except Exception as e:
+        HYPERVISOR_METRICS_OK = False
+        print(f"[Hypervisor Metrics] Module non disponible: {e}")
+        def collecter_metriques_hyperviseur(type_hyperviseur): return {"disponible": False}
+
     _analyser = None
+
+    try:
+        from vm_app_monitor import collecter_metriques_apps
+        VM_MONITOR_OK = True
+    except Exception as e:
+        VM_MONITOR_OK = False
+        print(f"[VM Monitor] Non disponible: {e}")
+        def collecter_metriques_apps(): return {"alertes_apps": []}
+
     try:
         from ml_analyser import MLAnalyseur
         _analyser = MLAnalyseur()
@@ -383,15 +239,89 @@ def _boucle_surveillance(loop: asyncio.AbstractEventLoop):
     while True:
         try:
             if PROXMOX_OK:
-                etat_raw     = get_etat_cluster()
-                etat         = _normaliser_etat(etat_raw)
+                etat_raw     = get_etat_tous_clusters()
+                etat         = normaliser_etat(etat_raw)
+                etat["hyperviseur"] = get_hypervisor_context()
+
+                if HYPERVISOR_METRICS_OK:
+                    try:
+                        etat["hyperviseur_metriques"] = collecter_metriques_hyperviseur(
+                            etat["hyperviseur"].get("type", "unknown")
+                        )
+                        if etat["hyperviseur_metriques"].get("disponible"):
+                            noeuds_liste = etat.get("noeuds", [])
+                            etat["hyperviseur_metriques"]["vms_ram_allouee_gb"] = round(
+                                sum(n.get("ram_total_gb", 0) for n in noeuds_liste), 2
+                            )
+                            etat["hyperviseur_metriques"]["vms_disk_allouee_gb"] = round(
+                                sum(n.get("disk_total_gb", 0) for n in noeuds_liste), 2
+                            )
+                    except Exception as e:
+                        print(f"[Hypervisor Metrics] Erreur collecte: {e}")
+                        etat["hyperviseur_metriques"] = {"disponible": False}
+
+                if HOTE_PC_OK:
+                    try:
+                        etat["hote_physique"] = collecter_ressources_pc_hote()
+                    except Exception as e:
+                        print(f"[PC Host] Erreur collecte: {e}")
+                        etat["hote_physique"] = {"disponible": False}
+
+                hote = etat.get("hote_physique", {})
+                hyp  = etat.get("hyperviseur_metriques", {})
+                if hote.get("disponible") and hyp.get("disponible"):
+                    reserve_windows = hote.get("vmware_allocation", {}) \
+                                          .get("windows_reserve", {}) \
+                                          .get("ram_gb", 0)
+                    vms_allouee = hyp.get("vms_ram_allouee_gb", 0)
+                    hyp["marge_reelle_ram_gb"] = round(
+                        hote.get("ram_total_gb", 0) - reserve_windows - vms_allouee, 2
+                    )
+
+                    host_ram_total  = hote.get("ram_total_gb", 0)
+                    host_disk_total = hote.get("disk_total_gb", 0)
+                    if host_ram_total > 0:
+                        hyp["vms_ram_allouee_pct_hote"] = round(
+                            vms_allouee / host_ram_total * 100, 1
+                        )
+                    if host_disk_total > 0:
+                        hyp["vms_disk_allouee_pct_hote"] = round(
+                            hyp.get("vms_disk_allouee_gb", 0) / host_disk_total * 100, 1
+                        )
+
+                if VM_MONITOR_OK:
+                    try:
+                        apps_data = collecter_metriques_apps()
+                        etat["apps"] = apps_data
+                        from vm_app_monitor import (detecter_services_vm, get_metriques_services_vm,
+                                                     generer_alertes_services)
+                        alertes_services = []
+                        for v in etat.get("vms", []):
+                            vmid = v.get("vmid")
+                            v["services_detectes"]  = detecter_services_vm(vmid)
+                            v["metriques_services"] = get_metriques_services_vm(
+                                vmid, v["services_detectes"], vcpus=v.get("vcpus")
+                            )
+                            alertes_services.extend(
+                                generer_alertes_services(vmid, v["services_detectes"], v["metriques_services"])
+                            )
+                        etat.setdefault("alertes", []).extend(
+                            apps_data.get("alertes_apps", [])
+                        )
+                        etat["alertes"].extend(alertes_services)
+                        if apps_data.get("alertes_apps"):
+                            print(f"[VM Monitor] {len(apps_data['alertes_apps'])} alertes applicatives")
+                        if alertes_services:
+                            print(f"[VM Monitor] {len(alertes_services)} alerte(s) service generique(s) (DOWN/derive)")
+                    except Exception as e:
+                        print(f"[VM Monitor] Erreur collecte: {e}")
                 dernier_etat = etat
             else:
                 etat = dernier_etat
 
-            # ── GARDE PRINCIPALE : Proxmox offline = zero alerte ─────────────
             if not _proxmox_accessible(etat):
                 print("[Monitoring] Proxmox non accessible -- alertes et rapports suspendus")
+                marquer_etat_accessibilite(False)
                 if ws_queue and etat:
                     asyncio.run_coroutine_threadsafe(ws_queue.put({
                         "type":      "etat_cluster",
@@ -403,6 +333,7 @@ def _boucle_surveillance(loop: asyncio.AbstractEventLoop):
                 continue
 
             if etat:
+                marquer_etat_accessibilite(True)
                 try:
                     from database import sauvegarder_metriques
                     sauvegarder_metriques(etat, dernier_lstm.get("score", 0.0))
@@ -411,7 +342,7 @@ def _boucle_surveillance(loop: asyncio.AbstractEventLoop):
 
             if etat and regles_necessitent_regeneration() and rate_limiter.slots() >= 5:
                 print("[AI Rules] Generation automatique des regles (24h)...")
-                asyncio.run_coroutine_threadsafe(generer_regles_ia(etat), loop).result(timeout=60)
+                asyncio.run_coroutine_threadsafe(generer_regles_ia(etat), loop).result(timeout=120)
             elif etat and etat_prec and rate_limiter.slots() >= 5:
                 vms_avant    = {v["vmid"] for v in etat_prec.get("vms", [])}
                 vms_apres    = {v["vmid"] for v in etat.get("vms", [])}
@@ -446,7 +377,7 @@ def _boucle_surveillance(loop: asyncio.AbstractEventLoop):
                     if match:
                         for key in (
                             "swap_pct","swap_used_gb","swap_total_gb",
-                            "cpu_iowait_pct","load_avg_1m","load_avg_5m","load_avg_15m",
+                            "cpu_iowait_pct","cpu_steal_pct","load_avg_1m","load_avg_5m","load_avg_15m",
                             "disk_read_iops","disk_write_iops","disk_read_mbps","disk_write_mbps",
                             "disk_read_latency_ms","disk_write_latency_ms",
                             "net_in_mbps","net_out_mbps","net_errors_in","net_errors_out",
@@ -468,6 +399,20 @@ def _boucle_surveillance(loop: asyncio.AbstractEventLoop):
                         n["net_available"] = n["io_available"] = n["hw_available"] = n["smart_available"] = False
                 if "cluster" in metriques_prom:
                     etat["cluster"] = {**etat.get("cluster", {}), **metriques_prom["cluster"]}
+
+                prom_vms = metriques_prom.get("vms", [])
+                for v in etat.get("vms", []):
+                    match = next(
+                        (pv for pv in prom_vms if str(pv.get("vmid","")) == str(v.get("vmid",""))),
+                        None
+                    )
+                    if match:
+                        for key in ("disk_used_gb", "disk_total_gb", "disk_pct",
+                                    "disk_read_mbps", "disk_write_mbps",
+                                    "net_in_mbps", "net_out_mbps"):
+                            if key in match and match[key]:
+                                v[key] = match[key]
+
                 dernier_etat = etat
 
             if _analyser and etat:
@@ -497,8 +442,6 @@ def _boucle_surveillance(loop: asyncio.AbstractEventLoop):
                             if k in metriques_prom:
                                 metriques_ml[k] = metriques_prom[k]
                     score, seuil = _analyser.analyser(metriques_ml)
-                    # ── Seuil plancher : evite les faux positifs si le LSTM
-                    # s'est entraine sur des donnees nulles (Proxmox eteint).
                     seuil = max(float(seuil), SCORE_PLANCHER_LSTM)
                     ml_stats = _analyser.get_stats() if hasattr(_analyser, "get_stats") else {}
                     dernier_lstm = {
@@ -513,19 +456,39 @@ def _boucle_surveillance(loop: asyncio.AbstractEventLoop):
                     print(f"[AI Engine] {e}")
 
             nouvelles = detecter_anomalies(etat, etat_prec)
+
+            # ← MODIFIÉ (ré-escalade du score IA) : avant, cette vérification
+            # ajoutait une entrée à CHAQUE cycle où le score restait au-dessus
+            # du seuil, sans aucune protection contre la répétition -- si le
+            # score restait élevé longtemps (ce qui arrive précisément quand
+            # un problème métrique reste critique), "nouvelles" n'était
+            # jamais vide, redéclenchant un nouveau rapport dès la fin de
+            # chaque cooldown, en continu. Même principe que
+            # anomaly_detector.py : un changement de palier déclenche
+            # toujours, un palier CRITIQUE soutenu ré-déclenche après
+            # INTERVALLE_REESCALADE_AI_S, rester dans le même palier
+            # IMPORTANT entre-temps ne redéclenche plus rien.
             if dernier_lstm["score"] >= SCORE_MIN_LLM:
                 ai_score  = dernier_lstm["score"]
                 ai_niveau = "CRITIQUE" if ai_score >= 0.8 else "IMPORTANT"
-                nouvelles.append({
-                    "niveau": ai_niveau, "cible": "cluster",
-                    "message": f"AI score {ai_score:.4f} > threshold {dernier_lstm['seuil']:.4f}",
-                    "type": "ai_score",
-                })
+                nouveau_palier = ai_niveau != _dernier_ai_niveau
+                reescalade = (ai_niveau == "CRITIQUE"
+                              and (time.time() - _derniere_alerte_ai_ts) >= INTERVALLE_REESCALADE_AI_S)
+                if nouveau_palier or reescalade:
+                    nouvelles.append({
+                        "niveau": ai_niveau, "cible": "cluster",
+                        "message": f"AI score {ai_score:.4f} > threshold {dernier_lstm['seuil']:.4f}",
+                        "type": "ai_score",
+                    })
+                    _derniere_alerte_ai_ts = time.time()
+                _dernier_ai_niveau = ai_niveau
+            else:
+                _dernier_ai_niveau = None
 
             seen_keys = set()
             nouvelles_dedup = []
             for a in nouvelles:
-                key = (a.get("cible", ""), a.get("message", "").lower().strip())
+                key = _cle_dedup_anomalie(a)
                 if key not in seen_keys:
                     seen_keys.add(key)
                     nouvelles_dedup.append(a)
@@ -536,30 +499,35 @@ def _boucle_surveillance(loop: asyncio.AbstractEventLoop):
                 slots = rate_limiter.slots()
                 print(f"[Monitoring] {len(nouvelles)} anomalie(s) -- slots: {slots}")
                 if slots >= 5:
-                    analyse = asyncio.run_coroutine_threadsafe(
+                    resultat_llm = asyncio.run_coroutine_threadsafe(
                         analyser_anomalie_llm(nouvelles, etat), loop
                     ).result(timeout=30)
+                    analyse    = resultat_llm["markdown"]
+                    structured = resultat_llm["structured"]
                 else:
-                    lignes  = "\n".join(f"- [{a['niveau']}] {a['message']}" for a in nouvelles)
-                    analyse = f"**Anomalies** (quota reserve)\n\n{lignes}"
+                    lignes     = "\n".join(f"- [{a['niveau']}] {a['message']}" for a in nouvelles)
+                    analyse    = f"**Anomalies** (quota reserve)\n\n{lignes}"
+                    structured = {"_parse_failed": True, "_raw": analyse}
 
                 etat_rapport       = etat if etat and etat.get("noeuds") else dernier_etat
-                nom_rapport        = sauvegarder_rapport(nouvelles, analyse, etat_rapport, dernier_lstm["score"])
+                # ← MODIFIÉ : structured transmis en plus -- report_writer.py
+                # construit maintenant le rapport directement depuis le JSON,
+                # plus par reparsing fragile du texte markdown.
+                nom_rapport        = sauvegarder_rapport(nouvelles, analyse, etat_rapport, dernier_lstm["score"], structured)
                 dernier_rapport_ts = now
 
                 if ws_queue:
                     asyncio.run_coroutine_threadsafe(ws_queue.put({
                         "type": "alerte", "role": "assistant",
-                        "content": analyse, "anomalies": nouvelles,
+                        "content": analyse,
+                        "structured": structured,
+                        "anomalies": nouvelles,
                         "timestamp": datetime.now().isoformat(),
                         "rapport": nom_rapport, "lstm": dernier_lstm,
                     }), loop)
 
                 try:
                     from notifications import envoyer_alerte
-                    # Sévérité réelle = niveau max des anomalies métriques (hors score AI pur)
-                    # Le score AI seul ne suffit pas à marquer l'email CRITIQUE
-                    # si toutes les métriques réelles sont en WARNING
                     anomalies_metriques = [a for a in nouvelles if a.get("type") != "ai_score"]
                     anomalies_ai        = [a for a in nouvelles if a.get("type") == "ai_score"]
                     if any(a.get("niveau") == "CRITIQUE" for a in anomalies_metriques):
@@ -567,11 +535,14 @@ def _boucle_surveillance(loop: asyncio.AbstractEventLoop):
                     elif anomalies_metriques:
                         niv_max = "IMPORTANT"
                     elif any(a.get("niveau") == "CRITIQUE" for a in anomalies_ai):
-                        # Score AI CRITIQUE uniquement si pas d'anomalie métrique
                         niv_max = "CRITIQUE"
                     else:
                         niv_max = "IMPORTANT"
-                    titre_notif = nouvelles[0].get("message", "Anomalie")[:60]
+
+                    types_dict, dominant_type = classifier_anomalies(nouvelles)
+                    anomalie_dominante = types_dict[dominant_type][0] if types_dict.get(dominant_type) else nouvelles[0]
+                    titre_notif = anomalie_dominante.get("message", "Anomalie")[:60]
+
                     asyncio.run_coroutine_threadsafe(
                         envoyer_alerte(titre=titre_notif, message=analyse, severite=niv_max,
                                        anomalies=nouvelles, etat=etat), loop

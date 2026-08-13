@@ -1,4 +1,3 @@
-
 import os
 import requests
 import urllib3
@@ -7,22 +6,40 @@ from dotenv import load_dotenv
 load_dotenv()
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+PVE1_IP = os.getenv("PVE1_IP", "192.168.138.100")
+PVE2_IP = os.getenv("PVE2_IP", "192.168.138.101")
+
 HOST         = os.getenv("PROXMOX_HOST", "192.168.138.100")
 TOKEN_ID     = os.getenv("PROXMOX_TOKEN_ID", "root@pam!opspilot")
 TOKEN_SECRET = os.getenv("PROXMOX_TOKEN_SECRET", "")
 VERIFY_SSL   = os.getenv("PROXMOX_VERIFY_SSL", "false").lower() == "true"
 
-BASE_URL = f"https://{HOST}:8006/api2/json"
 HEADERS  = {"Authorization": f"PVEAPIToken={TOKEN_ID}={TOKEN_SECRET}"}
+
+# ── Correspondance nom de nœud -> IP directe ──────────────────────────────────
+# Utilisée par get_vms() pour interroger chaque nœud SUR SA PROPRE IP plutôt
+# que de toujours passer par HOST (qui devrait alors relayer la requête en
+# interne si ce n'est pas le même nœud -- lent si le nœud cible est chargé).
+# Un nœud absent de cette liste (ex: nouveau nœud ajouté au cluster) retombe
+# automatiquement sur l'ancien comportement de relais -- toujours détecté,
+# juste un peu moins vite tant que son IP n'est pas ajoutée ici.
+NODE_IP_MAP = {
+    "pve1": PVE1_IP,
+    "pve2": PVE2_IP,
+}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Base
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _get(endpoint: str):
+def _get(endpoint: str, timeout: int = 5, host_override: str = None):
+    # BASE_URL recalculé à chaque appel pour que le fallback fonctionne.
+    # host_override : interroger une IP précise sans changer le HOST global
+    # (utilisé par get_vms() pour parler à chaque nœud directement).
+    base_url = f"https://{host_override or HOST}:8006/api2/json"
     try:
-        r = requests.get(f"{BASE_URL}{endpoint}", headers=HEADERS, verify=VERIFY_SSL, timeout=10)
+        r = requests.get(f"{base_url}{endpoint}", headers=HEADERS, verify=VERIFY_SSL, timeout=timeout)
         r.raise_for_status()
         return r.json().get("data")
     except Exception as e:
@@ -44,9 +61,6 @@ def get_noeuds() -> list[dict]:
             "nom":          n.get("node"),
             "statut":       n.get("status"),
             "cpu_pct":      round(n.get("cpu", 0) * 100, 1),
-            # FIX : Proxmox renvoie nativement "maxcpu" (nombre de cores) sur
-            # /nodes — ce champ n'etait jamais lu, donc cpu_cores arrivait
-            # toujours a 0 jusqu'au frontend (affiche "? cores").
             "cpu_cores":    n.get("maxcpu", 0),
             "ram_used_gb":  round(n.get("mem", 0) / 1024**3, 1),
             "ram_total_gb": round(maxmem / 1024**3, 1),
@@ -67,7 +81,12 @@ def get_vms(noeud: str = None) -> list[dict]:
     noeuds_list = [noeud] if noeud else [n["nom"] for n in get_noeuds()]
     vms = []
     for node in noeuds_list:
-        data = _get(f"/nodes/{node}/qemu") or []
+        # ← Interroger directement l'IP du nœud si on la connaît (pve1/pve2)
+        # -- évite le relais interne via HOST, donc insensible à sa charge.
+        # Nœud inconnu (nouveau nœud jamais vu) -> relais habituel, toujours
+        # détecté, juste potentiellement plus lent.
+        ip_directe = NODE_IP_MAP.get(node)
+        data = _get(f"/nodes/{node}/qemu", timeout=10, host_override=ip_directe) or []
         for vm in data:
             maxmem = max(vm.get("maxmem", 1), 1)
             vms.append({
@@ -82,12 +101,14 @@ def get_vms(noeud: str = None) -> list[dict]:
                 "disk_gb":      round(vm.get("disk", 0) / 1024**3, 1),
                 "uptime_h":     round(vm.get("uptime", 0) / 3600, 1),
                 "cpus":         vm.get("cpus", 1),
+                "tags":         vm.get("tags", ""),
             })
     return vms
 
 
 def get_vm_config(noeud: str, vmid: int) -> dict:
-    config = _get(f"/nodes/{noeud}/qemu/{vmid}/config") or {}
+    ip_directe = NODE_IP_MAP.get(noeud)
+    config = _get(f"/nodes/{noeud}/qemu/{vmid}/config", host_override=ip_directe) or {}
     return {
         "vmid":    vmid,
         "noeud":   noeud,
@@ -97,14 +118,14 @@ def get_vm_config(noeud: str, vmid: int) -> dict:
         "os":      config.get("ostype", "unknown"),
         "tags":    config.get("tags", ""),
         "description": config.get("description", ""),
-        # GPU passthrough détecté si hostpci présent
         "gpu_passthrough": any(k.startswith("hostpci") for k in config),
         "hostpci_devices": [config[k] for k in config if k.startswith("hostpci")],
     }
 
 
 def get_vm_status(noeud: str, vmid: int) -> dict:
-    s = _get(f"/nodes/{noeud}/qemu/{vmid}/status/current") or {}
+    ip_directe = NODE_IP_MAP.get(noeud)
+    s = _get(f"/nodes/{noeud}/qemu/{vmid}/status/current", host_override=ip_directe) or {}
     maxmem = max(s.get("maxmem", 1), 1)
     return {
         "vmid":        vmid,
@@ -119,7 +140,6 @@ def get_vm_status(noeud: str, vmid: int) -> dict:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # NIVEAU 3 — Allocation vs Usage
-# Détecte les VMs sur-allouées (ressources réservées >> ressources utilisées)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_allocation_vs_usage() -> list[dict]:
@@ -138,7 +158,8 @@ def get_allocation_vs_usage() -> list[dict]:
 
     for noeud in noeuds:
         node_name = noeud["nom"]
-        vms = _get(f"/nodes/{node_name}/qemu") or []
+        ip_directe = NODE_IP_MAP.get(node_name)
+        vms = _get(f"/nodes/{node_name}/qemu", host_override=ip_directe) or []
 
         for vm in vms:
             if vm.get("status") != "running":
@@ -149,23 +170,19 @@ def get_allocation_vs_usage() -> list[dict]:
             maxmem = max(vm.get("maxmem", 1), 1)
             cpus_alloues = vm.get("cpus", 1)
 
-            # Utilisation réelle
-            ram_utilisee_gb  = round(vm.get("mem", 0) / 1024**3, 2)
-            ram_allouee_gb   = round(maxmem / 1024**3, 2)
-            ram_utilisee_pct = round(vm.get("mem", 0) / maxmem * 100, 1)
+            ram_utilisee_gb   = round(vm.get("mem", 0) / 1024**3, 2)
+            ram_allouee_gb    = round(maxmem / 1024**3, 2)
+            ram_utilisee_pct  = round(vm.get("mem", 0) / maxmem * 100, 1)
             ram_gaspillee_pct = round((1 - vm.get("mem", 0) / maxmem) * 100, 1)
 
-            cpu_utilise_pct   = round(vm.get("cpu", 0) * 100, 1)
-            cpu_gaspille_pct  = round((1 - vm.get("cpu", 0)) * 100, 1) if cpus_alloues > 0 else 0
+            cpu_utilise_pct  = round(vm.get("cpu", 0) * 100, 1)
+            cpu_gaspille_pct = round((1 - vm.get("cpu", 0)) * 100, 1) if cpus_alloues > 0 else 0
 
-            # RAM optimale recommandée (utilisation + 30% marge de sécurité)
             ram_recommandee_gb = round(ram_utilisee_gb * 1.3, 1)
             economie_ram_gb    = round(max(0, ram_allouee_gb - ram_recommandee_gb), 1)
 
-            # Score de gaspillage global (0 = parfait, 100 = tout gaspillé)
             score_gaspillage = round((ram_gaspillee_pct * 0.6 + cpu_gaspille_pct * 0.4), 1)
 
-            # Niveau d'alerte
             if score_gaspillage > 70:
                 niveau = "HIGH_WASTE"
             elif score_gaspillage > 50:
@@ -177,25 +194,17 @@ def get_allocation_vs_usage() -> list[dict]:
                 "vmid":               vmid,
                 "nom":                nom,
                 "noeud":              node_name,
-
-                # RAM
                 "ram_allouee_gb":     ram_allouee_gb,
                 "ram_utilisee_gb":    ram_utilisee_gb,
                 "ram_utilisee_pct":   ram_utilisee_pct,
                 "ram_gaspillee_pct":  ram_gaspillee_pct,
                 "ram_recommandee_gb": ram_recommandee_gb,
                 "economie_ram_gb":    economie_ram_gb,
-
-                # CPU
                 "cpus_alloues":       cpus_alloues,
                 "cpu_utilise_pct":    cpu_utilise_pct,
                 "cpu_gaspille_pct":   cpu_gaspille_pct,
-
-                # Score global
                 "score_gaspillage":   score_gaspillage,
                 "niveau":             niveau,
-
-                # Recommandation
                 "recommandation": (
                     f"Reduce RAM from {ram_allouee_gb} GB to {ram_recommandee_gb} GB "
                     f"(save {economie_ram_gb} GB)"
@@ -203,44 +212,33 @@ def get_allocation_vs_usage() -> list[dict]:
                 ),
             })
 
-    # Trier par score de gaspillage décroissant
     return sorted(rapport, key=lambda x: x["score_gaspillage"], reverse=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # NIVEAU 3 — GPU
-# Détecte les GPUs sur les noeuds Proxmox (physiques et passthrough)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_gpu_info() -> list[dict]:
     """
     Détecte les GPUs sur chaque noeud Proxmox.
-
-    Ce que Proxmox expose via son API :
-      - Périphériques PCI (dont GPU) via /nodes/{node}/hardware/pci
-      - Config des VMs avec hostpci (GPU passthrough)
-
-    Note : Proxmox n'expose pas l'utilisation GPU en temps réel via son API.
-    Pour l'utilisation, il faudrait nvidia-smi dans les VMs (via SSH ou agent).
     """
     noeuds = get_noeuds()
     gpus = []
 
     for noeud in noeuds:
         node_name = noeud["nom"]
-
-        # Lister les périphériques PCI du noeud
-        pci_devices = _get(f"/nodes/{node_name}/hardware/pci") or []
+        ip_directe = NODE_IP_MAP.get(node_name)
+        pci_devices = _get(f"/nodes/{node_name}/hardware/pci", host_override=ip_directe) or []
 
         for pci in pci_devices:
-            # Filtrer les GPUs (VGA, 3D, Display)
             device_class = str(pci.get("class", "")).lower()
             subsystem    = str(pci.get("subsystem_device_name", "")).lower()
             vendor       = str(pci.get("vendor_name", "")).lower()
             device_name  = str(pci.get("device_name", ""))
 
             is_gpu = (
-                "0x03" in device_class or  # Display controller
+                "0x03" in device_class or
                 "vga" in device_class or
                 "nvidia" in vendor or
                 "amd" in vendor or
@@ -250,27 +248,19 @@ def get_gpu_info() -> list[dict]:
             )
 
             if is_gpu:
-                # Vérifier si ce GPU est utilisé en passthrough
                 vms_using = _gpu_passthrough_vms(node_name, pci.get("id", ""))
 
                 gpus.append({
-                    "noeud":        node_name,
-                    "pci_id":       pci.get("id"),
-                    "nom":          device_name or "GPU inconnu",
-                    "vendor":       pci.get("vendor_name", "Unknown"),
-                    "class":        pci.get("class"),
-
-                    # Passthrough
+                    "noeud":             node_name,
+                    "pci_id":            pci.get("id"),
+                    "nom":               device_name or "GPU inconnu",
+                    "vendor":            pci.get("vendor_name", "Unknown"),
+                    "class":             pci.get("class"),
                     "en_passthrough":    len(vms_using) > 0,
                     "vms_utilisant_gpu": vms_using,
                     "nb_vms":            len(vms_using),
-
-                    # Statut
-                    "statut": "IN_USE" if vms_using else "AVAILABLE",
-
-                    # Note : utilisation % non disponible via API Proxmox
-                    # Pour avoir nvidia-smi : installer dans la VM ou sur le host
-                    "utilisation_pct": None,
+                    "statut":            "IN_USE" if vms_using else "AVAILABLE",
+                    "utilisation_pct":   None,
                     "note": "GPU utilization requires nvidia-smi on the host or VM",
                 })
 
@@ -279,16 +269,16 @@ def get_gpu_info() -> list[dict]:
 
 def _gpu_passthrough_vms(noeud: str, pci_id: str) -> list[str]:
     """Retourne les noms des VMs qui utilisent ce GPU en passthrough."""
-    vms = _get(f"/nodes/{noeud}/qemu") or []
+    ip_directe = NODE_IP_MAP.get(noeud)
+    vms = _get(f"/nodes/{noeud}/qemu", host_override=ip_directe) or []
     vms_avec_gpu = []
 
     for vm in vms:
         if vm.get("status") != "running":
             continue
         vmid   = vm.get("vmid")
-        config = _get(f"/nodes/{noeud}/qemu/{vmid}/config") or {}
+        config = _get(f"/nodes/{noeud}/qemu/{vmid}/config", host_override=ip_directe) or {}
 
-        # Chercher hostpci0, hostpci1, etc.
         for key, val in config.items():
             if key.startswith("hostpci") and pci_id in str(val):
                 vms_avec_gpu.append(vm.get("name", f"vm-{vmid}"))
@@ -301,10 +291,6 @@ def get_gpu_utilisation_ssh(noeud_ip: str) -> dict:
     """
     Optionnel : récupère l'utilisation GPU via nvidia-smi en SSH.
     Nécessite : pip install paramiko
-
-    Usage :
-        gpu = get_gpu_utilisation_ssh("192.168.138.100")
-        print(gpu["utilisation_pct"])
     """
     try:
         import paramiko
@@ -345,7 +331,8 @@ def get_gpu_utilisation_ssh(noeud_ip: str) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_stockage(noeud: str) -> list[dict]:
-    data = _get(f"/nodes/{noeud}/storage") or []
+    ip_directe = NODE_IP_MAP.get(noeud)
+    data = _get(f"/nodes/{noeud}/storage", host_override=ip_directe) or []
     result = []
     for s in data:
         total = max(s.get("total", 1), 1)
@@ -369,7 +356,27 @@ def get_etat_cluster() -> dict:
     Retourne l'état complet du cluster avec toutes les ressources.
     Niveau 1 (Critique) + Niveau 2 (Important) + Niveau 3 (Optimisation)
     """
-    noeuds = get_noeuds()
+    # ── FALLBACK AUTOMATIQUE pve1 → pve2 ─────────────────────────────────────
+    global HOST
+    _hosts = [
+        os.getenv("PVE1_IP", "192.168.138.100"),
+        os.getenv("PVE2_IP", "192.168.138.101"),
+    ]
+    noeuds = []
+    for _host in _hosts:
+        try:
+            HOST = _host
+            os.environ["PROXMOX_HOST"] = _host
+            noeuds = get_noeuds()
+            if noeuds:
+                print(f"[Proxmox API] Connecté via {_host}")
+                break
+        except Exception as _e:
+            print(f"[Proxmox API] {_host} inaccessible: {_e}")
+            if _host == _hosts[-1]:
+                return {"noeuds": [], "vms": [], "alertes": []}
+    # ── FIN FALLBACK ──────────────────────────────────────────────────────────
+
     vms    = get_vms()
 
     vms_running = [v for v in vms if v["statut"] == "running"]
@@ -379,7 +386,6 @@ def get_etat_cluster() -> dict:
     alertes = []
 
     for n in noeuds:
-        # RAM critique
         if n["ram_pct"] > 85:
             alertes.append({
                 "niveau":  "CRITIQUE",
@@ -387,7 +393,6 @@ def get_etat_cluster() -> dict:
                 "message": f"Node {n['nom']} — Memory critical: {n['ram_pct']}% ({n['ram_used_gb']}/{n['ram_total_gb']} GB)",
                 "type":    "ram",
             })
-        # Disk critique
         if n["disk_pct"] > 90:
             alertes.append({
                 "niveau":  "CRITIQUE",
@@ -395,7 +400,6 @@ def get_etat_cluster() -> dict:
                 "message": f"Node {n['nom']} — Disk critical: {n['disk_pct']}% ({n['disk_used_gb']}/{n['disk_total_gb']} GB)",
                 "type":    "disk",
             })
-        # CPU critique
         if n["cpu_pct"] > 80:
             alertes.append({
                 "niveau":  "CRITIQUE",
@@ -420,11 +424,10 @@ def get_etat_cluster() -> dict:
                 "type":    "ram",
             })
 
-    # ── Niveau 3 — Allocation vs Usage ───────────────────────────────────────
+    # ── Niveau 3 — Allocation vs Usage ────────────────────────────────────────
     allocation_rapport = []
     try:
         allocation_rapport = get_allocation_vs_usage()
-        # Alertes pour fort gaspillage
         for vm_alloc in allocation_rapport:
             if vm_alloc["niveau"] == "HIGH_WASTE":
                 alertes.append({
@@ -440,10 +443,6 @@ def get_etat_cluster() -> dict:
     gpu_info = []
     try:
         gpu_info = get_gpu_info()
-        # Alerte uniquement pour les vrais GPUs physiques non assignes.
-        # On exclut les adaptateurs graphiques virtuels (VMware SVGA, VirtualBox,
-        # QEMU VGA...) qui ne peuvent pas etre assignes en passthrough — ce sont
-        # des peripheriques de l'hyperviseur lui-meme, pas des GPUs utilisables.
         ADAPTATEURS_VIRTUELS = ("svga", "vmware", "virtualbox", "vbox", "qemu", "bochs", "cirrus", "virtio-vga")
         for gpu in gpu_info:
             nom_lower = gpu.get("nom","").lower()
@@ -465,8 +464,6 @@ def get_etat_cluster() -> dict:
         "vms_stopped":         len(vms_stopped),
         "alertes":             alertes,
         "nb_alertes":          len(alertes),
-
-        # Niveau 3
         "allocation_rapport":  allocation_rapport,
         "gpu_info":            gpu_info,
         "nb_vms_over_provisioned": len([a for a in allocation_rapport if a["niveau"] == "HIGH_WASTE"]),
@@ -507,3 +504,119 @@ if __name__ == "__main__":
             print(f"  [{a['niveau']}] {a['message']}")
     else:
         print("  All systems healthy")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SUPPORT MULTI-CLUSTER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _charger_clusters() -> list:
+    """
+    Charge tous les clusters depuis .env.
+    Si aucun CLUSTER_N_HOST défini → utilise la config existante (1 cluster).
+    Compatible avec le mode actuel — rien ne casse.
+    """
+    clusters = []
+    i = 1
+    while True:
+        host = os.getenv(f"CLUSTER_{i}_HOST")
+        if not host:
+            break
+        clusters.append({
+            "nom":          os.getenv(f"CLUSTER_{i}_NAME", f"Cluster-{i}"),
+            "host":         host,
+            "cluster_host": host,
+            "token_id":     os.getenv(f"CLUSTER_{i}_TOKEN_ID", TOKEN_ID),
+            "token_secret": os.getenv(f"CLUSTER_{i}_TOKEN_SECRET", TOKEN_SECRET),
+        })
+        i += 1
+
+    # Fallback : mode actuel (1 seul cluster)
+    if not clusters:
+        clusters.append({
+            "nom":          "MonCluster",
+            "host":         HOST,
+            "cluster_host": HOST,
+            "token_id":     TOKEN_ID,
+            "token_secret": TOKEN_SECRET,
+        })
+    return clusters
+
+
+def get_etat_tous_clusters() -> dict:
+    """
+    Interroge TOUS les clusters configurés et agrège les résultats.
+    Utilisé par surveillance.py à la place de get_etat_cluster().
+
+    En mode simple (un seul cluster "MonCluster", le cas homelab par défaut),
+    on tente PVE1_IP puis PVE2_IP avant d'abandonner. En mode multi-cluster
+    explicite (CLUSTER_N_HOST défini), chaque cluster garde son hôte fixe.
+    """
+    global HOST, HEADERS
+    clusters    = _charger_clusters()
+    tous_noeuds = []
+    toutes_vms  = []
+
+    for cluster in clusters:
+        hosts_a_essayer = [cluster["host"]]
+        if cluster["nom"] == "MonCluster":
+            hosts_a_essayer = [
+                os.getenv("PVE1_IP", "192.168.138.100"),
+                os.getenv("PVE2_IP", "192.168.138.101"),
+            ]
+
+        noeuds, vms = [], []
+        hote_connecte = None
+        for _host in hosts_a_essayer:
+            HOST    = _host
+            HEADERS = {
+                "Authorization": f"PVEAPIToken={cluster['token_id']}={cluster['token_secret']}"
+            }
+            try:
+                noeuds = get_noeuds()
+                if noeuds:
+                    vms = get_vms()
+                    hote_connecte = _host
+                    print(f"[Multi-Cluster] {cluster['nom']} connecté via {_host}: "
+                          f"{len(noeuds)} nœuds, {len(vms)} VMs")
+                    break
+            except Exception as e:
+                print(f"[Multi-Cluster] {cluster['nom']} via {_host} inaccessible: {e}")
+
+        if noeuds:
+            for n in noeuds:
+                n["cluster"]      = cluster["nom"]
+                n["cluster_host"] = hote_connecte
+            for v in vms:
+                v["cluster"]      = cluster["nom"]
+                v["cluster_host"] = hote_connecte
+            tous_noeuds.extend(noeuds)
+            toutes_vms.extend(vms)
+        else:
+            print(f"[Multi-Cluster] {cluster['nom']} injoignable sur tous les hôtes testés: {hosts_a_essayer}")
+            tous_noeuds.append({
+                "nom":          f"{cluster['nom']}",
+                "statut":       "offline",
+                "cluster":      cluster["nom"],
+                "cluster_host": cluster["host"],
+                "ram_pct": 0, "cpu_pct": 0, "disk_pct": 0,
+                "ram_used_gb": 0, "ram_total_gb": 0,
+                "disk_used_gb": 0, "disk_total_gb": 0,
+                "uptime_h": 0, "cpu_cores": 0,
+            })
+
+    # Réinitialiser HOST au cluster principal après la boucle
+    HOST    = os.getenv("PROXMOX_HOST", "192.168.138.100")
+    HEADERS = {"Authorization": f"PVEAPIToken={TOKEN_ID}={TOKEN_SECRET}"}
+
+    vms_running = [v for v in toutes_vms if v["statut"] == "running"]
+    vms_stopped = [v for v in toutes_vms if v["statut"] == "stopped"]
+
+    return {
+        "noeuds":      tous_noeuds,
+        "vms":         toutes_vms,
+        "vms_running": len(vms_running),
+        "vms_stopped": len(vms_stopped),
+        "alertes":     [],
+        "nb_clusters": len(clusters),
+        "clusters":    [c["nom"] for c in clusters],
+    }
