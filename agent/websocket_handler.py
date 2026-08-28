@@ -31,6 +31,24 @@ correction post-traitement des erreurs systématiques du modèle.
    paramètre) -- un VMID halluciné retombe toujours sur 101 comme avant,
    un VMID réel n'est plus jamais touché.
 
+← CORRECTION (4e bug, ajouté après-coup) :
+4. handle_connection() n'avait AUCUNE protection autour de l'appel à
+   repondre_question() -- si CETTE fonction (ou quoi que ce soit qu'elle
+   appelle : system_prompt_chat, appeler_groq, _verifier_ressources_vm...)
+   levait une exception non prévue, elle remontait jusqu'à la boucle
+   "while True" de handle_connection(), qui la laisse passer jusqu'au
+   try/except EXTÉRIEUR -- lequel retire le client de "clients" et
+   TERMINE la boucle, donc ferme la connexion WebSocket entière. Résultat
+   concret : une seule question qui déclenche une exception imprévue tue
+   toute la session de chat en silence (rien d'affiché côté utilisateur,
+   juste un print() côté serveur) -- ET rend tout message suivant sur
+   cette même connexion (changer de conversation, poser une autre
+   question) inopérant, puisque la connexion elle-même n'existe plus.
+   Chaque bloc "question"/"edit_message" a maintenant son propre
+   try/except : en cas d'erreur, un message "type: error" est renvoyé au
+   client ET la boucle continue -- la connexion reste vivante pour tout
+   ce qui suit.
+
 Import re consolidé en un seul, en tête de fichier -- remplace l'ancien
 "import re as _re" (jamais utilisé) et le second "import re as _re2" local
 à _corriger_reponse_llm (redondant avec le premier).
@@ -45,7 +63,7 @@ from agent.chat_history import (
     vider_historique, get_historique_complet, charger_depuis_db, next_id,
     nouvelle_conversation, changer_conversation, supprimer_conversation, lister_conversations
 )
-from agent.groq_client  import appeler_groq, GROQ_MODEL, GROQ_OK
+from agent.groq_client  import appeler_groq_chat, GROQ_MODEL, GROQ_OK
 from agent.prompts      import system_prompt_chat
 import agent.surveillance as surveillance
 
@@ -53,14 +71,6 @@ clients: list = []
 
 
 def _get_pc_hote() -> dict:
-    """
-    Retourne les ressources du PC hôte. Le cache (TTL, voir
-    HOTE_PC_CACHE_TTL_S dans .env) vit dans
-    metriques_pc_hote.collecter_ressources_pc_hote() -- une seule source de
-    vérité pour la politique de cache, partagée avec surveillance.py qui
-    l'appelle aussi à chaque cycle. Import fait ici uniquement, pour ne pas
-    bloquer le reste de ce fichier si le module est absent.
-    """
     try:
         from metriques_pc_hote import collecter_ressources_pc_hote
         return collecter_ressources_pc_hote()
@@ -70,18 +80,10 @@ def _get_pc_hote() -> dict:
 
 
 def _contient_mot(texte: str, mots: list) -> bool:
-    """
-    Vrai si un des mots de la liste apparaît comme MOT ENTIER dans texte
-    (limite de mot \\b des deux côtés) -- pas comme simple sous-chaîne.
-    Utilisée par _detecter_langue() et _verifier_ressources_vm() pour
-    éviter les faux positifs du type "de" dans "deploy", "vm" dans "vm1",
-    "ct" dans "correct".
-    """
     return any(re.search(rf'\b{re.escape(m)}\b', texte) for m in mots)
 
 
 def _detecter_langue(question: str) -> str:
-    """Détecte si la question est en français ou en anglais (mot entier, voir docstring du fichier)."""
     mots_fr = ["créer", "construire", "ajouter", "veux", "je", "comment",
                "pourquoi", "quoi", "quel", "quelle", "mon", "ma", "les",
                "du", "de", "est", "sont", "pour", "avec", "sur", "dans",
@@ -90,10 +92,6 @@ def _detecter_langue(question: str) -> str:
 
 
 def _verifier_ressources_vm(question: str, etat: dict) -> str | None:
-    """
-    Vérifie les ressources avant création VM/LXC.
-    Intercepte avant l'appel LLM — zéro quota Groq consommé si refus.
-    """
     q = question.lower()
 
     mots_creation = ['create', 'build', 'add', 'new vm', 'créer', 'construire',
@@ -119,9 +117,8 @@ def _verifier_ressources_vm(question: str, etat: dict) -> str | None:
         return None
 
     lang        = _detecter_langue(question)
-    # LXC beaucoup plus léger qu'une VM — minimums différents
-    RAM_MIN_GB  = 0.25 if is_lxc else 1.0   # 256MB pour LXC, 1GB pour VM
-    DISK_MIN_GB = 5.0  if is_lxc else 10.0  # 5GB pour LXC, 10GB pour VM
+    RAM_MIN_GB  = 0.25 if is_lxc else 1.0
+    DISK_MIN_GB = 5.0  if is_lxc else 10.0
 
     for n in noeuds_mentionnes:
         nom    = n.get("nom", "?")
@@ -144,22 +141,57 @@ def _verifier_ressources_vm(question: str, etat: dict) -> str | None:
         ram_libre  = round(n.get("ram_total_gb", 0) - n.get("ram_used_gb", 0), 1)
         disk_libre = round(n.get("disk_total_gb", 0) * (1 - n.get("disk_pct", 0) / 100), 1)
 
+        # ← AJOUT : VMID d'exemple pris parmi les VMs RÉELLEMENT présentes
+        # sur CE nœud précis (nom) -- avant, "qm set 101" était codé en
+        # dur partout, y compris quand le nœud concerné n'hébergeait même
+        # pas la VM 101 (ex: RAM insuffisante détectée sur pve2, dont la
+        # seule VM réelle est 103) -- l'exemple pointait alors vers une
+        # VM sur le mauvais nœud, ou une VM qui n'existe pas du tout côté
+        # cluster. Repli sur "<vmid>" (placeholder explicite) si aucune
+        # VM n'est connue sur ce nœud, plutôt que d'inventer un nombre.
+        vms_sur_ce_noeud = [v for v in (etat.get("vms") or []) if str(v.get("noeud","")).lower() == nom.lower()]
+        vmid_exemple = vms_sur_ce_noeud[0].get("vmid", "<vmid>") if vms_sur_ce_noeud else "<vmid>"
+
+        # ← AJOUT : étape de migration, en PREMIER -- l'ordre établi partout
+        # ailleurs dans le projet est migration → KSM → ballooning → RAM
+        # physique → nouveau nœud (voir prompts.py, incident_prompt.py).
+        # Ce message de secours sautait directement à KSM/ballooning sans
+        # jamais mentionner la migration, la incohérent avec le reste de
+        # l'app. Cherche un autre nœud EN LIGNE comme cible -- absent si
+        # aucun autre nœud n'est disponible (cluster à un seul nœud).
+        autre_noeud_en_ligne = next(
+            (n2.get("nom") for n2 in etat.get("noeuds", [])
+             if n2.get("nom", "").lower() != nom.lower()
+             and str(n2.get("statut","")).lower() in ("online","up","en ligne")),
+            None
+        )
+        etape_migration_fr = (
+            f"Migrez une VM existante vers un autre nœud (le plus rapide) :\n"
+            f"```bash\nqm migrate {vmid_exemple} {autre_noeud_en_ligne} --online\n```\n"
+        ) if autre_noeud_en_ligne and vmid_exemple != "<vmid>" else ""
+        etape_migration_en = (
+            f"Migrate an existing VM to another node (fastest option):\n"
+            f"```bash\nqm migrate {vmid_exemple} {autre_noeud_en_ligne} --online\n```\n"
+        ) if autre_noeud_en_ligne and vmid_exemple != "<vmid>" else ""
+
         if ram_libre < RAM_MIN_GB:
             if lang == "fr":
                 return (f"❌ **RAM insuffisante sur {nom}**\n\n"
                         f"RAM libre : **{ram_libre}GB** — minimum requis : **{RAM_MIN_GB}GB**\n\n"
                         f"**Libérez de la RAM avant de créer une VM :**\n"
                         f"```bash\nps aux --sort=-%mem | head -15\n```\n"
-                        f"Réduisez le balloon des VMs existantes :\n"
-                        f"```bash\nqm set 101 --balloon 512\necho 1 > /sys/kernel/mm/ksm/run\n```\n"
+                        f"{etape_migration_fr}"
+                        f"Réduisez le balloon des VMs existantes sur {nom} :\n"
+                        f"```bash\nqm set {vmid_exemple} --balloon 512\necho 1 > /sys/kernel/mm/ksm/run\n```\n"
                         f"Ressources actuelles : RAM {ram_libre}GB libre | Disk {disk_libre}GB libre")
             else:
                 return (f"❌ **Not enough RAM on {nom}**\n\n"
                         f"RAM free: **{ram_libre}GB** — minimum required: **{RAM_MIN_GB}GB**\n\n"
                         f"**Free up RAM before creating a VM:**\n"
                         f"```bash\nps aux --sort=-%mem | head -15\n```\n"
-                        f"Reduce existing VM balloon:\n"
-                        f"```bash\nqm set 101 --balloon 512\necho 1 > /sys/kernel/mm/ksm/run\n```\n"
+                        f"{etape_migration_en}"
+                        f"Reduce existing VM balloon on {nom}:\n"
+                        f"```bash\nqm set {vmid_exemple} --balloon 512\necho 1 > /sys/kernel/mm/ksm/run\n```\n"
                         f"Current: RAM {ram_libre}GB free | Disk {disk_libre}GB free")
 
         if disk_libre < DISK_MIN_GB:
@@ -180,39 +212,23 @@ def _verifier_ressources_vm(question: str, etat: dict) -> str | None:
 
 
 def _corriger_reponse_llm(reponse: str, next_vmid: int, vmids_connus: list = None) -> str:
-    """
-    Corrige les erreurs systématiques du LLM llama-3.1-8b-instant.
-    Appliqué après chaque réponse avant envoi au frontend.
-    """
     vmids_connus = vmids_connus or []
 
-    # Plancher VMID — pve2 OFFLINE cache linux-vm2 (103)
-    # On force un minimum de 104 pour ne jamais suggérer 101/102/103
     if next_vmid <= 103:
         next_vmid = 104
 
-    # 1. Corriger pct create <vmid> → pct create <next_vmid>
     reponse = re.sub(
         r'(pct create\s+)\d+',
         lambda m: f"{m.group(1)}{next_vmid}",
         reponse
     )
 
-    # 2. Corriger pct start <vmid> → pct start <next_vmid>
     reponse = re.sub(
         r'(pct start\s+)\d+',
         lambda m: f"{m.group(1)}{next_vmid}",
         reponse
     )
 
-    # 3. Corriger --hostname avec mauvais VMID
-    # ← NON MODIFIÉ : logique volontairement laissée telle quelle (voir
-    # docstring du fichier) -- fonctionne sur les cas tracés à la main
-    # (hostname-<n>, hostname <n> seul) mais reste fragile/peu lisible.
-    # Une réécriture avec un groupe captant + backreference serait plus
-    # robuste (ex: r'(--hostname\s+[\w-]*?)\d+\b' → rf'\g<1>{next_vmid}'),
-    # à faire si un cas réel se met à échouer, pas modifié préventivement
-    # sans pouvoir tester contre de vraies sorties LLM.
     reponse = re.sub(
         r'(--hostname\s+\S*?)\d+\b',
         lambda m: m.group(0).rsplit(
@@ -221,45 +237,47 @@ def _corriger_reponse_llm(reponse: str, next_vmid: int, vmids_connus: list = Non
         reponse
     )
 
-    # 4. Supprimer --disk dans pct create (paramètre invalide)
     reponse = re.sub(r'\s*--disk\s+\S+', '', reponse)
 
-    # 5. Corriger --cpu X → --cores X
     reponse = re.sub(r'--cpu\s+(\d+)', r'--cores \1', reponse)
 
-    # 6. Corriger --net0 vmbr0 seul → --net0 name=eth0,bridge=vmbr0,ip=dhcp
     reponse = re.sub(
         r'--net0\s+(?!name=)(\w+)',
         r'--net0 name=eth0,bridge=\1,ip=dhcp',
         reponse
     )
 
-    # 7. Supprimer --template X (invalide pour pct create)
     reponse = re.sub(r'\s*--template\s+\S+', '', reponse)
 
-    # 8. Corriger qm set sur un VMID halluciné -- ← CORRECTION : ne touche
-    # plus un VMID qui correspond à une VM réellement connue (ex: 103,
-    # linux-vm2) -- avant, TOUT VMID différent de 101 était écrasé,
-    # cassant silencieusement toute réponse correcte visant une autre VM
-    # que 101. Un VMID halluciné (absent de vmids_connus) retombe toujours
-    # sur 101, comme avant.
     def _corriger_qm_set(m):
         if int(m.group(1)) in vmids_connus:
             return m.group(0)
         return "qm set 101"
     reponse = re.sub(r'qm set\s+(\d{3,})', _corriger_qm_set, reponse)
 
-    # 9. Corriger pveam download avec template invalide
     reponse = re.sub(
         r'pveam download local\s+(?!debian-12)(\S+)',
         'pveam download local debian-12-standard_12.7-1_amd64.tar.zst',
         reponse
     )
 
-    # 10. Corriger --rootfs local-lvm:1 → minimum 2GB
     reponse = re.sub(
         r'(--rootfs\s+\S+:)([01])(\s|$)',
         r'\g<1>2\3',
+        reponse
+    )
+
+    # 11. Corriger "migrate <vmid> <node>" -- commande INEXISTANTE dans
+    # Proxmox (le modèle l'invente, confirmé en observant une vraie
+    # réponse : "migrate 105 pve1"). La vraie syntaxe est "qm migrate"
+    # pour une VM QEMU (avec --online pour rester à chaud), "pct migrate"
+    # pour un conteneur LXC -- on ne peut pas distinguer depuis le texte
+    # seul, qm est le cas le plus courant dans ce projet donc le choix
+    # par défaut le plus utile ; --online ajouté systématiquement (sans
+    # effet néfaste si la VM est déjà arrêtée).
+    reponse = re.sub(
+        r'(?<!qm )(?<!pct )\bmigrate\s+(\d+)\s+(pve\d+)\b',
+        r'qm migrate \1 \2 --online',
         reponse
     )
 
@@ -267,25 +285,18 @@ def _corriger_reponse_llm(reponse: str, next_vmid: int, vmids_connus: list = Non
 
 
 async def repondre_question(question: str, msg_id_edition: str = None) -> tuple:
-    """
-    Appelle le LLM avec contexte complet puis corrige les erreurs
-    systématiques du modèle avant de retourner la réponse.
-    """
     etat    = surveillance.dernier_etat
     pc_hote = _get_pc_hote()
 
-    # Vérification avant LLM — économise le quota Groq
     refus = _verifier_ressources_vm(question, etat)
     if refus:
         msg = ajouter_message("assistant", refus)
         return refus, msg["id"]
 
     system = system_prompt_chat(etat, surveillance.dernier_lstm, pc_hote, question)
-    # Limiter à 10 messages — évite les prompts trop longs qui ralentissent Groq
     msgs_all = get_messages_llm(jusqu_a_id=msg_id_edition) if msg_id_edition else get_messages_llm()
     msgs = msgs_all[-10:] if len(msgs_all) > 10 else msgs_all
 
-    # Calculer next_vmid depuis l'état en mémoire — JAMAIS appeler get_etat_cluster()
     vmids_connus = [
         int(v.get("vmid", 0))
         for v in (etat or {}).get("vms", [])
@@ -294,11 +305,16 @@ async def repondre_question(question: str, msg_id_edition: str = None) -> tuple:
     next_vmid = max(vmids_connus) + 1 if vmids_connus else 104
 
     loop    = asyncio.get_event_loop()
+    # ← MODIFIÉ : appeler_groq -> appeler_groq_chat. Mêmes paramètres
+    # exacts (system, msgs, question, max_tokens=1200), même modèle en
+    # cascade, même température -- seul le compte Groq change, pour ne
+    # plus consommer le même budget journalier que la surveillance/les
+    # règles. Tant que GROQ_API_KEY_CHAT n'est pas définie dans .env,
+    # utilise le même compte qu'avant : comportement du chat inchangé.
     reponse = await loop.run_in_executor(
-        None, lambda: appeler_groq(system, msgs, question, max_tokens=1200)
+        None, lambda: appeler_groq_chat(system, msgs, question, max_tokens=1200)
     )
 
-    # Corriger les erreurs systématiques du LLM
     reponse = _corriger_reponse_llm(reponse, next_vmid, vmids_connus)
 
     msg = ajouter_message("assistant", reponse)
@@ -317,9 +333,6 @@ async def handle_connection(ws: WebSocket):
         "timestamp": datetime.now().isoformat(),
         "content":   "connected",
     })
-
-    # Pas de restauration automatique au démarrage
-    # L'utilisateur voit l'écran d'accueil et choisit dans la sidebar
 
     if surveillance.dernier_etat:
         await ws.send_json({
@@ -351,7 +364,20 @@ async def handle_connection(ws: WebSocket):
                     "timestamp": msg_user["timestamp"],
                 })
                 await ws.send_json({"type": "thinking"})
-                reponse, msg_id_rep = await repondre_question(question)
+                # ← AJOUT (4e correctif, voir docstring du fichier) : sans
+                # ce try/except, une exception ici tuait toute la
+                # connexion WebSocket -- voir le raisonnement complet en
+                # tête de fichier.
+                try:
+                    reponse, msg_id_rep = await repondre_question(question)
+                except Exception as e:
+                    print(f"[WS] Erreur traitement question: {e}")
+                    await ws.send_json({
+                        "type":      "error",
+                        "content":   "Une erreur est survenue lors du traitement de votre question. Réessayez.",
+                        "timestamp": datetime.now().isoformat(),
+                    })
+                    continue
                 try:
                     from database import sauvegarder_message
                     sauvegarder_message("assistant", reponse, msg_id_rep)
@@ -385,7 +411,17 @@ async def handle_connection(ws: WebSocket):
                     "truncated_after": msg_id,
                 })
                 await ws.send_json({"type": "thinking"})
-                reponse, msg_id_rep = await repondre_question(nouveau, msg_id_edition=msg_id)
+                # ← AJOUT : même filet de sécurité que le bloc "question".
+                try:
+                    reponse, msg_id_rep = await repondre_question(nouveau, msg_id_edition=msg_id)
+                except Exception as e:
+                    print(f"[WS] Erreur traitement edit_message: {e}")
+                    await ws.send_json({
+                        "type":      "error",
+                        "content":   "Une erreur est survenue lors du traitement de votre modification. Réessayez.",
+                        "timestamp": datetime.now().isoformat(),
+                    })
+                    continue
                 await ws.send_json({
                     "type":      "reponse",
                     "role":      "assistant",

@@ -9,10 +9,6 @@ function getSeverity(inc) {
   return normalizeSeverity(raw) || 'MONITORING'
 }
 
-// Regroupe les anomalies brutes par sévérité -- même logique que
-// report_writer.py (section "Detected Anomalies" du rapport .md), pour
-// que cette même vue existe aussi côté vivant, pas seulement dans le
-// document persistant.
 function grouperParSeverite(anomalies = []) {
   const crit  = anomalies.filter(a => String(a.niveau||'').toUpperCase().includes('CRIT'))
   const haute = anomalies.filter(a => String(a.niveau||'').toUpperCase().includes('IMP') && !crit.includes(a))
@@ -20,7 +16,6 @@ function grouperParSeverite(anomalies = []) {
   return { crit, haute, autre }
 }
 const SEV_ICON = { CRITICAL:'🔴', HIGH:'🟠', MONITORING:'🟡' }
-const PHASE_LABEL = { immediate: 'IMMEDIATE', short_term: 'SHORT TERM', long_term: 'LONG TERM' }
 
 function mdInline(t = '') {
   return t
@@ -79,127 +74,31 @@ function CodeBlock({ code, lang = 'bash' }) {
   )
 }
 
-// ── Rendu direct depuis le JSON structuré -- ni découpage de texte, ni
-// regex sur des marqueurs ---INCIDENT---/---RECOMMENDATION---. Miroir de
-// RecoCard (PageRecommendations.jsx) en plus simple : lecture seule, pas
-// de bouton "Accepter & Exécuter" ici -- l'exécution reste centralisée sur
-// la page Recommendations, cette page reste un historique/diagnostic.
-// Boutons Accept/Reject -- dupliqué depuis PageRecommendations.jsx
-// volontairement (pas de couche de composants partagés établie entre les
-// deux pages pour ce composant précis) -- même comportement : ne fait
-// jamais confiance au texte libre du LLM, seulement à action_id/
-// action_params déjà validés côté backend.
-function ActionButton({ actionId, params, risk }) {
-  const [status, setStatus] = useState('idle')
-  const [message, setMessage] = useState('')
-  const riskColor = risk === 'low' ? C.green : risk === 'medium' ? C.orange : C.red
+function StructuredIncident({ structured }) {
+  const parseFailed      = !!structured?._parse_failed
+  const depuisHistorique = structured?._source === 'history'
 
-  const execute = async () => {
-    setStatus('loading')
-    try {
-      const r = await fetch('/api/actions/execute', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action_id: actionId, params }),
-      })
-      const data = await r.json()
-      setStatus(data.ok ? 'success' : 'error')
-      setMessage(data.message || data.error || '')
-    } catch { setStatus('error'); setMessage('Erreur réseau') }
-  }
-
-  if (status === 'success') return <div style={{ padding:'6px 12px', borderRadius:6, background:'#22c55e15', border:'1px solid #22c55e30', fontSize:11, color:C.green, marginTop:6 }}>{message}</div>
-  if (status === 'error')   return <div style={{ padding:'6px 12px', borderRadius:6, background:'#ef444415', border:'1px solid #ef444430', fontSize:11, color:C.red, marginTop:6 }}>✗ {message}</div>
-  if (status === 'rejected') return <div style={{ fontSize:10, color:C.muted, marginTop:4, fontStyle:'italic' }}>Refusé — aucune modification effectuée</div>
-
-  return (
-    <div style={{ display:'flex', alignItems:'center', gap:8, marginTop:6 }}>
-      <span style={{ fontSize:10, color:riskColor, fontWeight:600 }}>
-        {risk === 'low' ? '🟢 Risque faible' : risk === 'medium' ? '🟠 Risque moyen' : '🔴 Risque élevé'}
-      </span>
-      <button onClick={execute} disabled={status === 'loading' || !params?.node}
-        style={{ padding:'4px 12px', borderRadius:6, border:'none', background:C.green, color:'#fff', cursor:'pointer', fontSize:11, fontWeight:700, opacity:(status==='loading'||!params?.node)?0.5:1 }}>
-        {status === 'loading' ? '⟳ Exécution...' : '✓ Accepter & Exécuter'}
-      </button>
-      <button onClick={() => setStatus('rejected')} disabled={status === 'loading'}
-        style={{ padding:'4px 10px', borderRadius:6, border:`1px solid ${C.border}`, background:'transparent', color:C.muted, cursor:'pointer', fontSize:11 }}>
-        ✗ Refuser
-      </button>
-    </div>
-  )
-}
-
-function StructuredIncident({ structured, loadingFull }) {
-  if (!structured || structured._parse_failed) {
-    // ← MODIFIÉ : deux cas distincts, deux messages distincts -- avant,
-    // "chargé depuis l'historique" (normal) et "le LLM a renvoyé un JSON
-    // invalide" (rare, un vrai problème) étaient indiscernables, donnant
-    // l'impression que certains incidents étaient arbitrairement "cassés".
-    const depuisHistorique = structured?._source === 'history'
+  if (parseFailed && !depuisHistorique) {
     return (
       <div style={{ fontSize:13, color:C.muted, lineHeight:1.6 }}>
-        {depuisHistorique ? (
-          <div style={{ display:'flex', gap:8, alignItems:'flex-start', padding:'8px 0' }}>
-            <span style={{ color:C.blue, flexShrink:0, marginTop:1 }}>{loadingFull ? '⟳' : 'ℹ'}</span>
-            <span>
-              {loadingFull ? 'Loading full analysis…' : (structured._raw || 'Loaded from a saved report — open the full report below for the complete analysis.')}
-            </span>
-          </div>
-        ) : (
-          <>
-            <div style={{ display:'flex', gap:8, alignItems:'flex-start', padding:'8px 10px', background:'#eab30810', border:`1px solid ${C.yellow}30`, borderRadius:7, marginBottom:10 }}>
-              <span style={{ color:C.yellow, flexShrink:0 }}>⚠</span>
-              <span style={{ fontSize:12, color:C.yellow }}>AI response could not be fully structured this time — showing available text.</span>
-            </div>
-            {structured?._raw || 'No structured analysis available for this incident.'}
-          </>
-        )}
+        <div style={{ display:'flex', gap:8, alignItems:'flex-start', padding:'8px 10px', background:'#eab30810', border:`1px solid ${C.yellow}30`, borderRadius:7 }}>
+          <span style={{ color:C.yellow, flexShrink:0 }}>⚠</span>
+          <span style={{ fontSize:12, color:C.yellow }}>AI response could not be fully structured this time — showing available text.</span>
+        </div>
+        {structured?._raw && <div style={{ marginTop:10 }}>{structured._raw}</div>}
       </div>
     )
   }
+
+  if (!structured) {
+    return <div style={{ fontSize:13, color:C.muted, lineHeight:1.6 }}>No analysis available for this incident.</div>
+  }
+
+  const texte = structured._raw || structured.summary || 'No summary available — open the full report below.'
   return (
-    <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
-      <div>
-        <div style={{ fontSize:13, color:C.text, lineHeight:1.6, marginBottom:8 }}>{structured.summary}</div>
-        {(structured.causes || []).length > 0 && (
-          <TextBlock text={structured.causes.map(c => `- ${c}`).join('\n')}/>
-        )}
-      </div>
-
-      {structured.warning && (
-        <div style={{ padding:'10px 14px', background:'#ef444410', border:`1px solid ${C.red}35`, borderRadius:7, display:'flex', gap:10, alignItems:'flex-start' }}>
-          <span style={{ fontSize:14, color:C.red, flexShrink:0 }}>⚠</span>
-          <span style={{ fontSize:12, color:C.red, fontWeight:600, lineHeight:1.5 }}>{structured.warning}</span>
-        </div>
-      )}
-
-      {(structured.steps || []).length > 0 && (
-        <div style={{ background:'#0a1a0e', border:`1px solid ${C.green}25`, borderRadius:8, padding:'12px 14px' }}>
-          <div style={{ fontSize:11, fontWeight:700, color:C.green, letterSpacing:'0.1em', marginBottom:10, fontFamily:'JetBrains Mono,monospace' }}>
-            RECOMMENDED ACTIONS
-          </div>
-          <div style={{ display:'flex', flexDirection:'column', gap:10 }}>
-            {structured.steps.map((step, i) => (
-              <div key={i}>
-                <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:4 }}>
-                  <span style={{ fontSize:9, fontWeight:700, color:C.blue, background:C.blue+'18', border:`1px solid ${C.blue}40`, borderRadius:8, padding:'1px 7px', fontFamily:'JetBrains Mono,monospace' }}>
-                    {PHASE_LABEL[step.phase] || (step.phase||'').toUpperCase()}
-                  </span>
-                  <span style={{ fontSize:13, color:C.sub }}>{step.action}</span>
-                </div>
-                {step.command && <CodeBlock code={step.command}/>}
-                {/* ← AJOUT : bouton d'action fonctionnel -- disponible dès
-                    que action_id/action_params sont présents, que
-                    l'incident soit en direct ou récupéré à la demande
-                    depuis le JSON compagnon persisté. */}
-                {step.action_id && step.action_params && (
-                  <ActionButton actionId={step.action_id} params={step.action_params} risk={step.risk || 'medium'}/>
-                )}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
+    <div style={{ display:'flex', gap:8, alignItems:'flex-start', padding:'8px 0', fontSize:13, color:C.sub, lineHeight:1.6 }}>
+      <span style={{ color:C.blue, flexShrink:0, marginTop:1 }}>ℹ</span>
+      <span>{texte}</span>
     </div>
   )
 }
@@ -306,7 +205,6 @@ function ReportViewer({ content, reportName }) {
 
   return (
     <div style={{ fontFamily:"'Inter','Segoe UI',sans-serif" }}>
-      {/* Header */}
       <div style={{ background:`linear-gradient(135deg, ${sevColor}22 0%, #030810 100%)`, borderBottom:`1px solid ${sevColor}30`, padding:'20px 24px' }}>
         <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', marginBottom:14 }}>
           <div>
@@ -337,7 +235,6 @@ function ReportViewer({ content, reportName }) {
         </div>
       </div>
 
-      {/* Sections */}
       {sections.map(({ title, body }, i) => {
         const cfg    = sectionConfig[title] || { icon:'▸', color:C.sub, bg:'transparent' }
         const hasTbl = body.includes('|---')
@@ -403,7 +300,6 @@ function ReportViewer({ content, reportName }) {
         )
       })}
 
-      {/* Footer */}
       <div style={{ padding:'12px 24px', background:'#040810', borderTop:`1px solid ${C.border}`, display:'flex', justifyContent:'space-between', alignItems:'center' }}>
         <div style={{ fontSize:11, color:C.muted }}>OpsPilot Infrastructure AI — Auto-generated incident report</div>
         <div style={{ fontSize:10, color:C.border, fontFamily:'JetBrains Mono,monospace' }}>Do not reply · Open dashboard for live status</div>
@@ -412,66 +308,126 @@ function ReportViewer({ content, reportName }) {
   )
 }
 
-// Carte d'incident dans la liste -- extraite en composant partagé car
-// utilisée à la fois par la vue Today (liste plate) et History (regroupée
-// par date), pour ne pas dupliquer le JSX entre les deux.
-// ← CORRIGÉ : sélection par inc.timestamp (identité stable), plus par
-// index de position dans le tableau -- l'index se décalait silencieusement
-// dès qu'un nouvel incident arrivait en direct pendant qu'un autre était
-// sélectionné (tout glisse d'un cran), faisant pointer la sélection vers
-// un incident différent de celui réellement cliqué.
-function IncidentCard({ inc, selTimestamp, setSelTimestamp, closeReport }) {
+// ← AJOUT : suppression d'un incident -- même pattern "armer puis
+// confirmer" que DeleteButton dans PageRecommendations.jsx (un premier
+// clic arme pendant 3s, un second clic dans ce délai confirme -- pas de
+// modale). Dupliqué ici plutôt qu'importé : aucun composant partagé
+// n'exportait déjà ce bouton pour être réutilisé tel quel.
+// ← AJOUT : remplace window.confirm() -- affichait la boîte native du
+// navigateur (grise, non stylée, mélangée FR/EN selon la langue du
+// navigateur), qui jurait avec le thème sombre du reste de l'app. Overlay
+// + carte simple, pas de dépendance externe.
+function ConfirmModal({ message, onConfirm, onCancel }) {
+  return (
+    <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.6)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:1000 }}
+         onClick={onCancel}>
+      <div onClick={e => e.stopPropagation()}
+           style={{ background:C.card, border:`1px solid ${C.borderHi}`, borderRadius:12, padding:'22px 24px', maxWidth:380, boxShadow:'0 20px 60px rgba(0,0,0,0.5)' }}>
+        <div style={{ fontSize:14, color:C.text, lineHeight:1.6, marginBottom:20 }}>{message}</div>
+        <div style={{ display:'flex', gap:10, justifyContent:'flex-end' }}>
+          <button onClick={onCancel}
+            style={{ padding:'8px 16px', borderRadius:7, border:`1px solid ${C.border}`, background:'transparent', color:C.sub, fontSize:12, fontWeight:600, cursor:'pointer', fontFamily:'JetBrains Mono,monospace' }}>
+            Cancel
+          </button>
+          <button onClick={onConfirm}
+            style={{ padding:'8px 16px', borderRadius:7, border:'none', background:C.red, color:'#fff', fontSize:12, fontWeight:700, cursor:'pointer', fontFamily:'JetBrains Mono,monospace' }}>
+            Delete
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function DeleteButtonInc({ onConfirm }) {
+  const [armed, setArmed] = useState(false)
+  const handleClick = (e) => {
+    e.stopPropagation()
+    if (armed) { onConfirm(); setArmed(false); return }
+    setArmed(true)
+    setTimeout(() => setArmed(false), 3000)
+  }
+  return (
+    <button onClick={handleClick}
+      style={{ background: armed ? C.red+'20' : 'transparent', border: `1px solid ${armed ? C.red : C.border}`,
+               borderRadius: 6, color: armed ? C.red : C.muted, fontSize: 10, padding: '3px 9px',
+               cursor: 'pointer', fontFamily: 'JetBrains Mono, monospace', transition: 'all 0.15s', flexShrink: 0 }}>
+      {armed ? 'Confirm?' : '🗑 Delete'}
+    </button>
+  )
+}
+
+function IncidentCard({ inc, selTimestamp, setSelTimestamp, closeReport, onDelete, selectionMode, selected, onToggleSelect }) {
   const sev      = getSeverity(inc)
   const sevColor = severityColor(sev)
   const isActive = selTimestamp === inc.timestamp
   return (
-    <div onClick={() => { setSelTimestamp(isActive ? null : inc.timestamp); closeReport() }}
-      style={{ background: isActive ? C.surface : C.card, border:`1px solid ${isActive?sevColor+'70':C.border}`, borderLeft:`3px solid ${sevColor}`, borderRadius:8, padding:'12px 14px', cursor:'pointer', transition:'all 0.15s' }}
+    <div onClick={() => selectionMode ? onToggleSelect?.(inc) : (setSelTimestamp(isActive ? null : inc.timestamp), closeReport())}
+      style={{ background: isActive ? C.surface : C.card, border:`1px solid ${isActive?sevColor+'70':C.border}`, borderLeft:`3px solid ${sevColor}`, borderRadius:8, padding:'12px 14px', cursor:'pointer', transition:'all 0.15s', display:'flex', gap:10, alignItems:'flex-start' }}
       onMouseEnter={e=>{ if(!isActive) { e.currentTarget.style.background=C.surface; e.currentTarget.style.borderColor=sevColor+'40' }}}
       onMouseLeave={e=>{ if(!isActive) { e.currentTarget.style.background=C.card;    e.currentTarget.style.borderColor=C.border }}}
     >
-      <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', gap:8, marginBottom:6 }}>
-        <div style={{ display:'flex', gap:8, alignItems:'flex-start', flex:1 }}>
-          <span style={{ fontSize:12, flexShrink:0, marginTop:2 }}>{SEV_ICON[sev]||'⚪'}</span>
-          <span style={{ fontSize:14, color:C.text, fontWeight:700, lineHeight:1.4 }}>
-            {inc.structured?.fix_title || inc.structured?.summary || inc.anomalies?.[0]?.message || (inc.rapport ? 'Historical incident' : 'Anomaly detected')}
-          </span>
+      {selectionMode && (
+        <div style={{ paddingTop: 2, flexShrink: 0 }} onClick={(e) => { e.stopPropagation(); onToggleSelect?.(inc) }}>
+          <input type="checkbox" checked={selected} readOnly
+                 style={{ width: 15, height: 15, cursor: 'pointer', accentColor: C.blue }} />
         </div>
-        <Chip label={sev} color={sevColor}/>
-      </div>
-      <div style={{ display:'flex', gap:12, fontSize:10, fontFamily:'JetBrains Mono,monospace', color:C.muted, paddingLeft:20 }}>
-        <span>{inc.timestamp?.slice(0,19).replace('T',' ')}</span>
-        {inc.score > 0 && <span style={{ color:C.purple }}>AI {inc.score?.toFixed(3)}</span>}
-        {(inc.anomalies?.length || 0) > 1 && <span style={{ color:C.orange }}>{inc.anomalies.length} anomalies</span>}
-        {inc.rapport && <span style={{ color:C.yellow }}>📄 report</span>}
+      )}
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', gap:8, marginBottom:6 }}>
+          <div style={{ display:'flex', gap:8, alignItems:'flex-start', flex:1 }}>
+            <span style={{ fontSize:12, flexShrink:0, marginTop:2 }}>{SEV_ICON[sev]||'⚪'}</span>
+            <span style={{ fontSize:14, color:C.text, fontWeight:700, lineHeight:1.4 }}>
+              {inc.structured?.fix_title || inc.structured?.summary || inc.anomalies?.[0]?.message || (inc.rapport ? 'Historical incident' : 'Anomaly detected')}
+            </span>
+          </div>
+          <div style={{ display:'flex', gap:6, alignItems:'center', flexShrink:0 }}>
+            <Chip label={sev} color={sevColor}/>
+            {inc.rapport && !selectionMode && (
+              <DeleteButtonInc onConfirm={() => onDelete?.(inc)} />
+            )}
+          </div>
+        </div>
+        <div style={{ display:'flex', gap:12, fontSize:10, fontFamily:'JetBrains Mono,monospace', color:C.muted, paddingLeft:20 }}>
+          <span>{inc.timestamp?.slice(0,19).replace('T',' ')}</span>
+          {inc.score > 0 && <span style={{ color:C.blue }}>AI {inc.score?.toFixed(3)}</span>}
+          {(inc.anomalies?.length || 0) > 1 && <span style={{ color:C.orange }}>{inc.anomalies.length} anomalies</span>}
+          {inc.rapport && <span style={{ color:C.yellow }}>📄 report</span>}
+        </div>
       </div>
     </div>
   )
 }
 
 export function PageIncidents({ incidents, historyTotal = 0, historyOffset = 0, loadingMore = false, onLoadMore = () => {} }) {
-  // ← CORRIGÉ : sélection par timestamp (identité stable de l'incident),
-  // plus par index de position -- voir commentaire détaillé sur
-  // IncidentCard plus haut.
   const [selTimestamp, setSelTimestamp] = useState(null)
   const [reportContent, setReportContent] = useState(null)
   const [loadingReport, setLoadingReport] = useState(false)
   const [downloadingPdf, setDownloadingPdf] = useState(false)
+  // ← AJOUT : recommendation liée à l'incident sélectionné -- répond à
+  // "savoir pour chaque incident quelle est sa recommendation". Recherche
+  // automatique (pas au clic) dès qu'un incident avec rapport est
+  // sélectionné, via le nouvel endpoint GET /api/recommendations/
+  // by-report/{nom}. null = pas encore cherché / aucune trouvée --
+  // les deux cas s'affichent pareil (rien), la distinction n'a pas
+  // besoin d'être visible ici.
   const [filter, setFilter]         = useState('ALL')
   const [reportOpen, setReportOpen] = useState(false)
-  // ← AJOUT : cache local {nom_rapport: structured_complet} -- rempli à la
-  // demande (voir useEffect plus bas) quand on sélectionne un incident qui
-  // n'a que le résumé (_source:'history'). Une fois récupéré, reste en
-  // cache pour le reste de la session -- pas de re-fetch si on resélectionne
-  // le même incident.
-  const [structuredCache, setStructuredCache] = useState({})
-  const [loadingFull, setLoadingFull] = useState(false)
-  // ← AJOUT : scope temporel -- "today" est la vue par défaut (l'attention
-  // immédiate), "history" ouvre tout ce qui est persisté. Avant, la page
-  // affichait toujours tout d'un coup -- gérable à la main quand
-  // l'historique n'existait pas encore, plus maintenant qu'il est chargé
-  // au démarrage (voir App.jsx) et peut couvrir des jours entiers.
   const [scope, setScope] = useState('today')
+
+  // ← AJOUT : suppression -- "deletedRapports" filtre localement ce qui a
+  // déjà été supprimé (identifié par nom de rapport, la seule clé stable
+  // qu'un incident possède), sans avoir besoin de faire remonter l'état
+  // jusqu'à App.jsx. Fonctionne quelle que soit l'origine de "incidents"
+  // (WebSocket en direct ou /api/rapports), puisque le filtrage se fait
+  // uniquement à l'affichage.
+  const [deletedRapports, setDeletedRapports] = useState(() => new Set())
+  const [selectionMode, setSelectionMode]     = useState(false)
+  const [selectedRapports, setSelectedRapports] = useState(() => new Set())
+  // ← AJOUT : confirmation stylée (remplace window.confirm) + attente de
+  // chargement de toutes les pages avant une sélection totale réelle.
+  const [confirmationEnCours, setConfirmationEnCours] = useState(false)
+  const [attenteChargementPourTout, setAttenteChargementPourTout] = useState(false)
 
   const estAujourdhui = (timestamp) => {
     if (!timestamp) return false
@@ -479,43 +435,35 @@ export function PageIncidents({ incidents, historyTotal = 0, historyOffset = 0, 
     return d.getFullYear() === n.getFullYear() && d.getMonth() === n.getMonth() && d.getDate() === n.getDate()
   }
 
-  const reversed = [...incidents].reverse()
-  // ← MODIFIÉ : Today et History sont maintenant deux partitions
-  // complémentaires, sans chevauchement -- avant, History montrait TOUT
-  // (y compris les incidents d'aujourd'hui, dupliqués avec Today). History
-  // ne montre désormais que les jours précédents, comme demandé.
+  const incidentsVisibles = incidents.filter(inc => !inc.rapport || !deletedRapports.has(inc.rapport))
+  const reversed = [...incidentsVisibles].reverse()
   const todayItems   = reversed.filter(inc => estAujourdhui(inc.timestamp))
   const historyItems = reversed.filter(inc => !estAujourdhui(inc.timestamp))
+  // ← CORRIGÉ : historyTotal (prop, total serveur AVANT toute suppression
+  // locale) ne bougeait jamais après une suppression -- le badge restait
+  // gonflé jusqu'à un rechargement complet de la page. nbSupprimesHistory
+  // compte, parmi TOUS les rapports supprimés localement, ceux qui
+  // étaient dans History (pas Today, qui n'a pas ce problème -- il est
+  // recalculé directement depuis incidentsVisibles à chaque rendu).
+  const nbSupprimesHistory = incidents.filter(
+    inc => inc.rapport && deletedRapports.has(inc.rapport) && !estAujourdhui(inc.timestamp)
+  ).length
+  const trueHistoryCount = Math.max(historyItems.length, historyTotal - nbSupprimesHistory - todayItems.length)
   const enScope  = scope === 'today' ? todayItems : historyItems
   const filtered = filter === 'ALL' ? enScope : enScope.filter(inc => getSeverity(inc) === filter)
   const selected = selTimestamp !== null ? (reversed.find(inc => inc.timestamp === selTimestamp) || null) : null
 
-  // ← AJOUT : récupération à la demande de l'analyse complète (causes,
-  // steps, action_id, action_params) quand on sélectionne un incident qui
-  // n'a que le résumé (_source:'history') -- jamais tout chargé au
-  // démarrage, seulement pour l'incident réellement consulté. Le fichier
-  // .json compagnon n'existe que pour les rapports générés après ce
-  // correctif (voir report_writer.sauvegarder_rapport) -- 404 pour les
-  // rapports plus anciens, géré silencieusement (reste sur le résumé).
+  const [recommandationLiee, setRecommandationLiee] = useState(null)
   useEffect(() => {
-    if (!selected?.rapport) return
-    if (selected.structured?._source !== 'history') return
-    if (structuredCache[selected.rapport]) return
+    if (!selected?.rapport) { setRecommandationLiee(null); return }
     let annule = false
-    setLoadingFull(true)
-    fetch(`/api/rapports/${selected.rapport}/structured`)
+    fetch(`/api/recommendations/by-report/${selected.rapport}`)
       .then(r => r.ok ? r.json() : null)
-      .then(data => { if (!annule && data) setStructuredCache(c => ({ ...c, [selected.rapport]: data })) })
-      .catch(() => {})
-      .finally(() => { if (!annule) setLoadingFull(false) })
+      .then(d => { if (!annule) setRecommandationLiee(d) })
+      .catch(() => { if (!annule) setRecommandationLiee(null) })
     return () => { annule = true }
-  }, [selected?.rapport, selected?.structured?._source])
+  }, [selected?.rapport])
 
-  const structuredEffectif = (selected?.rapport && structuredCache[selected.rapport]) || selected?.structured
-
-  // ← MODIFIÉ : les compteurs reflètent le scope actif (Today ou History),
-  // pas toujours le total -- pour rester cohérents avec ce qui est
-  // réellement affiché en dessous.
   const critCount = enScope.filter(i => getSeverity(i) === 'CRITICAL').length
   const highCount = enScope.filter(i => getSeverity(i) === 'HIGH').length
   const monCount  = enScope.filter(i => getSeverity(i) === 'MONITORING').length
@@ -533,11 +481,6 @@ export function PageIncidents({ incidents, historyTotal = 0, historyOffset = 0, 
   }
   const closeReport = () => { setReportOpen(false); setReportContent(null) }
 
-  // ← MODIFIÉ : télécharge maintenant un vrai PDF, via la nouvelle route
-  // backend GET /api/rapports/{nom}/pdf (report_writer.generer_pdf) --
-  // avant, téléchargeait le .md brut côté client. Nécessite d'ajouter
-  // cette route à routes.py (voir message) et les 3 polices DejaVu dans
-  // fonts/ à la racine du projet.
   const telechargerRapport = async () => {
     if (!selected?.rapport) return
     setDownloadingPdf(true)
@@ -560,12 +503,168 @@ export function PageIncidents({ incidents, historyTotal = 0, historyOffset = 0, 
     }
   }
 
+  const deleteOneIncident = (inc) => {
+    if (!inc?.rapport) return
+    setDeletedRapports(prev => new Set(prev).add(inc.rapport))
+    if (selTimestamp === inc.timestamp) { setSelTimestamp(null); closeReport() }
+    fetch(`/api/rapports/${inc.rapport}`, { method: 'DELETE' }).catch(() => {})
+  }
+
+  const toggleSelectInc = (inc) => {
+    if (!inc?.rapport) return
+    setSelectedRapports(prev => {
+      const suivant = new Set(prev)
+      if (suivant.has(inc.rapport)) suivant.delete(inc.rapport)
+      else suivant.add(inc.rapport)
+      return suivant
+    })
+  }
+
+  // ← AJOUT : sélectionne tout ce qui est visible (filtré par sévérité +
+  // onglet Today/History courant) -- seuls les incidents avec un rapport
+  // comptent, les autres n'ont rien à sélectionner (voir toggleSelectInc).
+  // Basé sur "filtered", donc respecte déjà le filtre CRITICAL/HIGH/
+  // MONITORING actif au moment du clic.
+  const rapportsVisibles = filtered.map(inc => inc.rapport).filter(Boolean)
+  const toutSelectionneInc = rapportsVisibles.length > 0 && rapportsVisibles.every(r => selectedRapports.has(r))
+
+  // ← AJOUT : History est paginé (Load more) -- "filtered" ne contient
+  // que ce qui a déjà été chargé, jamais tout le total serveur tant que
+  // "Load more" n'a pas été cliqué assez de fois. Sans ça, "Select all"
+  // ne sélectionnait que la première page chargée (ex: 113 sur 863
+  // réels) sans que rien n'indique que ce n'était qu'un sous-ensemble.
+  // Cet effet charge automatiquement toutes les pages restantes avant de
+  // sélectionner réellement tout, en réagissant aux changements de
+  // historyOffset/loadingMore plutôt qu'en dépendant d'un onLoadMore
+  // qu'on pourrait ou non pouvoir attendre (await) directement.
+  useEffect(() => {
+    if (!attenteChargementPourTout) return
+    if (loadingMore) return
+    if (scope === 'history' && historyOffset < historyTotal) {
+      onLoadMore()
+    } else {
+      setAttenteChargementPourTout(false)
+      setSelectedRapports(new Set(rapportsVisibles))
+    }
+  }, [attenteChargementPourTout, loadingMore, historyOffset, historyTotal, scope])
+
+  const selectionnerToutInc = () => {
+    if (toutSelectionneInc) { setSelectedRapports(new Set()); return }
+    if (scope === 'history' && historyOffset < historyTotal) {
+      setAttenteChargementPourTout(true)  // déclenche l'effet ci-dessus
+    } else {
+      setSelectedRapports(new Set(rapportsVisibles))
+    }
+  }
+
+  // ← MODIFIÉ : window.confirm() retiré -- ouvre la modale stylée
+  // (ConfirmModal) à la place ; la suppression réelle est dans
+  // confirmerSuppressionInc, appelée par le bouton "Delete" de la modale.
+  const deleteSelectionInc = () => {
+    if (selectedRapports.size === 0) return
+    setConfirmationEnCours(true)
+  }
+
+  // ← CORRIGÉ : avant, TOUS les ids sélectionnés étaient retirés de
+  // l'affichage IMMÉDIATEMENT (setDeletedRapports), puis TOUS les appels
+  // DELETE partaient EN MÊME TEMPS, sans aucune limite de concurrence ni
+  // suivi de succès -- pour 600 éléments, ça veut dire 600 requêtes HTTP
+  // simultanées vers un unique processus Uvicorn, dont une bonne partie
+  // échouait silencieusement (.catch(() => {}) avalait l'erreur sans rien
+  // faire) tout en étant déjà affichée comme supprimée. D'où l'écart
+  // observé après rafraîchissement (le fichier n'avait en réalité jamais
+  // été supprimé côté serveur, seul l'affichage local mentait). Traite
+  // maintenant par lots de 8 max en parallèle (Promise.allSettled),
+  // attend chaque lot avant de lancer le suivant, et ne retire de
+  // l'affichage QUE ce qui a un status HTTP réellement OK -- un échec
+  // reste visible, honnêtement, plutôt que de disparaître à tort.
+  const [suppressionEnCours, setSuppressionEnCours] = useState(false)
+  const [progressionSuppression, setProgressionSuppression] = useState({ fait: 0, total: 0 })
+
+  // ← RENFORCÉ (après un vrai retour terrain : 8 en parallèle restait
+  // trop pour un unique processus Uvicorn qui fait AUSSI tourner le
+  // cycle de surveillance, les appels Groq/Tavily etc. en tâche de fond
+  // -- 27 échecs sur 120 constatés en pratique malgré le premier
+  // correctif). Deux changements : lots réduits de 8 à 4, ET surtout,
+  // chaque suppression qui échoue est maintenant retentée automatiquement
+  // jusqu'à 3 fois avec un délai croissant (300ms, 600ms) avant d'être
+  // vraiment comptée comme un échec -- la plupart des échecs observés
+  // sont transitoires (serveur momentanément occupé), pas permanents,
+  // donc se corrigent tout seuls sans que l'utilisateur ait besoin de
+  // resélectionner et recliquer manuellement.
+  const supprimerAvecRetry = async (url, maxTentatives = 3) => {
+    for (let tentative = 1; tentative <= maxTentatives; tentative++) {
+      try {
+        const r = await fetch(url, { method: 'DELETE' })
+        if (r.ok) return true
+      } catch (e) { /* reseau -- retenter */ }
+      if (tentative < maxTentatives) await new Promise(res => setTimeout(res, 300 * tentative))
+    }
+    return false
+  }
+
+  const confirmerSuppressionInc = async () => {
+    setConfirmationEnCours(false)
+    const aTraiter = [...selectedRapports]
+    setSuppressionEnCours(true)
+    setProgressionSuppression({ fait: 0, total: aTraiter.length })
+    if (selected?.rapport && selectedRapports.has(selected.rapport)) { setSelTimestamp(null); closeReport() }
+
+    const TAILLE_LOT = 4
+    const reussis = []
+    for (let i = 0; i < aTraiter.length; i += TAILLE_LOT) {
+      const lot = aTraiter.slice(i, i + TAILLE_LOT)
+      const resultats = await Promise.allSettled(
+        lot.map(async nom => ({ nom, ok: await supprimerAvecRetry(`/api/rapports/${nom}`) }))
+      )
+      resultats.forEach(r => {
+        if (r.status === 'fulfilled' && r.value.ok) reussis.push(r.value.nom)
+      })
+      setProgressionSuppression({ fait: Math.min(i + TAILLE_LOT, aTraiter.length), total: aTraiter.length })
+      // ← seuls les succès confirmés jusqu'ici disparaissent de
+      // l'affichage, lot par lot -- jamais tout d'un coup en supposant
+      // que ça va marcher.
+      setDeletedRapports(prev => {
+        const suivant = new Set(prev)
+        reussis.forEach(nom => suivant.add(nom))
+        return suivant
+      })
+      // ← pause entre les lots -- laisse respirer le serveur, qui fait
+      // aussi tourner la surveillance en tâche de fond pendant ce temps.
+      if (i + TAILLE_LOT < aTraiter.length) await new Promise(r => setTimeout(r, 150))
+    }
+
+    setSuppressionEnCours(false)
+    const echecs = aTraiter.length - reussis.length
+    if (echecs > 0) {
+      alert(`${echecs} sur ${aTraiter.length} suppressions ont échoué même après plusieurs tentatives -- réessaie de les sélectionner et supprimer à nouveau.`)
+    }
+    setSelectedRapports(new Set())
+    setSelectionMode(false)
+  }
+
+  const changerScope = (id) => {
+    setScope(id); setSelTimestamp(null); closeReport()
+    setSelectionMode(false); setSelectedRapports(new Set())
+  }
+  const changerFiltre = (f) => {
+    setFilter(f); setSelTimestamp(null); closeReport()
+    setSelectionMode(false); setSelectedRapports(new Set())
+  }
+
   return (
     <div style={{ display:'flex', flexDirection:'column', gap:16 }}>
       <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start' }}>
-        <div>
-          <h2 style={{ fontSize:22, fontWeight:800, color:C.text, marginBottom:6 }}>Incident Management</h2>
-          <div style={{ fontSize:13, color:C.sub }}>AI-detected infrastructure events · Click any incident to view analysis</div>
+        <div style={{ display:'flex', gap:12, alignItems:'flex-start' }}>
+          {/* ← RETIRÉ : pastille dégradée bleu/cyan devant le titre. Le
+              titre porte maintenant lui-même le dégradé, ce qui évite de
+              répéter deux fois le même accent côte à côte. */}
+          <div>
+            <h2 style={{ fontSize:22, fontWeight:800, marginBottom:6, letterSpacing:'-0.02em',
+                         background:'linear-gradient(180deg, #ffffff 0%, #b9c9dd 130%)',
+                         WebkitBackgroundClip:'text', WebkitTextFillColor:'transparent' }}>Incident Management</h2>
+            <div style={{ fontSize:13, color:C.sub }}>AI-detected infrastructure events · Click any incident to view analysis</div>
+          </div>
         </div>
         <div style={{ display:'flex', gap:8 }}>
           {critCount > 0 && <Chip label={`${critCount} CRITICAL`}  color={C.red}/>}
@@ -575,7 +674,7 @@ export function PageIncidents({ incidents, historyTotal = 0, historyOffset = 0, 
         </div>
       </div>
 
-      {incidents.length === 0 ? (
+      {incidentsVisibles.length === 0 ? (
         <Card style={{ padding:'60px 0', textAlign:'center' }}>
           <div style={{ fontSize:40, marginBottom:16 }}>✓</div>
           <div style={{ fontSize:15, color:C.green, fontWeight:700, marginBottom:6 }}>All Systems Operational</div>
@@ -584,34 +683,77 @@ export function PageIncidents({ incidents, historyTotal = 0, historyOffset = 0, 
       ) : (
         <>
           <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', flexWrap:'wrap', gap:10 }}>
-            {/* ← AJOUT : toggle Today / History -- Today est le scope par
-                défaut (attention immédiate), History ouvre tout ce qui est
-                persisté (voir App.jsx, chargé depuis /api/rapports). */}
-            <div style={{ display:'flex', gap:6, background:C.surface, borderRadius:8, padding:4, border:`1px solid ${C.border}` }}>
-              {[['today','Today'],['history','History']].map(([id,label]) => (
-                <button key={id} onClick={()=>{ setScope(id); setSelTimestamp(null); closeReport() }}
-                  style={{ padding:'5px 16px', borderRadius:6, fontSize:11, fontFamily:'JetBrains Mono,monospace', fontWeight:700, border:'none', cursor:'pointer',
-                    background: scope===id ? C.blue : 'transparent', color: scope===id ? '#fff' : C.sub, transition:'all 0.15s', display:'flex', alignItems:'center', gap:6 }}>
-                  {label}
-                  {id==='today' && todayItems.length > 0 && (
-                    <span style={{ background: scope===id?'rgba(255,255,255,0.25)':C.bg, borderRadius:8, padding:'1px 6px', fontSize:10 }}>{todayItems.length}</span>
-                  )}
-                  {id==='history' && (
-                    <span style={{ background: scope===id?'rgba(255,255,255,0.25)':C.bg, borderRadius:8, padding:'1px 6px', fontSize:10 }}>{historyItems.length}</span>
-                  )}
-                </button>
-              ))}
+            {/* ← MODIFIÉ : même style que TabButton (PageRecommendations.jsx)
+                -- boîte bordée, bleue quand actif, "(N)" entre parenthèses
+                dans le libellé au lieu d'une puce arrondie séparée. Même
+                composant visuel des deux côtés, sur demande explicite de
+                cohérence entre les deux pages. */}
+            <div style={{ display:'flex', gap:8 }}>
+              <button onClick={()=>changerScope('today')}
+                style={{ padding:'7px 16px', borderRadius:8, border:`1px solid ${scope==='today'?C.blue:C.border}`,
+                         background: scope==='today' ? C.blue+'18' : 'transparent', color: scope==='today' ? C.blue : C.sub,
+                         fontSize:12, fontWeight:700, cursor:'pointer', fontFamily:'JetBrains Mono, monospace', transition:'all 0.15s' }}>
+                Today {todayItems.length > 0 ? `(${todayItems.length})` : ''}
+              </button>
+              <button onClick={()=>changerScope('history')}
+                style={{ padding:'7px 16px', borderRadius:8, border:`1px solid ${scope==='history'?C.blue:C.border}`,
+                         background: scope==='history' ? C.blue+'18' : 'transparent', color: scope==='history' ? C.blue : C.sub,
+                         fontSize:12, fontWeight:700, cursor:'pointer', fontFamily:'JetBrains Mono, monospace', transition:'all 0.15s' }}>
+                History {trueHistoryCount > 0 ? `(${trueHistoryCount})` : ''}
+              </button>
             </div>
 
-            <div style={{ display:'flex', gap:6, background:C.surface, borderRadius:8, padding:4, border:`1px solid ${C.border}` }}>
-              {['ALL','CRITICAL','HIGH','MONITORING'].map(f => (
-                <button key={f} onClick={()=>{ setFilter(f); setSelTimestamp(null); closeReport() }}
-                  style={{ padding:'5px 14px', borderRadius:6, fontSize:11, fontFamily:'JetBrains Mono,monospace', fontWeight:700, border:'none', cursor:'pointer',
-                    background: filter===f ? (f==='CRITICAL'?C.red:f==='HIGH'?C.orange:f==='MONITORING'?C.yellow:C.blue) : 'transparent',
-                    color: filter===f ? '#fff' : C.sub, transition:'all 0.15s' }}>
-                  {f}
-                </button>
-              ))}
+            <div style={{ display:'flex', gap:10, alignItems:'center' }}>
+              <div style={{ display:'flex', gap:6, background:C.surface, borderRadius:8, padding:4, border:`1px solid ${C.border}` }}>
+                {['ALL','CRITICAL','HIGH','MONITORING'].map(f => (
+                  <button key={f} onClick={()=>changerFiltre(f)}
+                    style={{ padding:'5px 14px', borderRadius:6, fontSize:11, fontFamily:'JetBrains Mono,monospace', fontWeight:700, border:'none', cursor:'pointer',
+                      background: filter===f ? (f==='CRITICAL'?C.red:f==='HIGH'?C.orange:f==='MONITORING'?C.yellow:C.blue) : 'transparent',
+                      color: filter===f ? '#fff' : C.sub, transition:'all 0.15s' }}>
+                    {f}
+                  </button>
+                ))}
+              </div>
+
+              {filtered.length > 0 && (
+                <div style={{ display:'flex', gap:8, alignItems:'center' }}>
+                  {selectionMode && (
+                    <button onClick={selectionnerToutInc} disabled={attenteChargementPourTout}
+                      style={{ background:'transparent', border:`1px solid ${C.border}`, borderRadius:6,
+                               color:C.sub, fontSize:11, padding:'5px 12px', cursor: attenteChargementPourTout ? 'default' : 'pointer',
+                               opacity: attenteChargementPourTout ? 0.6 : 1,
+                               fontFamily:'JetBrains Mono,monospace' }}>
+                      {attenteChargementPourTout ? '⟳ Loading all…' : toutSelectionneInc ? 'Deselect all' : 'Select all'}
+                    </button>
+                  )}
+                  {suppressionEnCours && (
+                    <span style={{ fontSize:12, color:C.orange, fontFamily:'JetBrains Mono,monospace' }}>
+                      ⟳ Deleting {progressionSuppression.fait}/{progressionSuppression.total}…
+                    </span>
+                  )}
+                  {selectionMode && selectedRapports.size > 0 && !suppressionEnCours && (
+                    <>
+                      <span style={{ fontSize:12, color:C.sub, fontFamily:'JetBrains Mono,monospace' }}>
+                        {selectedRapports.size} selected
+                      </span>
+                      <button onClick={deleteSelectionInc}
+                        style={{ background:'transparent', border:`1px solid ${C.red}60`, borderRadius:6,
+                                 color:C.red, fontSize:11, padding:'5px 12px', cursor:'pointer',
+                                 fontFamily:'JetBrains Mono,monospace' }}>
+                        🗑 Delete selected
+                      </button>
+                    </>
+                  )}
+                  <button
+                    onClick={() => { setSelectionMode(v => !v); setSelectedRapports(new Set()) }}
+                    style={{ background: selectionMode ? 'transparent' : C.blue+'12',
+                             border:`1px solid ${selectionMode ? C.border : C.blue+'50'}`, borderRadius:6,
+                             color: selectionMode ? C.sub : C.blue, fontSize:11, padding:'5px 12px', cursor:'pointer',
+                             fontFamily:'JetBrains Mono,monospace', transition:'all 0.15s' }}>
+                    {selectionMode ? 'Cancel' : 'Select'}
+                  </button>
+                </div>
+              )}
             </div>
           </div>
 
@@ -620,17 +762,11 @@ export function PageIncidents({ incidents, historyTotal = 0, historyOffset = 0, 
               {filtered.length === 0 && (
                 <div style={{ color:C.muted, fontSize:12, textAlign:'center', padding:'30px 0' }}>
                   {scope === 'today'
-                    ? <>No incidents today. <span style={{color:C.blue,cursor:'pointer',fontWeight:600}} onClick={()=>setScope('history')}>View history →</span></>
+                    ? <>No incidents today. <span style={{color:C.blue,cursor:'pointer',fontWeight:600}} onClick={()=>changerScope('history')}>View history →</span></>
                     : 'No incidents for this filter'}
                 </div>
               )}
               {scope === 'history' ? (
-                // ← Vue History : regroupée par date, avec en-têtes ---
-                // "Yesterday" pour hier, la date complète sinon -- "Today"
-                // ne peut plus apparaître ici : History exclut maintenant
-                // Today par construction (voir historyItems plus haut).
-                // Purement un habillage d'affichage -- `filtered` (l'ordre,
-                // le contenu) reste la source de vérité.
                 Object.entries(
                   filtered.reduce((groupes, inc) => {
                     const d = inc.timestamp ? new Date(inc.timestamp) : null
@@ -649,20 +785,20 @@ export function PageIncidents({ incidents, historyTotal = 0, historyOffset = 0, 
                       {dateLabel.toUpperCase()} · {items.length}
                     </div>
                     <div style={{ display:'flex', flexDirection:'column', gap:8 }}>
-                      {items.map((inc, i) => <IncidentCard key={i} inc={inc} selTimestamp={selTimestamp} setSelTimestamp={setSelTimestamp} closeReport={closeReport}/>)}
+                      {items.map((inc, i) => (
+                        <IncidentCard key={i} inc={inc} selTimestamp={selTimestamp} setSelTimestamp={setSelTimestamp} closeReport={closeReport}
+                          onDelete={deleteOneIncident} selectionMode={selectionMode} selected={selectedRapports.has(inc.rapport)} onToggleSelect={toggleSelectInc}/>
+                      ))}
                     </div>
                   </div>
                 ))
               ) : (
-                filtered.map((inc, i) => <IncidentCard key={i} inc={inc} selTimestamp={selTimestamp} setSelTimestamp={setSelTimestamp} closeReport={closeReport}/>)
+                filtered.map((inc, i) => (
+                  <IncidentCard key={i} inc={inc} selTimestamp={selTimestamp} setSelTimestamp={setSelTimestamp} closeReport={closeReport}
+                    onDelete={deleteOneIncident} selectionMode={selectionMode} selected={selectedRapports.has(inc.rapport)} onToggleSelect={toggleSelectInc}/>
+                ))
               )}
 
-              {/* ← AJOUT : "Load more" -- après des mois d'utilisation avec
-                  des milliers de rapports, tout charger d'un coup au
-                  démarrage devient lent et inutile. Visible uniquement en
-                  vue History, seulement s'il reste des rapports plus
-                  anciens que ceux déjà chargés (historyOffset < historyTotal,
-                  géré côté App.jsx). */}
               {scope === 'history' && historyOffset < historyTotal && (
                 <button onClick={onLoadMore} disabled={loadingMore}
                   style={{ marginTop:8, padding:'10px 16px', borderRadius:8, border:`1px solid ${C.border}`, background:C.surface, color:C.sub, fontSize:12, fontFamily:'JetBrains Mono,monospace', fontWeight:700, cursor: loadingMore?'default':'pointer', opacity: loadingMore?0.6:1, textAlign:'center' }}>
@@ -673,35 +809,49 @@ export function PageIncidents({ incidents, historyTotal = 0, historyOffset = 0, 
 
             {selected && (
               <div style={{ display:'flex', flexDirection:'column', gap:12, position:'sticky', top:16 }}>
-                {/* ← CORRIGÉ : "Incident Details" reste TOUJOURS visible,
-                    même quand le rapport complet est ouvert -- avant, un
-                    {!reportOpen && ...} le cachait dès l'ouverture du
-                    rapport puis le réaffichait à la fermeture, ce qui
-                    donnait l'impression d'un vrai bug (disparition/
-                    réapparition) plutôt qu'un choix d'affichage délibéré. */}
                 <Card style={{ padding:'18px 20px', borderLeft:`3px solid ${severityColor(getSeverity(selected))}` }}>
                   <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:14 }}>
                     <div>
                       <div style={{ fontSize:15, fontWeight:700, color:C.text, marginBottom:3 }}>Incident Details</div>
                       <div style={{ fontSize:11, color:C.muted, fontFamily:'JetBrains Mono,monospace' }}>
                         {selected.timestamp?.slice(0,19).replace('T',' ')}
-                        {selected.score > 0 && <span style={{ marginLeft:12, color:C.purple }}>AI {selected.score?.toFixed(4)}</span>}
+                        {selected.score > 0 && <span style={{ marginLeft:12, color:C.blue }}>AI {selected.score?.toFixed(4)}</span>}
                       </div>
                     </div>
-                    <Chip label={getSeverity(selected)} color={severityColor(getSeverity(selected))}/>
+                    <div style={{ display:'flex', gap:8, alignItems:'center' }}>
+                      <Chip label={getSeverity(selected)} color={severityColor(getSeverity(selected))}/>
+                      {selected.rapport && <DeleteButtonInc onConfirm={() => deleteOneIncident(selected)} />}
+                    </div>
                   </div>
                   <div style={{ borderTop:`1px solid ${C.border}`, paddingTop:14 }}>
                     {selected.structured ? (
-                      <StructuredIncident structured={structuredEffectif} loadingFull={loadingFull}/>
+                      <StructuredIncident structured={selected.structured}/>
                     ) : (
                       <div style={{ fontSize:13, color:C.sub, lineHeight:1.7 }}>{selected.message}</div>
                     )}
-                    {/* ← AJOUT : liste brute complète des anomalies détectées
-                        ce cycle, groupées par sévérité -- absente de
-                        Recommendations (qui ne montre que les causes
-                        retenues par le LLM, pas la liste exhaustive). C'est
-                        la vraie différence entre les deux pages, rendue
-                        visible plutôt que seulement expliquée. */}
+
+                    {/* ← AJOUT : recommendation liée à cet incident --
+                        répond à "savoir pour chaque incident quelle est sa
+                        recommendation". N'affiche rien si aucune trouvée
+                        (incident sans recommendation associée, ex: rapport
+                        dégradé généré pendant une panne DB) -- pas un
+                        message d'erreur, juste une absence silencieuse. */}
+                    {recommandationLiee && (
+                      <div style={{ marginTop:14, paddingTop:14, borderTop:`1px solid ${C.border}` }}>
+                        <div style={{ fontSize:10, fontWeight:700, color:C.sub, letterSpacing:'0.08em', marginBottom:8, fontFamily:'JetBrains Mono,monospace' }}>
+                          LINKED RECOMMENDATION
+                        </div>
+                        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', gap:10, padding:'10px 12px', background:C.surface, border:`1px solid ${C.border}`, borderRadius:8 }}>
+                          <div style={{ fontSize:12.5, color:C.text, fontWeight:600 }}>{recommandationLiee.title}</div>
+                          <span style={{ fontSize:10, fontWeight:700, padding:'2px 9px', borderRadius:10, flexShrink:0,
+                                         color: recommandationLiee.status === 'RESOLVED' ? C.green : C.orange,
+                                         border:`1px solid ${recommandationLiee.status === 'RESOLVED' ? C.green : C.orange}` }}>
+                            {recommandationLiee.status === 'RESOLVED' ? 'RESOLVED' : 'ACTIVE'}
+                          </span>
+                        </div>
+                      </div>
+                    )}
+
                     {(selected.anomalies?.length || 0) > 1 && (() => {
                       const { crit, haute, autre } = grouperParSeverite(selected.anomalies)
                       return (
@@ -777,6 +927,14 @@ export function PageIncidents({ incidents, historyTotal = 0, historyOffset = 0, 
             )}
           </div>
         </>
+      )}
+
+      {confirmationEnCours && (
+        <ConfirmModal
+          message={`Delete ${selectedRapports.size} selected incident${selectedRapports.size > 1 ? 's' : ''}? This cannot be undone.`}
+          onConfirm={confirmerSuppressionInc}
+          onCancel={() => setConfirmationEnCours(false)}
+        />
       )}
     </div>
   )

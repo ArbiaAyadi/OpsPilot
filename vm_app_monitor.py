@@ -135,10 +135,6 @@ def _query_prometheus_series(query: str) -> list:
 # ══════════════════════════════════════════════════════════════════════════════
 # SSH vers les VMs Linux (SÉPARÉ du SSH vers les noeuds Proxmox)
 # ══════════════════════════════════════════════════════════════════════════════
-# hypervisor_detect.py a déjà SSH_USER/SSH_PASSWORD, mais c'est le compte
-# root de pve1/pve2 -- une VM Ubuntu classique a son propre compte
-# utilisateur, presque jamais le même. Variables séparées pour ne jamais
-# mélanger les deux.
 LINUX_VM_SSH_USER     = os.getenv("LINUX_VM_SSH_USER", "")
 LINUX_VM_SSH_PASSWORD = os.getenv("LINUX_VM_SSH_PASSWORD", "")
 
@@ -182,10 +178,6 @@ VM_IP_MAP = {
     "103": "192.168.138.137",  # linux-vm2
 }
 
-# ── Catalogue de services reconnus (badge de détection uniquement) ─────────
-# Nom du service systemd (sans ".service") -> nom affiché. Un service actif
-# absent de cette liste reste invisible pour l'instant -- ajouter une ligne
-# suffit à l'inclure, jamais besoin de toucher à detecter_services_vm().
 CATALOGUE_SERVICES = {
     "postgresql":      "PostgreSQL",
     "docker":          "Docker",
@@ -200,17 +192,6 @@ CATALOGUE_SERVICES = {
     "minio":           "MinIO",
 }
 
-# ── Mesure de consommation réelle — process-exporter (port 9256) ───────────
-# ← CORRECTION IMPORTANTE : process-exporter tourne avec sa config générique
-# par défaut (name: "{{.Comm}}", cmdline: ['.+']) -- JAMAIS régénérée,
-# jamais éditée. Ça veut dire qu'il suit déjà TOUT processus automatiquement,
-# y compris un service qui n'a jamais été ajouté à CATALOGUE_SERVICES.
-# La table ci-dessous ne sert PLUS à configurer quoi que ce soit -- juste à
-# retrouver la bonne donnée quand le nom du service systemd diffère du nom
-# réel du processus (postgresql.service lance un binaire "postgres";
-# docker.service lance "dockerd"). Un service absent d'ici est cherché sous
-# son propre nom directement -- fonctionne déjà pour la majorité des cas
-# (nginx, redis-server, mongod... le nom du service EST le nom du processus).
 PROCESS_EXPORTER_PORT = 9256
 COMM_REEL = {
     "postgresql": "postgres",
@@ -222,26 +203,7 @@ COMM_REEL = {
 
 def get_process_metrics(vmid, service_key: str, vcpus: int = None) -> dict:
     """
-    Retourne la consommation réelle du processus correspondant à service_key
-    (ex: "postgresql", "redis-server", ou n'importe quel autre nom de
-    service systemd détecté) -- RAM, CPU et I/O disque, tout ce que
-    process-exporter expose de directement utile pour juger la santé d'un
-    service. Générique : fonctionne pour n'importe quel processus déjà
-    suivi automatiquement, pas seulement ceux listés dans COMM_REEL.
-
-    vcpus (optionnel, rétrocompatible -- omis = comportement identique à
-    avant) : cpu_pct ci-dessous reste le % d'UN SEUL cœur (ce que
-    process-exporter mesure nativement) -- pas comparable tel quel au
-    cpu_pct affiché au niveau VM, qui lui est déjà normalisé sur l'ensemble
-    des vCPU alloués. cpu_pct_vm est ajouté EN PLUS (cpu_pct reste inchangé)
-    quand vcpus est fourni -- seul chiffre réellement comparable au CPU% de
-    la VM. Générique : vcpus vient de la VM, pas du service -- s'applique
-    pareil à PostgreSQL, Docker, Redis ou n'importe quel autre.
-
-    Absent volontairement : le réseau (process-exporter ne l'expose pas par
-    processus, aucun contournement fiable) et toute donnée interne au
-    service (connexions, requêtes lentes...) -- voir ENRICHISSEURS_SERVICE
-    pour les services qui ont un exportateur dédié capable de fournir ça.
+    Retourne la consommation réelle du processus correspondant à service_key.
     """
     ip = VM_IP_MAP.get(str(vmid))
     if not ip:
@@ -252,7 +214,7 @@ def get_process_metrics(vmid, service_key: str, vcpus: int = None) -> dict:
     ram_bytes = _query_prometheus(f'namedprocess_namegroup_memory_bytes{{{base},memtype="resident"}}')
     num_procs = _query_prometheus(f'namedprocess_namegroup_num_procs{{{base}}}')
     if not ram_bytes and not num_procs:
-        return {}  # groupe introuvable -- service pas suivi ou pas actif actuellement
+        return {}
 
     cpu_user = _query_prometheus(f'rate(namedprocess_namegroup_cpu_seconds_total{{{base},mode="user"}}[5m])')
     cpu_sys  = _query_prometheus(f'rate(namedprocess_namegroup_cpu_seconds_total{{{base},mode="system"}}[5m])')
@@ -275,12 +237,7 @@ def get_process_metrics(vmid, service_key: str, vcpus: int = None) -> dict:
 def detecter_services_vm(vmid) -> list:
     """
     Retourne les services RÉELLEMENT actifs sur cette VM, vérifiés en direct
-    via Prometheus -- pas une déclaration statique. Si un service tombe, il
-    disparaît de cette liste au prochain cycle (60s), automatiquement.
-
-    Générique : n'importe quel service du catalogue est détecté de la même
-    façon, sans code spécifique par service. Ajouter un nouveau service à
-    surveiller = une ligne dans CATALOGUE_SERVICES.
+    via Prometheus.
     """
     ip = VM_IP_MAP.get(str(vmid))
     if not ip:
@@ -288,7 +245,6 @@ def detecter_services_vm(vmid) -> list:
 
     services = []
 
-    # ── Détection générique (n'importe quel service actif du catalogue) ────
     resultats = _query_prometheus_series(
         f'node_systemd_unit_state{{instance="{ip}:9100",state="active"}} == 1'
     )
@@ -299,9 +255,6 @@ def detecter_services_vm(vmid) -> list:
         if nom_unit in CATALOGUE_SERVICES:
             services.append(CATALOGUE_SERVICES[nom_unit])
 
-    # ── Exception documentée : conteneurs Docker (Prometheus/Alertmanager),
-    # jamais visibles comme service systemd de l'hôte -- vérifiés via leur
-    # propre endpoint, comme avant ce correctif.
     prom_host = PROMETHEUS_URL.split("//")[-1].split(":")[0]
     if ip == prom_host:
         if _query_prometheus('up{job="prometheus"}') == 1.0:
@@ -315,15 +268,6 @@ def detecter_services_vm(vmid) -> list:
 # ══════════════════════════════════════════════════════════════════════════════
 # Enrichissement optionnel par service — registre extensible
 # ══════════════════════════════════════════════════════════════════════════════
-# Un service avec un exportateur dédié, une auto-exposition native (comme
-# Prometheus), ou un accès SSH direct (comme Docker) peut apporter des
-# métriques que process-exporter ne voit jamais. Ajouter le support d'un
-# nouveau service = écrire une fonction d'enrichissement + une ligne dans
-# ENRICHISSEURS_SERVICE ci-dessous. Rien d'autre à toucher : ni
-# detecter_services_vm(), ni get_metriques_services_vm(), ni la détection
-# DOWN générique, ni le suivi num_procs. Un service SANS entrée ici garde
-# simplement RAM/CPU/disk/num_procs génériques -- c'est le comportement par
-# défaut, pas une exception à gérer.
 def _enrichir_postgresql(vmid=None) -> dict:
     pg     = get_postgres_metrics()
     health = check_postgres_health()
@@ -343,14 +287,7 @@ def _enrichir_postgresql(vmid=None) -> dict:
 def _enrichir_prometheus(vmid=None) -> dict:
     """
     Prometheus expose déjà ses propres statistiques internes sur son
-    /metrics natif (il s'auto-scrape) -- pas besoin d'exportateur séparé,
-    contrairement à PostgreSQL. prometheus_tsdb_head_series explique
-    directement pourquoi sa RAM grandit dans le temps.
-
-    ← AJOUT : container_restarts, via _restart_pour_service() -- voir la
-    section "Redémarrages de conteneurs Docker" plus bas dans ce fichier.
-    Absent du dict si aucun conteneur nommé "prometheus" n'est trouvé
-    (silencieux, pas d'erreur).
+    /metrics natif (il s'auto-scrape).
     """
     resultat = {
         "series_actives": _query_prometheus('prometheus_tsdb_head_series'),
@@ -363,7 +300,6 @@ def _enrichir_prometheus(vmid=None) -> dict:
     return resultat
 
 
-# ── Docker : espace disque images/volumes/cache, via SSH ────────────────────
 DOCKER_DISK_CACHE_TTL_S = float(os.getenv("DOCKER_DISK_CACHE_TTL_S", "300"))
 _docker_disk_cache = None
 _docker_disk_ts    = 0.0
@@ -371,9 +307,7 @@ _docker_disk_ts    = 0.0
 
 def _parser_taille_docker(texte: str) -> float:
     """
-    Convertit une taille Docker human-readable ("1.2GB", "450MB (37%)",
-    "0B") en GB (float). Ne garde que le premier "mot" (avant un éventuel
-    "(37%)" de réutilisable) puis extrait nombre + unité.
+    Convertit une taille Docker human-readable en GB (float).
     """
     if not texte:
         return 0.0
@@ -389,18 +323,13 @@ def _parser_taille_docker(texte: str) -> float:
 def _enrichir_docker(vmid=None) -> dict:
     """
     Espace disque réel pris par Docker (images, volumes locaux, cache de
-    build) -- invisible pour process-exporter, qui ne voit que des
-    processus, jamais la comptabilité interne du moteur Docker. Nécessite
-    docker system df en SSH sur la VM qui héberge Docker (voir docstring du
-    fichier). Mis en cache DOCKER_DISK_CACHE_TTL_S (5 min par défaut) --
-    cette donnée ne change pas seconde par seconde, inutile de rouvrir une
-    connexion SSH à chaque cycle de surveillance (60s).
+    build).
     """
     global _docker_disk_cache, _docker_disk_ts
     if _docker_disk_cache is not None and (time.time() - _docker_disk_ts) < DOCKER_DISK_CACHE_TTL_S:
         return _docker_disk_cache
 
-    ip = VM_IP_MAP.get("103")  # linux-vm2, seule VM avec Docker actuellement
+    ip = VM_IP_MAP.get("103")
     resultat = {}
     if ip:
         sortie = _ssh_command_linux_vm(ip, "docker system df --format '{{json .}}'")
@@ -431,39 +360,23 @@ def _enrichir_docker(vmid=None) -> dict:
     return resultat
 
 
-# ── Redémarrages de conteneurs Docker (Prometheus, Alertmanager) ────────────
-# ← AJOUT : angle mort identifié -- si un conteneur plante et redémarre
-# automatiquement (politique "restart: always", très courante), process-
-# exporter voit juste "le processus existe" en continu, le plantage est
-# invisible. Docker tient lui-même à jour un compteur de redémarrages par
-# conteneur (RestartCount) -- ce bloc le lit en SSH une fois pour tous les
-# conteneurs (docker inspect), le range par nom de conteneur, et
-# _restart_pour_service() retrouve le bon conteneur par sous-chaîne dans son
-# nom ("prometheus" matche "docker-prometheus-1", "monitoring_prometheus_1",
-# peu importe le préfixe posé par docker-compose). Cache plus court que
-# l'espace disque (60s, pas 5min) -- un redémarrage est un événement qu'on
-# veut détecter rapidement, pas une donnée qui évolue lentement.
 DOCKER_RESTART_CACHE_TTL_S = float(os.getenv("DOCKER_RESTART_CACHE_TTL_S", "60"))
 _docker_restart_cache = None
 _docker_restart_ts    = 0.0
-_restart_precedent    = {}  # (vmid(str), service_key) -> dernier restart_count vu
+_restart_precedent    = {}
 
 _DOCKER_INSPECT_CMD = r"""docker inspect --format '{"name":"{{.Name}}","restart_count":{{.RestartCount}},"started_at":"{{.State.StartedAt}}"}' $(docker ps -q)"""
 
 
 def _obtenir_conteneurs_docker() -> dict:
     """
-    Interroge docker inspect UNE fois pour tous les conteneurs en cours,
-    retourne {nom_conteneur_en_minuscules: {"restart_count": int,
-    "started_at": str}}. $(docker ps -q) est résolu par le SHELL DISTANT
-    (dans la commande SSH elle-même), pas par Python -- un seul aller-retour
-    SSH pour tous les conteneurs, pas un par conteneur.
+    Interroge docker inspect UNE fois pour tous les conteneurs en cours.
     """
     global _docker_restart_cache, _docker_restart_ts
     if _docker_restart_cache is not None and (time.time() - _docker_restart_ts) < DOCKER_RESTART_CACHE_TTL_S:
         return _docker_restart_cache
 
-    ip = VM_IP_MAP.get("103")  # linux-vm2, seule VM avec des conteneurs actuellement
+    ip = VM_IP_MAP.get("103")
     resultat = {}
     if ip:
         sortie = _ssh_command_linux_vm(ip, _DOCKER_INSPECT_CMD)
@@ -488,9 +401,7 @@ def _obtenir_conteneurs_docker() -> dict:
 def _restart_pour_service(cle_service: str) -> dict:
     """
     Retrouve les infos de redémarrage du conteneur dont le nom CONTIENT
-    cle_service -- pas une correspondance exacte, pour rester indépendant du
-    préfixe de projet docker-compose. Retourne {} si aucun conteneur ne
-    correspond (pas d'erreur, juste rien à ajouter pour ce service).
+    cle_service.
     """
     for nom, infos in _obtenir_conteneurs_docker().items():
         if cle_service in nom:
@@ -501,12 +412,7 @@ def _restart_pour_service(cle_service: str) -> dict:
 def detecter_redemarrage_conteneur(vmid, service_key: str, restart_count) -> dict:
     """
     Compare le restart_count actuel au dernier connu pour CE service sur
-    CETTE VM -- une hausse indique qu'un conteneur vient de redémarrer
-    (plantage + relance automatique par Docker, ou redémarrage manuel),
-    invisible pour process-exporter qui ne voit que "le processus existe",
-    jamais son historique de plantages. Premier cycle : rien à comparer,
-    juste enregistre la valeur de départ (même principe que
-    detecter_changements_services).
+    CETTE VM.
     """
     cle = (str(vmid), service_key)
     precedent = _restart_precedent.get(cle)
@@ -524,11 +430,7 @@ def detecter_redemarrage_conteneur(vmid, service_key: str, restart_count) -> dic
 
 def _enrichir_alertmanager(vmid=None) -> dict:
     """
-    ← AJOUT : Alertmanager reste SANS enrichisseur pour ses métriques
-    internes (alertes actives, silences...) -- toujours vrai, ça reste
-    hors-sujet pour le dimensionnement (voir note ci-dessous). Celui-ci
-    existe UNIQUEMENT pour le comptage de redémarrages de conteneur -- un
-    signal de fiabilité, pas de ressource, invisible pour process-exporter.
+    Alertmanager reste SANS enrichisseur pour ses métriques internes.
     """
     conteneur = _restart_pour_service("alertmanager")
     if not conteneur:
@@ -541,14 +443,6 @@ ENRICHISSEURS_SERVICE = {
     "prometheus":   _enrichir_prometheus,
     "docker":       _enrichir_docker,
     "alertmanager": _enrichir_alertmanager,
-    # Alertmanager n'a PAS d'enrichisseur pour ses métriques internes
-    # (alertes actives, silences...) -- ça concerne la santé de son propre
-    # pipeline, pas le dimensionnement de la VM -- process-exporter
-    # (RAM/CPU/disk) suffit déjà pour que la recommandation reste correcte
-    # sur ce point précis. Son entrée ci-dessus sert uniquement au comptage
-    # de redémarrages, une préoccupation différente (fiabilité).
-    # Prochain service avec exportateur dédié : une fonction + une ligne
-    # ici, rien d'autre à modifier.
 }
 
 
@@ -557,17 +451,6 @@ def get_metriques_services_vm(vmid, services_detectes: list, vcpus: int = None) 
     Retourne {nom_service_affiché: {ram_mb, cpu_pct, cpu_pct_vm?, disk_read_mbps,
     disk_write_mbps, num_procs, ...métriques internes si exportateur dédié}}
     pour chaque service déjà détecté.
-
-    vcpus (optionnel, rétrocompatible) : transmis à get_process_metrics()
-    pour calculer cpu_pct_vm sur CHAQUE service, générique -- pas seulement
-    PostgreSQL.
-
-    Retrouve la clé systemd depuis le nom affiché via CATALOGUE_SERVICES
-    (inversé) -- Prometheus/Alertmanager, spéciaux car détectés par leur
-    endpoint Docker plutôt que par systemd, sont ajoutés explicitement ici
-    puisqu'absents de ce catalogue. Un service sans clé connue est cherché
-    directement sous son nom en minuscules -- fonctionne pour la majorité
-    des cas, générique par défaut plutôt que par exception.
     """
     label_vers_cle = {v: k for k, v in CATALOGUE_SERVICES.items()}
     label_vers_cle.update({"Prometheus": "prometheus", "Alertmanager": "alertmanager"})
@@ -583,7 +466,7 @@ def get_metriques_services_vm(vmid, services_detectes: list, vcpus: int = None) 
             try:
                 m.update(enrichisseur(vmid))
             except Exception:
-                pass  # exportateur dédié indisponible -- garde au moins RAM/CPU/disk génériques
+                pass
         resultat[label] = m
     return resultat
 
@@ -591,16 +474,14 @@ def get_metriques_services_vm(vmid, services_detectes: list, vcpus: int = None) 
 # ══════════════════════════════════════════════════════════════════════════════
 # Détection générique de service DOWN + dérive du nombre de processus
 # ══════════════════════════════════════════════════════════════════════════════
-_etat_precedent_services = {}   # vmid(str) -> set(labels actifs au cycle précédent)
-_historique_num_procs    = {}   # (vmid(str), service_key) -> deque des derniers num_procs
+_etat_precedent_services = {}
+_historique_num_procs    = {}
 
 
 def detecter_changements_services(vmid, services_actuels: list) -> list:
     """
     Compare la liste de services actifs de ce cycle à celle du cycle
-    précédent pour CETTE VM. Un service qui disparaît (crash, arrêt manuel,
-    unité systemd qui bascule à "failed") génère une alerte générique,
-    immédiatement, sans code spécifique par service.
+    précédent pour CETTE VM.
     """
     cle = str(vmid)
     actuels = set(services_actuels)
@@ -623,9 +504,7 @@ def detecter_changements_services(vmid, services_actuels: list) -> list:
 def detecter_derive_num_procs(vmid, service_key: str, num_procs: int,
                                fenetre: int = 10, facteur_alerte: float = 2.0):
     """
-    Suit num_procs dans le temps pour CE service sur CETTE VM -- générique,
-    s'applique à n'importe quel service du catalogue. Une fuite de
-    processus/connexions fait grimper ce nombre en continu.
+    Suit num_procs dans le temps pour CE service sur CETTE VM.
     """
     cle = (str(vmid), service_key)
     if cle not in _historique_num_procs:
@@ -647,16 +526,135 @@ def detecter_derive_num_procs(vmid, service_key: str, num_procs: int,
     return alerte
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Seuils sur les métriques ENRICHIES par service — registre extensible
+# ══════════════════════════════════════════════════════════════════════════════
+# ← AJOUT : avant, les métriques enrichies par service (ENRICHISSEURS_SERVICE
+# ci-dessus) étaient MESURÉES et affichées dans l'UI, mais jamais comparées
+# à un seuil -- seuls num_procs (dérive) et container_restarts (dérive)
+# généraient une alerte. Le cas le plus concret : Docker total_disk_gb
+# pouvait grossir indéfiniment sans jamais rien signaler, exactement le
+# mécanisme qui a produit la crise VM103/pool LVM diagnostiquée plus tôt
+# dans cette même session -- la donnée existait déjà, elle n'était
+# simplement jamais vérifiée.
+#
+# Registre extensible, même principe que ENRICHISSEURS_SERVICE : ajouter un
+# seuil pour un nouveau champ = une ligne ici, rien d'autre à modifier.
+# Format (cle_service, champ) -> (avertissement, critique, inverse).
+# inverse=True signifie "plus BAS = pire" (ex: cache_hit_pct) plutôt que
+# "plus HAUT = pire" (comportement par défaut).
+#
+# Valeurs choisies comme point de départ raisonnable, pas mesurées sur TON
+# infrastructure précise -- à ajuster si trop/pas assez sensibles en usage
+# réel :
+#   - docker.total_disk_gb : 15GB avertissement / 25GB critique. Ton pool
+#     LVM fait actuellement 46.81GB (après l'agrandissement fait plus tôt
+#     cette session) -- ces seuils laissent une marge confortable avant de
+#     retoucher au pool, sans attendre qu'il soit de nouveau plein.
+#   - postgresql.cache_hit_pct : en dessous de 90%/80%, le cache est trop
+#     petit pour la charge réelle (le buffer pool PostgreSQL ne suffit
+#     plus) -- guidance standard PostgreSQL, pas une valeur inventée pour
+#     ce projet précis.
+#   - postgresql.rollback_rate : un taux de rollback soutenu au-dessus de
+#     1-5/s indique un problème applicatif (transactions qui échouent en
+#     boucle), pas un pic ponctuel normal.
+SEUILS_METRIQUES_SERVICE = {
+    ("docker",     "total_disk_gb"):   (15,  25, False),
+    ("postgresql", "cache_hit_pct"):   (90,  80, True),
+    ("postgresql", "rollback_rate"):   (1,   5,  False),
+}
+
+# Champs booléens où False EST le problème (pas de notion de palier
+# warning/critical -- soit c'est bon, soit non). Format (cle_service,
+# champ) -> message si False.
+CHAMPS_BOOLEENS_CRITIQUES = {
+    ("prometheus", "config_ok"): "config reload failed -- check for a syntax error in the last edit to prometheus.yml",
+}
+
+INTERVALLE_REESCALADE_SEUIL_SERVICE_S = 1800  # 30 min -- cohérent avec anomaly_detector.py
+_dernier_palier_seuil_service    = {}  # (vmid, service_key, champ) -> dernier palier connu (ou None)
+_derniere_alerte_seuil_service   = {}  # (vmid, service_key, champ) -> timestamp du dernier signalement
+
+
+def _palier_seuil_service(valeur: float, warn: float, crit: float, inverse: bool) -> str | None:
+    if inverse:
+        if valeur < crit: return "CRITIQUE"
+        if valeur < warn: return "IMPORTANT"
+        return None
+    else:
+        if valeur > crit: return "CRITIQUE"
+        if valeur > warn: return "IMPORTANT"
+        return None
+
+
+def detecter_seuils_metriques_service(vmid, cle_service: str, metriques: dict) -> list:
+    """
+    Vérifie les métriques enrichies de CE service contre SEUILS_METRIQUES_SERVICE
+    et CHAMPS_BOOLEENS_CRITIQUES -- même principe palier + ré-escalade que
+    anomaly_detector.py (changement de palier déclenche toujours, un palier
+    CRITIQUE soutenu se rappelle après 30 min), mais basé sur un état stocké
+    en mémoire (dernier palier connu) plutôt qu'un etat_prec explicite -- ce
+    fichier n'a jamais accès au cycle précédent complet, contrairement à
+    anomaly_detector.detecter_anomalies(etat, etat_prec).
+    """
+    alertes = []
+    cle_svc = cle_service.lower()
+
+    for (svc, champ), (warn, crit, inverse) in SEUILS_METRIQUES_SERVICE.items():
+        if svc != cle_svc:
+            continue
+        valeur = metriques.get(champ)
+        if valeur is None:
+            continue
+        cle_etat = (str(vmid), cle_svc, champ)
+        palier       = _palier_seuil_service(float(valeur), warn, crit, inverse)
+        palier_avant = _dernier_palier_seuil_service.get(cle_etat)
+        doit_reescalader = (
+            palier == "CRITIQUE"
+            and (time.time() - _derniere_alerte_seuil_service.get(cle_etat, 0)) >= INTERVALLE_REESCALADE_SEUIL_SERVICE_S
+        )
+        if (palier and palier != palier_avant) or doit_reescalader:
+            mot   = "critical" if palier == "CRITIQUE" else "high"
+            unite = "GB" if champ.endswith("_gb") else ("%" if champ.endswith("_pct") else "/s")
+            alertes.append({
+                "niveau":  palier,
+                "cible":   f"vm-{vmid}/{cle_svc}",
+                "message": f"{cle_service}: {champ.replace('_',' ')} {mot} ({valeur:.1f}{unite})",
+                "type":    "service_threshold",
+            })
+            _derniere_alerte_seuil_service[cle_etat] = time.time()
+        _dernier_palier_seuil_service[cle_etat] = palier
+
+    for (svc, champ), description in CHAMPS_BOOLEENS_CRITIQUES.items():
+        if svc != cle_svc:
+            continue
+        valeur = metriques.get(champ)
+        if valeur is None:
+            continue
+        cle_etat = (str(vmid), cle_svc, champ)
+        mauvais_maintenant = (valeur is False)
+        etait_mauvais       = _dernier_palier_seuil_service.get(cle_etat) == "CRITIQUE"
+        doit_reescalader = (
+            mauvais_maintenant
+            and (time.time() - _derniere_alerte_seuil_service.get(cle_etat, 0)) >= INTERVALLE_REESCALADE_SEUIL_SERVICE_S
+        )
+        if (mauvais_maintenant and not etait_mauvais) or doit_reescalader:
+            alertes.append({
+                "niveau":  "CRITIQUE",
+                "cible":   f"vm-{vmid}/{cle_svc}",
+                "message": f"{cle_service}: {description}",
+                "type":    "service_threshold",
+            })
+            _derniere_alerte_seuil_service[cle_etat] = time.time()
+        _dernier_palier_seuil_service[cle_etat] = "CRITIQUE" if mauvais_maintenant else None
+
+    return alertes
+
+
 def generer_alertes_services(vmid, services_detectes: list, metriques_services: dict) -> list:
     """
     Point d'entrée unique à appeler UNE FOIS PAR CYCLE PAR VM, juste après
     detecter_services_vm() et get_metriques_services_vm().
-
-    ← AJOUT : vérifie aussi la dérive de container_restarts, quand présent
-    (Prometheus, Alertmanager) -- même boucle que num_procs, pas une passe
-    supplémentaire. Générique : tout futur service dont l'enrichisseur
-    ajoute un jour un champ "container_restarts" est couvert automatiquement,
-    sans toucher à cette fonction.
     """
     alertes = detecter_changements_services(vmid, services_detectes)
 
@@ -673,6 +671,9 @@ def generer_alertes_services(vmid, services_detectes: list, metriques_services: 
             alerte = detecter_redemarrage_conteneur(vmid, cle, m["container_restarts"])
             if alerte:
                 alertes.append(alerte)
+        # ← AJOUT : seuils sur les metriques enrichies (Docker total_disk_gb,
+        # PostgreSQL cache_hit_pct/rollback_rate, Prometheus config_ok...)
+        alertes.extend(detecter_seuils_metriques_service(vmid, cle, m))
 
     return alertes
 
@@ -680,68 +681,36 @@ def generer_alertes_services(vmid, services_detectes: list, metriques_services: 
 # ══════════════════════════════════════════════════════════════════════════════
 # NIVEAU 2 — PostgreSQL (linux-vm1, 192.168.138.133)
 # ══════════════════════════════════════════════════════════════════════════════
-
-# Base de données réellement monitorée, alignée sur DB_NAME dans .env (la
-# base qu'OpsPilot utilise pour son propre stockage) -- une seule source de
-# vérité pour ce nom, pas deux valeurs distinctes à garder en synchro.
 DB_NAME_MONITOREE = os.getenv("DB_NAME", "opspilot")
 
 
 def get_postgres_metrics(instance: str = "192.168.138.133:9187", datname: str = None) -> dict:
     """
     Collecte les métriques PostgreSQL depuis postgres_exporter.
-
-    ← CORRECTION MAJEURE : "pg_up" interrogeait up{job="postgres_exporter"}
-    (santé du SCRAPE Prometheus) au lieu de la vraie métrique "pg_up" que
-    postgres_exporter expose lui-même (santé de SA connexion à PostgreSQL).
-    Confirmé par curl direct : pg_up=0 alors que le scrape réussit toujours
-    -- collision de nom entre notre champ et la métrique native de
-    l'exportateur, on lisait la mauvaise depuis le début. pg_scrape_ok
-    ajouté séparément pour garder les deux signaux distincts.
-
-    pg_stat_activity_count, pg_locks_count et pg_stat_database_blks_hit/
-    blks_read restent filtrés sur datname (DB_NAME dans .env) -- inchangé,
-    mais tant que pg_up=0 (exportateur qui n'arrive pas à joindre
-    PostgreSQL), ces métriques ne seront de toute façon jamais exposées du
-    tout, peu importe le filtre.
     """
     if datname is None:
         datname = DB_NAME_MONITOREE
     try:
         return {
-            # Santé RÉELLE de la connexion exportateur -> PostgreSQL
             "pg_up": _query_prometheus(f'pg_up{{instance="{instance}"}}'),
-            # Santé du SCRAPE Prometheus -> exportateur (différent de pg_up)
             "pg_scrape_ok": _query_prometheus(
                 f'up{{instance="{instance}",job="postgres_exporter"}}'
             ),
-            # Connexions actives
             "pg_active_connections": _query_prometheus(
                 f'pg_stat_activity_count{{instance="{instance}",datname="{datname}",state="active"}}'
             ),
-            # Connexions max utilisées (%)
-            # ← CORRECTION : "ignoring(datname)" ajouté -- pg_stat_activity_count
-            # a le label datname, pg_settings_max_connections non (volontairement,
-            # c'est un réglage serveur). Sans ce indiquer explicitement à Prometheus
-            # d'ignorer ce label pour la division, les deux séries ne matchent pas
-            # (labels différents de chaque côté) et la division retourne vide -- 0%
-            # silencieux, alors que "Connections Active" (une seule métrique, pas de
-            # division) affichait la vraie valeur juste au-dessus.
             "pg_connections_pct": _query_prometheus(
                 f'pg_stat_activity_count{{instance="{instance}",datname="{datname}"}} / ignoring(datname) '
                 f'pg_settings_max_connections{{instance="{instance}"}} * 100'
             ),
-            # Locks en attente
             "pg_waiting_locks": _query_prometheus(
                 f'pg_locks_count{{instance="{instance}",datname="{datname}",granted="false"}}'
             ),
-            # Taux de hits cache
             "pg_cache_hit_pct": _query_prometheus(
                 f'pg_stat_database_blks_hit{{instance="{instance}",datname="{datname}"}} / '
                 f'(pg_stat_database_blks_hit{{instance="{instance}",datname="{datname}"}} + '
                 f'pg_stat_database_blks_read{{instance="{instance}",datname="{datname}"}}) * 100'
             ),
-            # Taux de rollbacks (signe de problème)
             "pg_rollback_rate": _query_prometheus(
                 f'rate(pg_stat_database_xact_rollback{{instance="{instance}",datname="{datname}"}}[5m])'
             ),
@@ -778,7 +747,6 @@ def check_postgres_health(host: str = "192.168.138.133", port: int = 5432) -> di
 def collecter_metriques_apps() -> dict:
     """
     Collecte toutes les métriques applicatives (niveaux 2 et 3).
-    Appelée dans la boucle de surveillance toutes les 60s.
     """
     pg_metrics = get_postgres_metrics()
     pg_health  = check_postgres_health()
@@ -795,14 +763,10 @@ def collecter_metriques_apps() -> dict:
 def _generer_alertes_apps(pg, pg_health) -> list:
     """
     Génère des alertes sur les métriques applicatives (PostgreSQL
-    uniquement). ← Cette condition n'a pas changé, mais elle lit maintenant
-    la VRAIE santé de connexion (voir correction pg_up ci-dessus) -- elle
-    va probablement se déclencher au prochain cycle, ce qui est correct :
-    la panne était réelle, juste invisible jusqu'ici.
+    uniquement).
     """
     alertes = []
 
-    # PostgreSQL DOWN
     if pg.get("pg_up", 1) == 0 or not pg_health.get("healthy", True):
         alertes.append({
             "niveau":  "CRITIQUE",
@@ -811,7 +775,6 @@ def _generer_alertes_apps(pg, pg_health) -> list:
             "type":    "service_down",
         })
 
-    # PostgreSQL connexions saturées
     conn_pct = pg.get("pg_connections_pct", 0)
     if conn_pct > 80:
         alertes.append({
@@ -821,7 +784,6 @@ def _generer_alertes_apps(pg, pg_health) -> list:
             "type":    "connections",
         })
 
-    # PostgreSQL locks
     locks = pg.get("pg_waiting_locks", 0)
     if locks > 5:
         alertes.append({

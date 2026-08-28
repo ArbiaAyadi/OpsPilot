@@ -47,10 +47,23 @@ def charger_conversations():
         if os.path.exists(CONVERSATIONS_FILE):
             with open(CONVERSATIONS_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            _conversations = data.get("conversations", {})
+            toutes = data.get("conversations", {})
+            # ← AJOUT : purge des conversations VIDES au chargement. Avant
+            # le correctif de get_conv_active() ci-dessous, chaque
+            # redémarrage en créait une nouvelle sans aucun message, qui
+            # s'accumulait indéfiniment dans la barre latérale ("New
+            # conversation - 0 msgs" en plusieurs exemplaires, constaté en
+            # réel). Nettoie aussi rétroactivement celles déjà présentes
+            # sur disque, sans rien perdre : une conversation sans message
+            # ne contient par définition aucune information.
+            _conversations = {cid: msgs for cid, msgs in toutes.items() if msgs}
+            n_purgees = len(toutes) - len(_conversations)
             # Ne pas restaurer _conv_active — écran d'accueil au démarrage
             _conv_active = None
-            print(f"[Chat] {len(_conversations)} conversation(s) chargée(s) depuis disque")
+            if n_purgees:
+                print(f"[Chat] {len(_conversations)} conversation(s) chargée(s), {n_purgees} vide(s) ignorée(s)")
+            else:
+                print(f"[Chat] {len(_conversations)} conversation(s) chargée(s) depuis disque")
         else:
             print("[Chat] Aucune conversation sauvegardée — démarrage vide")
     except Exception as e:
@@ -61,8 +74,27 @@ def charger_conversations():
 charger_conversations()
 
 
+def _conv_active_lecture() -> str | None:
+    """← AJOUT : variante LECTURE SEULE de get_conv_active() -- retourne
+    l'ID actif s'il existe, sinon None, sans jamais rien créer.
+
+    Root cause du bug constaté : à chaque démarrage,
+    charger_conversations() remet _conv_active à None (volontairement --
+    on veut l'écran d'accueil). Le frontend appelle alors immédiatement
+    /api/status, qui fait len(get_historique_complet()) -> get_conv_active()
+    -> qui CRÉAIT une conversation vide. Une fonction de lecture ne doit
+    jamais produire d'effet de bord : c'est ce que corrige cette
+    séparation. get_conv_active() reste inchangée pour les appelants qui
+    ont réellement besoin d'écrire (ajouter_message, charger_depuis_db)."""
+    if _conv_active is None or _conv_active not in _conversations:
+        return None
+    return _conv_active
+
+
 def get_conv_active() -> str:
-    """Retourne l'ID de la conversation active, en crée une si nécessaire."""
+    """Retourne l'ID de la conversation active, en crée une si nécessaire.
+    À n'utiliser QUE depuis un chemin d'ÉCRITURE -- voir
+    _conv_active_lecture() pour la lecture."""
     global _conv_active
     if _conv_active is None or _conv_active not in _conversations:
         _conv_active = _conv_id_new()
@@ -154,7 +186,9 @@ def get_messages_llm(jusqu_a_id: str = None, max_messages: int = 6) -> list:
     Retourne les N derniers messages pour le LLM.
     Limité à 6 par défaut pour des réponses rapides.
     """
-    conv_id = get_conv_active()
+    conv_id = _conv_active_lecture()
+    if not conv_id:
+        return []
     msgs    = _conversations.get(conv_id, [])
     result  = []
     for m in msgs:
@@ -165,17 +199,21 @@ def get_messages_llm(jusqu_a_id: str = None, max_messages: int = 6) -> list:
 
 
 def vider_historique():
-    """Vide la conversation active."""
-    conv_id = get_conv_active()
+    """Vide la conversation active -- ne crée rien s'il n'y en a pas."""
+    conv_id = _conv_active_lecture()
+    if not conv_id:
+        return
     if conv_id in _conversations:
         _conversations[conv_id].clear()
     sauvegarder_conversations()
 
 
 def get_historique_complet() -> list:
-    """Retourne les messages de la conversation active."""
-    conv_id = get_conv_active()
-    return _conversations.get(conv_id, [])
+    """Retourne les messages de la conversation active -- liste vide si
+    aucune n'est active. Ne crée JAMAIS de conversation (voir
+    _conv_active_lecture)."""
+    conv_id = _conv_active_lecture()
+    return _conversations.get(conv_id, []) if conv_id else []
 
 
 def charger_depuis_db(messages_db: list):

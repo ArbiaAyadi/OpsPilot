@@ -114,7 +114,13 @@ export function PageMonitoringRules({ reglesDynamiques = [], stale = false }) {
     <div style={{ display:'flex', flexDirection:'column', gap:16 }}>
       <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start' }}>
         <div>
-          <h2 style={{ fontSize:22, fontWeight:800, color:C.text, marginBottom:6 }}>Monitoring Rules</h2>
+          {/* ← MODIFIÉ : color:C.text (blanc pur) -> #f2ede4 (blanc chaud).
+              Voir App.jsx pour le raisonnement -- un blanc légèrement chaud
+              contraste agréablement avec le fond bleu froid, là où le blanc
+              pur paraissait dur. */}
+          <h2 style={{ fontSize:22, fontWeight:800, marginBottom:6, letterSpacing:'-0.02em',
+                         background:'linear-gradient(180deg, #ffffff 0%, #b9c9dd 130%)',
+                         WebkitBackgroundClip:'text', WebkitTextFillColor:'transparent' }}>Monitoring Rules</h2>
           <div style={{ fontSize:13, color:C.sub }}>
             {isAI ? `${regles.length} AI-generated rules · click to expand` : `${regles.length} rules from Proxmox official docs · click to expand`}
           </div>

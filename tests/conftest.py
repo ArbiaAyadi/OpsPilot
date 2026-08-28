@@ -183,23 +183,29 @@ def ml_analyser():
 
 
 @pytest.fixture
-def client(tmp_path):
+def client(tmp_path, monkeypatch):
     """
     Client HTTP FastAPI pour les tests d'intégration.
     Mocke Proxmox, Groq et la DB pour ne pas avoir besoin de services externes.
+
+    ← MODIFIÉ : s'authentifie maintenant AVANT de retourner le client --
+    depuis l'ajout du système d'authentification (auth.py/auth_routes.py),
+    toutes les routes de agent.routes exigent une session valide
+    (dependencies=[Depends(get_current_user)] au niveau du router). Sans
+    cette connexion préalable, CHAQUE test utilisant ce fixture échouerait
+    avec 401, pas parce que la route testée est cassée, mais simplement
+    parce qu'aucune session n'est fournie. Un seul endroit corrigé ici,
+    plutôt que d'ajouter une connexion dans chaque test individuellement.
     """
-    # Mock DB
     db_mock = MagicMock()
     db_mock.return_value = None
 
-    # Mock Groq
     groq_mock = MagicMock(return_value="Test LLM response")
 
-    # Mock Proxmox
     proxmox_mock = MagicMock(return_value=ETAT_CLUSTER_NORMAL)
 
-    # Mock conversations.json path pour éviter les conflits
     os.environ["OPSPILOT_CONV_FILE"] = str(tmp_path / "conversations.json")
+    monkeypatch.setenv("SIGNUP_INVITE_CODE", "code-test-conftest-2026")
 
     with patch("proxmox_api.get_etat_cluster", proxmox_mock), \
          patch("agent.groq_client.appeler_groq", groq_mock), \
@@ -209,7 +215,19 @@ def client(tmp_path):
         try:
             from fastapi.testclient import TestClient
             from agent.main import app
-            yield TestClient(app)
+            import database as _db_module
+            # Repli mémoire propre pour ce test précis -- évite qu'un compte
+            # créé par un test antérieur bloque "email déjà utilisé" ici.
+            _db_module._mem_users.clear()
+            _db_module._mem_sessions.clear()
+            tc = TestClient(app)
+            tc.post("/api/auth/signup", json={
+                "email": "fixture-user@opspilot.local",
+                "password": "SolidPassphrase20260819",
+                "nom": "QA Fixture",
+                "invite_code": "code-test-conftest-2026",
+            })
+            yield tc
         except Exception as e:
             pytest.skip(f"App FastAPI non disponible: {e}")
 

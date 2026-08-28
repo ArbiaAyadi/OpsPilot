@@ -37,6 +37,32 @@ def system_prompt_chat(etat: dict = None, dernier_lstm: dict = None,
     """
     Prompt adaptatif — court pour questions générales, complet pour création VM.
     Réduit drastiquement la taille du prompt → réponses plus rapides.
+
+    ← CORRECTION (trouvé en examinant une vraie réponse du chat) : ni le
+    prompt "creation" ni le prompt général ci-dessous ne mentionnaient
+    JAMAIS KSM, le ballooning, ni l'interdiction de réduire la RAM/vCPU
+    d'une VM existante -- alors que ces trois règles sont appliquées et
+    affichées systématiquement partout ailleurs dans le projet (voir
+    incident_prompt.py, GARDE_FOUS_SEUILS, tous les warnings "Never
+    reduce VM RAM or vCPU in production" visibles sur chaque
+    recommendation générée par surveillance.py). Le chat suit un chemin
+    de prompt totalement séparé de l'analyse d'incidents -- rien ne lui
+    transmettait cette règle avant ce correctif, d'où une vraie réponse
+    contenant "pct set <vmid> --memory <new-mb>" comme option de
+    remédiation, contredisant directement la philosophie affichée
+    partout ailleurs dans l'app. Ajouté au prompt général (utilisé pour
+    'general' ET 'sizing', les deux intentions où une question de
+    pression RAM/CPU peut survenir) ainsi qu'au prompt de création (une
+    question de création peut aussi mentionner libérer de la place sur
+    un nœud saturé) -- concis, cohérent avec le style "RULES" existant,
+    sans faire exploser la taille du prompt (l'objectif de rapidité
+    documenté ci-dessus reste respecté).
+
+    Corrige aussi, dans le même mouvement, la commande "migrate <vmid>
+    <node>" que le modèle inventait (n'existe pas dans Proxmox) --
+    la bonne syntaxe qm migrate ... --online est maintenant donnée
+    explicitement dans le prompt lui-même, pas seulement corrigée après
+    coup par regex dans websocket_handler.py.
     """
     intent = _detect_intent(question)
 
@@ -85,10 +111,6 @@ def system_prompt_chat(etat: dict = None, dernier_lstm: dict = None,
     cluster_ctx = "\n".join(cluster_lines) if cluster_lines else "No cluster data"
 
     # ── Bloc PC hôte — question sizing OU création ────────────────────────────
-    # ← CORRECTION : incluait ce bloc uniquement pour intent == 'sizing'.
-    # Une question de création ("I want to create a VM...") a exactement
-    # autant besoin de connaître la marge physique du PC hôte -- c'est le
-    # moment où de nouvelles ressources vont justement être allouées.
     pc_bloc = ""
     if intent in ('sizing', 'creation') and pc_hote and pc_hote.get("disponible"):
         alloc  = pc_hote.get("vmware_allocation", {})
@@ -104,6 +126,18 @@ def system_prompt_chat(etat: dict = None, dernier_lstm: dict = None,
             f"{pve2_r.get('cores_recommended')} cores\n"
         )
 
+    # ← AJOUT : règle RAM/CPU partagée par les deux prompts ci-dessous --
+    # une seule définition, jamais dupliquée à la main dans les deux
+    # branches (creation ET général).
+    regle_ram_cpu = (
+        "- NEVER suggest reducing an existing VM's RAM or vCPU as a solution — this can crash running applications\n"
+        "- For RAM/CPU pressure on a node, suggest in this order: "
+        "1) qm migrate <vmid> <target-node> --online  "
+        "2) echo 1 > /sys/kernel/mm/ksm/run  "
+        "3) qm set <vmid> --balloon <mb>  "
+        "4) add physical RAM  5) add a cluster node"
+    )
+
     # ── Prompt création VM — complet avec syntaxe exacte ─────────────────────
     if intent == 'creation':
         return f"""You are OpsPilot, Proxmox VE expert. Respond in the SAME language as the question.
@@ -117,6 +151,7 @@ RULES:
 - Use ONLY values above — never invent
 - RAM free < 1GB → REFUSE, show how to free memory first
 - OFFLINE node → refuse VM creation
+{regle_ram_cpu}
 
 LXC CREATION — EXACT SYNTAX ONLY:
 pct create {next_vmid} local:vztmpl/<template> --hostname <name> --memory <mb> --swap <mb> --rootfs local-lvm:<gb> --net0 name=eth0,bridge=vmbr0,ip=dhcp --cores <n> --unprivileged 1
@@ -144,6 +179,7 @@ NEXT VMID: {next_vmid}
 RULES:
 - Use ONLY official Proxmox commands: qm, pct, pvesh, pvecm, vzdump, pveam, pvesm, systemctl
 - FORBIDDEN: pveadm, pvectl, any invented command
+{regle_ram_cpu}
 - bash blocks for ALL commands
 - Max 200 words"""
 

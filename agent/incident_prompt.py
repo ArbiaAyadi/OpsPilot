@@ -69,13 +69,6 @@ except ImportError:
 
 
 # ── Commandes de diagnostic par service ─────────────────────────────────────
-# Table extensible : un service reconnu ici obtient une commande précise ;
-# un service absent (n'importe lequel, détecté plus tard par le futur
-# catalogue générique) retombe sur "default" -- systemctl/journalctl
-# fonctionnent pour n'importe quel service systemd, sans le connaître à
-# l'avance. Ceci reste informatif (contexte pour le LLM), aucune de ces
-# commandes n'est un action_id exécutable -- redémarrer un service
-# n'est pas encore dans action_executor.ACTION_REGISTRY.
 SERVICE_COMMANDS = {
     "postgresql": (
         "systemctl status postgresql ; sudo -u postgres psql -c 'SELECT 1;' "
@@ -88,23 +81,95 @@ SERVICE_COMMANDS = {
 }
 
 
+from collections import defaultdict
+
+# ← AJOUT : associe une métrique canonique (champ "metric" posé par
+# anomaly_detector.py) au bucket de classement le plus pertinent, quand
+# plusieurs métriques partagent la même famille de cause (iowait +
+# latence + processus bloqués = tous des symptômes du même goulot
+# d'I/O storage, ils partagent donc le même garde-fou et la même
+# recherche documentaire). Une métrique absente de ce mapping crée
+# simplement son propre bucket à la volée (voir classifier_anomalies) --
+# jamais un repli silencieux vers une mauvaise catégorie.
+_BUCKET_PAR_METRIQUE = {
+    "cpu_pct": "cpu", "ram_pct": "ram", "disk_pct": "disk", "swap_pct": "swap",
+    "cpu_iowait_pct": "iowait", "disk_read_latency_ms": "iowait",
+    "disk_write_latency_ms": "iowait", "procs_blocked": "iowait",
+    "corosync_ok": "quorum", "corosync_quorum_ok": "quorum",
+    "net_errors_in": "network", "net_errors_out": "network",
+    "net_drop_in": "network", "net_drop_out": "network",
+    "fd_used_pct": "fd", "cpu_steal_pct": "cpu", "load_avg_1m": "cpu",
+    "zfs_arc_hit_rate": "disk",
+    "smart_uncorrectable": "disk", "smart_reallocated_sectors": "disk", "smart_pending_sectors": "disk",
+}
+
+
+def _bucket_depuis_metric(metric: str) -> str:
+    """Déduit un bucket de classement à partir du champ "metric" canonique
+    d'une anomalie -- voir _BUCKET_PAR_METRIQUE pour les regroupements
+    déjà établis. Toute métrique absente de ce mapping (une métrique
+    totalement nouvelle, jamais vue par ce code) utilise son propre
+    premier segment de nom comme bucket -- crée dynamiquement une
+    nouvelle catégorie plutôt que de retomber sur "ram" par défaut."""
+    if metric in _BUCKET_PAR_METRIQUE:
+        return _BUCKET_PAR_METRIQUE[metric]
+    if "temp" in metric:
+        return "temp"
+    return metric.split("_")[0]
+
+
 def classifier_anomalies(anomalies: list) -> tuple:
-    types = {k: [] for k in ["service","ram","disk","cpu","swap","iowait","temp","vm","quorum","network","ai"]}
+    """
+    ← REFONTE (classement par métrique canonique, plus par mots-clés
+    devinés) : avant, chaque anomalie était classée en cherchant des
+    mots-clés DANS SON TEXTE LIBRE ("ram" in message.lower()...), avec un
+    repli silencieux vers "ram" si rien ne correspondait -- confirmé par
+    le code lui-même avoir déjà touché "steal"/"blocked"/"corosync" avant
+    qu'un bucket dédié ne soit ajouté à la main pour chacun. Utilise
+    maintenant en priorité le champ "metric" canonique posé par
+    anomaly_detector.py (le nom réel du champ mesuré, ex: "cpu_steal_pct")
+    -- une métrique totalement nouvelle, jamais vue par ce code, obtient
+    son propre bucket automatiquement (voir _bucket_depuis_metric), sans
+    intervention manuelle. Le repli mots-clés original est CONSERVÉ mais
+    seulement pour les anomalies SANS champ "metric" (alertes Proxmox API
+    brutes, qui n'ont pas de métrique numérique unique associée -- voir
+    anomaly_detector.py).
+    """
+    types = defaultdict(list)
     for a in anomalies:
-        msg   = a.get("message", "").lower()
+        t = a.get("type", "")
+        if t == "ai_score":
+            types["ai"].append(a)
+            continue
+        if t == "service_down":
+            types["service"].append(a)
+            continue
+        if t == "vm_down":
+            types["vm"].append(a)
+            continue
+
+        metric = a.get("metric")
+        if metric:
+            types[_bucket_depuis_metric(metric)].append(a)
+            continue
+
+        # ← CONSERVÉ : repli mots-clés, uniquement pour les anomalies sans
+        # champ "metric" (alertes Proxmox API brutes -- voir
+        # anomaly_detector.py, qui n'en pose pas pour celles-ci).
+        msg   = a.get("message", "")
+        msg_l = msg.lower()
         cible = a.get("cible", "").lower()
-        t     = a.get("type", "")
-        if t == "ai_score":                    types["ai"].append(a)
-        elif t == "service_down":              types["service"].append(a)
-        elif "quorum" in msg:                  types["quorum"].append(a)
-        elif "temp" in msg:                    types["temp"].append(a)
-        elif "iowait" in msg or "latency" in msg: types["iowait"].append(a)
-        elif "swap" in msg:                    types["swap"].append(a)
-        elif "disk" in msg:                    types["disk"].append(a)
-        elif "ram" in msg or "memory" in msg:  types["ram"].append(a)
-        elif "cpu" in msg:                     types["cpu"].append(a)
-        elif "vm" in msg or "vm" in cible:     types["vm"].append(a)
-        elif "net" in msg:                     types["network"].append(a)
+        if msg.startswith("VM "):            types["vm"].append(a)
+        elif "quorum" in msg_l or "corosync" in msg_l: types["quorum"].append(a)
+        elif "temp" in msg_l:                  types["temp"].append(a)
+        elif "iowait" in msg_l or "i/o wait" in msg_l or "latency" in msg_l or "blocked processes" in msg_l: types["iowait"].append(a)
+        elif "swap" in msg_l:                  types["swap"].append(a)
+        elif "disk" in msg_l:                  types["disk"].append(a)
+        elif "ram" in msg_l or "memory" in msg_l: types["ram"].append(a)
+        elif "cpu" in msg_l or "load average" in msg_l: types["cpu"].append(a)
+        elif "vm" in msg_l or "vm" in cible:   types["vm"].append(a)
+        elif "net" in msg_l:                   types["network"].append(a)
+        elif "file descriptor" in msg_l:       types["fd"].append(a)
         else:
             if "ram" in cible:    types["ram"].append(a)
             elif "disk" in cible: types["disk"].append(a)
@@ -121,10 +186,6 @@ def classifier_anomalies(anomalies: list) -> tuple:
 
 
 def calculer_seuils_franchis(etat: dict) -> str:
-    """
-    Calcule pour chaque noeud quel seuil exact est franchi (WARNING ou CRITICAL).
-    Couvre les niveaux 1, 2 et 3 pour que le LLM ait le contexte complet.
-    """
     lignes = []
     for n in etat.get("noeuds", []):
         nom  = n.get("nom", "?")
@@ -206,11 +267,6 @@ def calculer_seuils_franchis(etat: dict) -> str:
     return "\n".join(lignes) if lignes else "  All metrics within normal range"
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Menu d'actions sûres — généré depuis action_executor.ACTION_META, jamais
-# recopié à la main. Si un jour une action est ajoutée/retirée côté
-# action_executor.py, ce menu suit automatiquement, sans toucher ce fichier.
-# ══════════════════════════════════════════════════════════════════════════════
 def _construire_menu_actions() -> str:
     if not ACTIONS_OK or not ACTION_META:
         return "  (no pre-approved one-click actions available in this environment)"
@@ -225,10 +281,6 @@ def _construire_menu_actions() -> str:
     return "\n".join(lignes)
 
 
-# Repères de sécurité par type de problème -- PAS des commandes imposées.
-# Le LLM choisit librement quelles actions du menu ci-dessus appliquer, dans
-# quel ordre, avec quels paramètres -- ceci ne fait que rappeler les
-# contraintes non négociables et la cible chiffrée par catégorie.
 GARDE_FOUS = {
     "service": "No action_id applies to restarting an arbitrary service (not yet in the executable catalog) -- describe diagnostic/fix steps as informational (action_id=null), using the diagnostic command context provided below.",
     "ram":     "FORBIDDEN: never suggest reducing VM RAM, maxmem, or vCPU in production -- this crashes running applications. Always set the warning field to state this explicitly when RAM is the dominant problem. TARGET: host RAM < 70%.",
@@ -241,7 +293,53 @@ GARDE_FOUS = {
     "quorum":  "No action_id applies -- quorum/Corosync issues need careful manual diagnosis (pvecm status, network check) before any corrective action. Never suggest 'pvecm expected 1' unless the anomaly explicitly confirms the other node is truly offline.",
     "network": "No action_id applies -- network hardware/driver issues need manual diagnosis (ip -s link, ethtool). Describe as informational steps.",
     "ai":      "This is a statistical anomaly (LSTM/Isolation Forest), not a specific metric breach -- correlate with EXACT THRESHOLD STATUS and CLUSTER STATE to explain what's actually happening, don't invent a cause not supported by the data above.",
+    "fd":      "No action_id applies -- file descriptor exhaustion usually means a service is leaking open files/sockets. Investigate with lsof before any fix; restarting the offending service is a temporary workaround, not a root cause fix. TARGET: fd usage < 70%.",
 }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Recherche documentaire par service — cache en mémoire
+# ══════════════════════════════════════════════════════════════════════════════
+# ← AJOUT : avant, un service détecté (Redis, MySQL...) n'avait le choix
+# qu'entre une mesure générique (RAM/CPU/disk via process-exporter, voir
+# vm_app_monitor.py) et, à défaut de mesure, une phrase statique écrite une
+# fois pour toutes dans EXIGENCES_SERVICES ci-dessus -- exactement le même
+# anti-pattern que l'ancien PROXMOX_DOCS_CONTEXT que rules_engine.py a déjà
+# corrigé. rechercher_doc_service() vit directement dans web_search.py, à
+# côté de rechercher_doc_proxmox() -- même fichier, mêmes conventions
+# (cache, style d'appel Tavily), cherche la doc OFFICIELLE du service
+# lui-même (redis.io, postgresql.org...), jamais Proxmox.
+#
+# Cache en mémoire côté web_search.py, indéfiniment (pas de TTL) -- la doc
+# officielle d'un service change rarement d'un cycle à l'autre, et un
+# service qui redéclenche une alerte (ré-escalade toutes les 30min, voir
+# anomaly_detector.py) ne doit pas relancer une recherche identique à
+# chaque fois. Générique par construction : n'importe quel service détecté
+# (n'importe lequel dans CATALOGUE_SERVICES côté vm_app_monitor.py)
+# obtient ce traitement automatiquement, aucune ligne à ajouter ici pour
+# un service de plus.
+_cache_doc_services: dict = {}
+
+
+def _obtenir_doc_service(nom_service: str) -> str | None:
+    """Retourne la doc officielle mise en cache pour ce service, la
+    recherche si absente. Ne lève jamais d'exception -- None si la
+    recherche échoue ou si web_search.py n'expose pas encore la fonction
+    (ex: ancienne version du fichier pas encore mise à jour)."""
+    if nom_service in _cache_doc_services:
+        return _cache_doc_services[nom_service]
+
+    doc = None
+    try:
+        from web_search import rechercher_doc_service
+        doc = rechercher_doc_service(nom_service)
+    except ImportError:
+        pass  # fonction pas encore ajoutée côté web_search.py -- silencieux
+    except Exception as e:
+        print(f"[WebSearch] Erreur recherche service '{nom_service}': {e}")
+
+    _cache_doc_services[nom_service] = doc
+    return doc
 
 
 def construire_prompt_specifique(anomalies: list, etat: dict, lstm: dict) -> str:
@@ -419,6 +517,12 @@ def construire_prompt_specifique(anomalies: list, etat: dict, lstm: dict) -> str
                 )
 
     commande_service = SERVICE_COMMANDS["default"]
+    # ← AJOUT : initialisé à None même hors branche "service" -- défensif,
+    # pour que le bloc de recherche service plus bas (if dominant=="service"
+    # and nom_service:) ne dépende jamais implicitement de l'ordre
+    # d'exécution ou d'une garantie de classifier_anomalies() qui pourrait
+    # changer un jour.
+    nom_service = None
     if dominant == "service" and types_classified.get("service"):
         cible = types_classified["service"][0].get("cible", "")
         nom_service = cible.split("/")[-1].strip().lower() if cible else ""
@@ -443,6 +547,24 @@ prefer it over generic assumptions when they differ.
                 print(f"[WebSearch] Doc Proxmox chargée pour '{dominant}' ({len(doc_raw)} chars)")
         except Exception as e:
             print(f"[WebSearch] Erreur: {e}")
+
+    # ← AJOUT : documentation du SERVICE lui-même (Redis, PostgreSQL...),
+    # pas seulement Proxmox -- voir _obtenir_doc_service() plus haut pour
+    # le contrat exact. Complémentaire au bloc Proxmox ci-dessus, jamais un
+    # remplacement : l'un situe l'incident dans l'écosystème Proxmox,
+    # l'autre informe sur ce que "RAM élevée" signifie concrètement POUR
+    # CE service précis, avec ses propres seuils/bonnes pratiques.
+    if dominant == "service" and nom_service:
+        doc_service = _obtenir_doc_service(nom_service)
+        if doc_service:
+            doc_context += f"""
+OFFICIAL {nom_service.upper()} DOCUMENTATION (fetched in real-time):
+{doc_service[:1000]}
+
+This is the service's OWN documentation, not Proxmox's -- prefer it for anything specific to
+how {nom_service} itself reports, manages, or recommends handling this exact metric.
+"""
+            print(f"[WebSearch] Doc {nom_service} chargée ({len(doc_service)} chars)")
 
     hyperviseur_ctx = ""
     try:
@@ -523,44 +645,14 @@ Respond with EXACTLY this JSON shape (fill every field, use null where genuinely
     }}
   ]
 }}"""
-    # ← MODIFIÉ : retourne aussi "dominant" -- surveillance.py en a besoin
-    # pour calculer doc_url (get_doc_url(dominant), voir web_search.py) et
-    # rétablir le lien "docs" dans PageRecommendations.jsx, retiré par
-    # inadvertance lors du retrait de l'ancienne bibliothèque SOLUTIONS.
     return prompt, dominant
 
 
 def obtenir_doc_url(dominant: str) -> str:
-    """
-    Fine enveloppe autour de web_search.get_doc_url() -- pour que
-    surveillance.py continue d'importer uniquement depuis ce module,
-    cohérent avec ses autres imports (classifier_anomalies,
-    construire_prompt_specifique, parser_reponse_llm).
-    """
     return get_doc_url(dominant)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Parsing + validation de la réponse JSON du LLM
-# ══════════════════════════════════════════════════════════════════════════════
 def _commande_reelle(action_id: str, params: dict) -> str | None:
-    """
-    Reconstruit la VRAIE commande, de façon déterministe, à partir de
-    action_id + action_params déjà validés -- ne fait JAMAIS confiance au
-    texte que le LLM a mis dans step["command"] pour une action
-    pré-approuvée. Trouvé en pratique : le LLM (llama-3.1-8b-instant) a
-    inventé un outil cohérent mais inexistant ("pveadm enable-ksm pve2")
-    pour TOUTES les actions d'un même incident -- le menu d'actions ne
-    donnait que description/paramètres/risque, jamais le texte exact de la
-    commande (ACTION_META ne le stocke même pas, il n'existe que codé en
-    dur à l'intérieur de chaque fonction Python d'action_executor.py). Le
-    bouton "Accepter & Exécuter" restait sûr malgré ça (il envoie
-    action_id + params, jamais ce texte, à /api/actions/execute) -- mais le
-    texte affiché/copiable était faux. Ces commandes DOIVENT rester
-    synchronisées avec celles réellement exécutées dans action_executor.py
-    -- même commande, deux endroits : ici pour l'affichage, là-bas pour
-    l'exécution réelle.
-    """
     if action_id == "enable_ksm":
         return "echo 1 > /sys/kernel/mm/ksm/run"
     if action_id == "enable_balloon":
@@ -575,20 +667,6 @@ def _commande_reelle(action_id: str, params: dict) -> str | None:
 
 
 def _valider_step(step: dict) -> dict:
-    """
-    Ne fait jamais confiance aveuglément à ce que le LLM a rempli pour
-    action_id/action_params : si l'action_id n'existe pas vraiment dans
-    ACTION_META, ou si un paramètre requis manque, l'action_id est mis à
-    None -- l'étape reste affichée comme texte informatif, mais aucun
-    bouton "Accepter & Exécuter" qui échouerait silencieusement à
-    l'exécution ne peut apparaître pour elle.
-
-    ← AJOUT : pour toute action_id valide, step["command"] est ÉCRASÉ par
-    _commande_reelle() -- jamais le texte du LLM pour ces cas précis (voir
-    docstring de _commande_reelle ci-dessus). Seules les étapes SANS
-    action_id (purement informatives, ex: "add physical RAM") gardent le
-    texte de commande du LLM, faute d'alternative déterministe.
-    """
     action_id = step.get("action_id")
     if not action_id or action_id not in ACTION_META:
         step["action_id"] = None
@@ -610,20 +688,6 @@ def _valider_step(step: dict) -> dict:
 
 
 def _retirer_commentaires_js(texte: str) -> str:
-    """
-    Retire les commentaires style JavaScript (// ...) qu'un LLM ajoute
-    parfois dans son JSON malgré la consigne stricte de n'en pas mettre --
-    rend cassant un JSON par ailleurs valide. Repère les limites de
-    chaînes JSON caractère par caractère pour ne JAMAIS retirer un "//"
-    qui fait partie du CONTENU d'une chaîne (ex: une URL "https://...")
-    plutôt qu'un vrai commentaire. S'arrête au prochain caractère
-    structurel JSON ({ } [ ] , " ou fin de ligne) -- PAS seulement fin de
-    ligne : les réponses du LLM arrivent souvent sur une seule ligne
-    continue sans vrais retours à la ligne, ce qui supprimerait tout le
-    reste du JSON par erreur si on s'arrêtait uniquement sur \\n.
-    Testé contre un cas réel observé en production (commentaire au milieu
-    d'un action_params) avant intégration ici.
-    """
     resultat = []
     dans_chaine = False
     echap = False
@@ -661,29 +725,72 @@ _RE_TITRE_SECOURS  = re.compile(r'"fix_title"\s*:\s*"((?:[^"\\]|\\.)*)"')
 
 
 def parser_reponse_llm(reponse: str) -> dict:
-    """
-    Extrait et valide l'objet JSON retourné par le LLM. En cas d'échec de
-    parsing (JSON malformé, réponse vide...), retourne un dict avec
-    "_parse_failed": True et le texte brut conservé sous "_raw" -- jamais
-    d'exception vers l'appelant, jamais un JSON inventé pour combler.
+    # ← AJOUT : journal explicite à CHAQUE chemin de sortie, avec le
+    # modèle Groq actif au moment de l'appel (GROQ_MODEL reflète déjà
+    # correctement le dernier modèle ayant réellement répondu, y compris
+    # après une bascule de repli -- voir groq_client.py). Avant, seul le
+    # tout dernier cas (JSON invalide même après nettoyage) était
+    # journalisé ; les deux échecs précédents étaient totalement
+    # silencieux -- impossible de savoir, depuis le log seul, LEQUEL des
+    # 3 échecs possibles s'était produit sans deviner depuis des indices
+    # indirects (comme on vient de le faire). But : la PROCHAINE fois
+    # qu'un "AI response could not be parsed" apparaît, le log dira
+    # explicitement pourquoi, sans avoir besoin de le redemander.
+    from agent.groq_client import GROQ_MODEL as _modele_actif
 
-    ← MODIFIÉ : retire d'abord les commentaires style JS que le LLM ajoute
-    parfois (ex: "// assuming a minimum of 128MB" au milieu d'un objet) --
-    du JSON par ailleurs parfaitement valide échouait à cause de ça seul.
-
-    ← AJOUT : si le parsing échoue malgré tout (autre cause), tente une
-    extraction de secours de "summary"/"fix_title" par regex simple --
-    évite d'afficher un pavé de JSON brut illisible à l'utilisateur quand
-    seul UN champ du JSON pose problème alors que le reste est exploitable.
-    """
+    # ← AJOUT : filet de sécurité -- retire toute trace de raisonnement
+    # interne (balises <think>...</think>) avant même de chercher le JSON.
+    # Normalement inutile depuis que appeler_groq() envoie
+    # reasoning_format="hidden" pour qwen (voir groq_client.py), mais un
+    # bug documenté côté Groq (forum communautaire) montre que ce
+    # paramètre peut ponctuellement ne pas être respecté -- sans ce
+    # filet, quelques milliers de mots de raisonnement interne
+    # ("Wait, the prompt says...", "Let's verify...") pollueraient le
+    # texte examiné par la regex ci-dessous, reproduit à l'identique
+    # dans les captures reçues.
+    #
+    # ← AJOUT (2e cas trouvé après coup) : balise <think> OUVERTE mais
+    # jamais refermée -- se produit quand max_tokens coupe la réponse EN
+    # PLEIN raisonnement, avant que le modèle n'ait pu écrire ni </think>
+    # ni sa vraie réponse. Dans ce cas, re.sub ci-dessus ne retire RIEN
+    # (il exige une paire ouverture+fermeture) -- pire, la regex JSON qui
+    # suit peut attraper un fragment JSON présent DANS le raisonnement
+    # (le modèle y esquisse parfois des exemples de structure, ex:
+    # action_params={"node": "pve2"} en plein milieu d'une phrase),
+    # produisant un résultat trompeur plutôt qu'un échec propre. Détecté
+    # et traité en échec explicite AVANT toute tentative de parsing --
+    # il n'y a rien de récupérable dans une réponse qui n'a jamais
+    # dépassé son propre raisonnement.
+    if '<think>' in reponse and '</think>' not in reponse:
+        print(f"[Incident] ECHEC parsing -- balise <think> jamais refermee (modele: {_modele_actif}, longueur reponse: {len(reponse)} caracteres)")
+        return {"_parse_failed": True, "_raw": reponse}
+    reponse = re.sub(r'<think>.*?</think>', '', reponse, flags=re.DOTALL).strip()
     try:
         match = re.search(r'\{.*\}', reponse, re.DOTALL)
         if not match:
+            print(f"[Incident] ECHEC parsing -- aucun JSON trouve dans la reponse (modele: {_modele_actif}, longueur reponse: {len(reponse)} caracteres, debut: {reponse[:120]!r})")
             return {"_parse_failed": True, "_raw": reponse}
         json_nettoye = _retirer_commentaires_js(match.group())
-        donnees = json.loads(json_nettoye)
+        try:
+            donnees = json.loads(json_nettoye)
+        except json.JSONDecodeError:
+            # ← AJOUT : filet de sécurité -- certaines réponses du modèle
+            # actuel (voir agent/config.py, changement de modèles Groq)
+            # produisent un dict "à la Python" (guillemets simples,
+            # virgule finale) plutôt que du JSON strict -- confirmé être
+            # la cause exacte de "Expecting property name enclosed in
+            # double quotes: line 1 column 2" observé en production
+            # (reproduit à l'identique avec '{'a': 'b'}'). ast.literal_eval
+            # accepte les deux styles de guillemets et les virgules
+            # finales sans risque : il parse un littéral Python, n'exécute
+            # jamais de code (contrairement à eval()).
+            import ast
+            donnees = ast.literal_eval(json_nettoye)
+            if not isinstance(donnees, dict):
+                raise ValueError("resultat de literal_eval n'est pas un dict")
+            print(f"[Incident] Parsing reussi via repli ast.literal_eval (modele: {_modele_actif}) -- JSON non strict (guillemets simples ou virgule finale probable)")
     except Exception as e:
-        print(f"[Incident] Erreur parsing JSON: {e}")
+        print(f"[Incident] ECHEC parsing -- JSON invalide meme apres nettoyage: {e} (modele: {_modele_actif}, longueur reponse: {len(reponse)} caracteres)")
         m_resume = _RE_RESUME_SECOURS.search(reponse)
         m_titre  = _RE_TITRE_SECOURS.search(reponse)
         if m_resume:

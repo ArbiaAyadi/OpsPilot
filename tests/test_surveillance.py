@@ -1,10 +1,14 @@
 """
 test_surveillance.py — Tests de la logique de surveillance.
 
-Couvre :
-  - _normaliser_etat()  : normalisation de l'état cluster brut depuis l'API
-  - _calculer_seuils_franchis() : détection des seuils dépassés niveaux 1/2/3
-  - _proxmox_accessible() : garde principale contre les fausses alertes
+← MIS À JOUR : _calculer_seuils_franchis() a été déplacée (et renommée,
+sans underscore) dans agent/incident_prompt.py lors du refactor qui a
+extrait incident_prompt.py de surveillance.py (devenu trop long -- voir
+la docstring d'incident_prompt.py). L'import
+"from agent.surveillance import _calculer_seuils_franchis" lève
+maintenant ImportError -- cette fonction n'existe plus du tout à cet
+endroit. _normaliser_etat (alias vers agent.etat_normalizer.normaliser_etat)
+et _proxmox_accessible n'ont pas bougé, toujours dans agent.surveillance.
 """
 import pytest
 import sys
@@ -15,19 +19,29 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 def get_fonctions():
     try:
-        from agent.surveillance import (
-            _normaliser_etat, _calculer_seuils_franchis, _proxmox_accessible
-        )
-        return _normaliser_etat, _calculer_seuils_franchis, _proxmox_accessible
+        from agent.surveillance import _normaliser_etat, _proxmox_accessible
+        # ← MODIFIÉ : calculer_seuils_franchis vit maintenant dans
+        # agent.incident_prompt (plus d'underscore, fonction publique) --
+        # plus dans agent.surveillance.
+        from agent.incident_prompt import calculer_seuils_franchis
+        return _normaliser_etat, calculer_seuils_franchis, _proxmox_accessible
     except ImportError:
-        pytest.skip("agent.surveillance non disponible")
+        pytest.skip("agent.surveillance ou agent.incident_prompt non disponible")
 
-
-# ─── Tests _normaliser_etat() ─────────────────────────────────────────────────
 
 @pytest.mark.unit
 class TestNormaliserEtat:
-    """_normaliser_etat() convertit l'état brut de l'API Proxmox en format normalisé."""
+    """
+    ⚠ NON VÉRIFIÉ EN PROFONDEUR : agent/etat_normalizer.py (qui contient
+    la vraie implémentation de normaliser_etat) n'a jamais été transmis
+    cette session -- le fichier utilisé ici est un stub minimal
+    (pass-through) que j'ai écrit uniquement pour débloquer les IMPORTS du
+    reste du projet (agent.surveillance en dépend au niveau module, donc
+    tout ce qui en dépend transitivement). Les tests ci-dessous passeront
+    ou échoueront contre CE stub, pas contre le vrai comportement --
+    voir mon rapport pour le détail exact de ce qui est réellement
+    vérifié vs. non vérifiable en l'état.
+    """
 
     def test_etat_vide_retourne_dict(self):
         normaliser, _, _ = get_fonctions()
@@ -54,7 +68,6 @@ class TestNormaliserEtat:
             assert champ in noeud, f"Champ normalisé manquant: {champ}"
 
     def test_ram_pct_calcule_si_absent(self):
-        """Si ram_pct absent mais ram_used_gb/total présents → calculé automatiquement."""
         normaliser, _, _ = get_fonctions()
         etat_raw = {
             "noeuds": [{
@@ -65,7 +78,6 @@ class TestNormaliserEtat:
         }
         result = normaliser(etat_raw)
         noeud = result["noeuds"][0]
-        # ram_pct doit être calculé : 0.9/1.9 * 100 ≈ 47.4%
         assert noeud["ram_pct"] > 0, "ram_pct doit être calculé depuis ram_used/total"
         assert 40.0 < noeud["ram_pct"] < 60.0
 
@@ -83,27 +95,21 @@ class TestNormaliserEtat:
         assert isinstance(result["vms_running"], int)
 
     def test_noeud_alternatif_fields(self):
-        """Accepte 'nodes' en plus de 'noeuds' (compatibilité API)."""
         normaliser, _, _ = get_fonctions()
         etat = {
             "nodes": [{"name": "pve1", "status": "online", "cpu": 0.15}]
         }
         result = normaliser(etat)
-        # Doit normaliser sans crash
         assert isinstance(result, dict)
 
 
-# ─── Tests _calculer_seuils_franchis() ────────────────────────────────────────
-
 @pytest.mark.unit
 class TestCalculerSeuilsFranchis:
-    """_calculer_seuils_franchis() identifie les métriques hors seuil."""
-
     def test_cluster_normal_retourne_message_normal(self, etat_normal):
         _, calculer, _ = get_fonctions()
         result = calculer(etat_normal)
         assert "normal range" in result.lower() or result.strip() == \
-               "  All metrics within normal range", \
+               "All metrics within normal range", \
             f"Cluster normal ne doit pas afficher d'alertes: {result}"
 
     def test_ram_critique_detectee(self):
@@ -161,7 +167,6 @@ class TestCalculerSeuilsFranchis:
         assert "CPU" in result, f"CPU 92% non détecté dans: {result}"
 
     def test_niveau2_swap_detecte(self):
-        """Niveau 2 : Swap > 50% doit être détecté."""
         _, calculer, _ = get_fonctions()
         etat = {
             "noeuds": [{
@@ -180,7 +185,6 @@ class TestCalculerSeuilsFranchis:
             f"Swap 55% (niveau 2) non détecté dans: {result}"
 
     def test_niveau3_smart_detecte(self):
-        """Niveau 3 : SMART FAIL doit être signalé immédiatement."""
         _, calculer, _ = get_fonctions()
         etat = {
             "noeuds": [{
@@ -206,7 +210,6 @@ class TestCalculerSeuilsFranchis:
         assert isinstance(result, str), "Le résultat doit être une chaîne"
 
     def test_multiple_noeuds(self):
-        """Plusieurs nœuds avec des problèmes différents → tous détectés."""
         _, calculer, _ = get_fonctions()
         etat = {
             "noeuds": [
@@ -237,12 +240,8 @@ class TestCalculerSeuilsFranchis:
             "Les deux nœuds doivent apparaître dans le résultat"
 
 
-# ─── Tests _proxmox_accessible() ─────────────────────────────────────────────
-
 @pytest.mark.unit
 class TestProxmoxAccessible:
-    """Garde principale — bloque les alertes si Proxmox est hors ligne."""
-
     def test_pve1_online_accessible(self, etat_normal):
         _, _, accessible = get_fonctions()
         assert accessible(etat_normal) is True, \
@@ -265,23 +264,22 @@ class TestProxmoxAccessible:
 
     def test_etat_none_non_accessible(self):
         """
-        _proxmox_accessible(None) doit retourner False sans crasher.
-
-        BUG PRODUCTION IDENTIFIÉ par ce test :
-        surveillance.py ligne 37 — etat.get("noeuds", []) crash si etat=None.
-        FIX : ajouter 'if not etat: return False' au début de la fonction.
+        ← Mis à jour : le vrai surveillance.py reçu cette session a déjà
+        "if not noeuds: return False" en tout début de fonction -- couvre
+        etat={} ET etat=None (etat.get(...) ne serait jamais atteint pour
+        etat=None puisque `{}.get("noeuds", [])` sur un dict vide retourne
+        déjà [] -- mais un VRAI None ferait planter .get() lui-même avant
+        même d'atteindre "if not noeuds". Testé directement plutôt que
+        supposé.
         """
         _, _, accessible = get_fonctions()
-        # Avant fix : lève AttributeError — on le vérifie ET on note le fix requis
         try:
             result = accessible(None)
-            # Si pas de crash → le fix est appliqué
             assert result is False, "_proxmox_accessible(None) doit retourner False"
         except (AttributeError, TypeError):
-            # Bug non encore corrigé — marquer comme xfail explicatif
             pytest.xfail(
-                "Bug production : _proxmox_accessible(None) lève AttributeError. "
-                "Fix : ajouter 'if not etat: return False' dans surveillance.py ligne ~37"
+                "_proxmox_accessible(None) lève une exception -- "
+                "etat.get('noeuds', []) suppose etat non-None"
             )
 
     def test_un_noeud_online_suffit(self):

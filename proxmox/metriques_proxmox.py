@@ -7,6 +7,7 @@ Ressources monitorées :
   - Réseau (perte paquets, erreurs)
   - Processus (load, zombie, fd)
   - Cluster Proxmox (quorum, corosync)
+  - Sauvegarde (VMs non couvertes par un job de backup)
 """
 
 import os
@@ -120,21 +121,9 @@ def _metriques_noeud(node: str) -> dict:
     m = {"node": node, "timestamp": datetime.now().isoformat()}
 
     # ── CPU (pve_exporter) ────────────────────────────────────────────────────
-    # ← CORRECTION : "type" n'existe pas comme label sur cet exportateur
-    # (confirmé par requête directe) — l'identifiant réel est le champ "id",
-    # au format "node/pve1". Le label "node" existant est conservé en plus :
-    # il indique quel exportateur a répondu (pve1 ou pve2, les deux voient
-    # tout le cluster) — sans lui, _sum_query compterait la même valeur deux
-    # fois, une fois par exportateur.
     m["cpu_pct"]   = round(_first_val(f'pve_cpu_usage_ratio{{id="node/{node}",node="{node}"}}') * 100, 2)
     m["cpu_cores"] = int(_first_val(f'pve_cpu_usage_limit{{id="node/{node}",node="{node}"}}'))
 
-    # Load average — node_exporter. Le label "node" est posé par Prometheus
-    # lui-même (fichier de découverte file_sd_configs généré par
-    # pve_discovery.py), pas deviné depuis une IP : instance=~"{node}.*" ne
-    # matchait jamais (node_exporter s'identifie par IP:port, pas par nom),
-    # node="{node}" matche toujours puisque c'est exactement le label que
-    # pve_discovery.py pose sur chaque cible.
     load1  = _first_val(f'node_load1{{node="{node}"}}')
     load5  = _first_val(f'node_load5{{node="{node}"}}')
     load15 = _first_val(f'node_load15{{node="{node}"}}')
@@ -145,17 +134,6 @@ def _metriques_noeud(node: str) -> dict:
     iowait = _first_val(f'rate(node_cpu_seconds_total{{node="{node}",mode="iowait"}}[5m])')
     m["cpu_iowait_pct"] = round(iowait * 100, 2)
 
-    # ← AJOUT : CPU steal — % de temps où cette VM/ce nœud aurait voulu
-    # utiliser le CPU mais l'hyperviseur physique (hôte VMware Workstation)
-    # a donné le cœur à quelqu'un d'autre. Même requête que iowait, juste
-    # mode="steal" au lieu de mode="iowait" : node_cpu_seconds_total expose
-    # les deux modes de la même façon, aucune raison structurelle pour que
-    # l'un fonctionne et pas l'autre. Distinction critique pour la
-    # recommandation RAM/CPU : un steal élevé signifie que le problème est
-    # la contention sur l'hôte physique, pas un manque de ressources
-    # allouées à cette VM/ce nœud — ajouter du CPU virtuel n'y changerait
-    # rien, contrairement à ce qu'un load average élevé pourrait suggérer
-    # seul.
     steal = _first_val(f'rate(node_cpu_seconds_total{{node="{node}",mode="steal"}}[5m])')
     m["cpu_steal_pct"] = round(steal * 100, 2)
 
@@ -199,16 +177,6 @@ def _metriques_noeud(node: str) -> dict:
     m["disk_write_latency_ms"] = round((write_lat / write_ops) * 1000, 2)
 
     # ── RÉSEAU nœud — basculé de pve_exporter vers node_exporter ─────────────
-    # Confirmé par requête directe : pve_network_receive_bytes_total n'existe
-    # qu'avec id="qemu/..." — jamais id="node/...". pve_exporter n'expose
-    # simplement pas le débit réseau au niveau nœud, contrairement au niveau
-    # VM où ça fonctionne déjà. Cible vmbr0 précisément (confirmé présent par
-    # curl sur pve1) — PAS un simple device!="lo" : un paquet à destination
-    # d'une VM traverse tap101i0 → fwbr101i0 → fwln101i0/fwpr101p0 → vmbr0 →
-    # nic0, cinq interfaces pour un seul paquet. Sommer tout sauf lo aurait
-    # compté chaque paquet plusieurs fois. vmbr0 est le pont qui porte l'IP
-    # du nœud lui-même (192.168.138.100) — la référence standard Proxmox
-    # pour mesurer le trafic d'un nœud, une seule interface, pas de somme.
     m["net_in_mbps"]  = round(_first_val(f'rate(node_network_receive_bytes_total{{node="{node}",device="vmbr0"}}[5m])')  / (1024**2), 3)
     m["net_out_mbps"] = round(_first_val(f'rate(node_network_transmit_bytes_total{{node="{node}",device="vmbr0"}}[5m])') / (1024**2), 3)
 
@@ -231,9 +199,6 @@ def _metriques_noeud(node: str) -> dict:
     uptime_s = _first_val(f'pve_uptime_seconds{{id="node/{node}",node="{node}"}}')
     m["uptime_h"] = round(uptime_s / 3600, 1)
 
-    # vms_running : compte les entrées dont "id" commence par "qemu/" ou
-    # "lxc/", rapportées par CE nœud spécifiquement (node="{node}" évite de
-    # compter les VMs vues par l'exportateur d'un autre nœud du cluster).
     m["vms_running"] = int(_first_val(
         f'count(pve_cpu_usage_ratio{{id=~"qemu/.*|lxc/.*",node="{node}"}})'
     ))
@@ -248,29 +213,18 @@ def _metriques_vm(vmid: str, node: str = None, vm_type: str = "qemu") -> dict:
     nf = f',node="{node}"' if node else ""
     m  = {"vmid": vmid, "node": node or "unknown", "type": vm_type, "name": f"vm-{vmid}"}
 
-    # CPU — ← CORRECTION MAJEURE : ni "vmid" ni "type" n'existent comme labels
-    # sur pve_exporter (confirmé par requête directe) — seul "id" existe, au
-    # format "qemu/101". nf ajoute ",node=..." quand connu, pour éviter de
-    # compter deux fois la même VM vue par les deux exportateurs du cluster.
     r = _query(f'pve_cpu_usage_ratio{{id="{vm_type}/{vmid}"{nf}}}')
     if r:
         m["cpu_pct"] = round(_val(r[0]) * 100, 2)
         m["node"]    = r[0].get("metric", {}).get("node", node or "unknown")
     m["vcpus"] = int(_first_val(f'pve_cpu_usage_limit{{id="{vm_type}/{vmid}"{nf}}}'))
 
-    # RAM
     ram_used  = _first_val(f'pve_memory_usage_bytes{{id="{vm_type}/{vmid}"{nf}}}')
     ram_total = _first_val(f'pve_memory_size_bytes{{id="{vm_type}/{vmid}"{nf}}}')
     m["ram_used_gb"]  = round(ram_used  / (1024**3), 2)
     m["ram_total_gb"] = round(ram_total / (1024**3), 2)
     m["ram_pct"]      = round((ram_used / ram_total * 100) if ram_total > 0 else 0, 2)
 
-    # Disque — via node_exporter DANS la VM. Repose maintenant sur le label
-    # "vmid" (posé par pve_discovery.py sur chaque cible node_exporter d'une
-    # VM) plutôt que sur le nom — élimine toute dépendance à une
-    # correspondance exacte de chaîne entre deux sources différentes
-    # (pve_exporter et pve_discovery.py), qui pouvait diverger sans bruit.
-    # vmid est un identifiant numérique déjà disponible ici, sans comparaison.
     disk_total = _first_val(f'node_filesystem_size_bytes{{vmid="{vmid}",mountpoint="/"}}')
     disk_avail = _first_val(f'node_filesystem_avail_bytes{{vmid="{vmid}",mountpoint="/"}}')
     disk_used  = max(0.0, disk_total - disk_avail)
@@ -278,21 +232,9 @@ def _metriques_vm(vmid: str, node: str = None, vm_type: str = "qemu") -> dict:
     m["disk_total_gb"] = round(disk_total / (1024**3), 2)
     m["disk_pct"]      = round((disk_used / disk_total * 100) if disk_total > 0 else 0, 2)
 
-    # I/O Disque VM — ← CORRECTION FINALE : renommé disk_read_iops/write_iops
-    # → disk_read_mbps/write_mbps, ET converti en Mo/s (division par 1024**2,
-    # oubliée volontairement avant pour ne pas casser trois fichiers d'un
-    # coup). pve_exporter ne fournit qu'un débit en octets/s par VM, jamais
-    # un vrai compte d'opérations — contrairement à node_exporter au niveau
-    # nœud, qui donne un vrai IOPS. Garder l'ancien nom aurait affiché un
-    # débit sous une étiquette "IOPS", avec des nombres à 5-6 chiffres
-    # (confirmé dans le dashboard : 184801.5, 58477.1) qui semblent alarmants
-    # sans l'être — juste une mauvaise unité. Le nom correspond maintenant
-    # exactement à disk_read_mbps/write_mbps déjà utilisés au niveau nœud
-    # dans ce même fichier, pour une convention cohérente partout.
     m["disk_read_mbps"]  = round(_sum_query(f'rate(pve_disk_read_bytes_total{{id="{vm_type}/{vmid}"{nf}}}[5m])'    ) / (1024**2), 3)
     m["disk_write_mbps"] = round(_sum_query(f'rate(pve_disk_written_bytes_total{{id="{vm_type}/{vmid}"{nf}}}[5m])' ) / (1024**2), 3)
 
-    # Réseau VM — même correction
     m["net_in_mbps"]  = round(_sum_query(f'rate(pve_network_receive_bytes_total{{id="{vm_type}/{vmid}"{nf}}}[5m])')  / (1024**2), 3)
     m["net_out_mbps"] = round(_sum_query(f'rate(pve_network_transmit_bytes_total{{id="{vm_type}/{vmid}"{nf}}}[5m])') / (1024**2), 3)
 
@@ -332,6 +274,19 @@ def _metriques_cluster() -> dict:
     nodes_up = _query('sum(up{job=~".*proxmox.*|.*pve.*"})')
     m["nodes_prometheus_up"] = int(_val(nodes_up[0])) if nodes_up else 0
 
+    # ── SAUVEGARDE (pve_exporter) ─────────────────────────────────────────────
+    # ← AJOUT, puis CORRIGÉ : pve_not_backed_up_total confirmée par toi en
+    # conditions réelles -- MAIS chaque nœud du cluster rapporte la MÊME
+    # valeur cluster-wide (id="cluster/MonCluster", 2 sur pve1 ET 2 sur pve2
+    # dans ta capture) -- ce n'est pas 2 par nœud, c'est 2 pour tout le
+    # cluster, vu deux fois (une fois par exportateur qui voit tout le
+    # cluster). Interrogée ici une seule fois (niveau cluster, pas par
+    # nœud) pour ne jamais additionner la même donnée deux fois -- avant,
+    # elle était ajoutée au dict de CHAQUE nœud puis sommée dans
+    # collecter_metriques_cluster(), produisant 4 au lieu de 2.
+    resultats_backup = _query('pve_not_backed_up_total')
+    m["total_vms_sans_sauvegarde"] = int(_val(resultats_backup[0])) if resultats_backup else 0
+
     return m
 
 
@@ -342,7 +297,7 @@ def _metriques_temperature(node: str) -> dict:
     """
     Requiert node_exporter --collector.hwmon sur le nœud (label "node" posé
     par pve_discovery.py, cf. _metriques_noeud). Dans une VM VMware imbriquée,
-    hwmon peut simplement n'exposer aucun capteur réel — à vérifier une fois
+    hwmon peut simplement n'exposer aucun capteur réel -- à vérifier une fois
     la cible confirmée UP, sans trop y compter.
     """
     m = {}
@@ -368,8 +323,6 @@ def _metriques_temperature(node: str) -> dict:
     results_crit = _query(f'node_hwmon_temp_crit_celsius{{node="{node}"}}')
     m["cpu_temp_critical_c"] = round(_val(results_crit[0]), 1) if results_crit else 95.0
 
-    # smartmon_exporter n'est pas encore déployé (cf. audit) — cette ligne
-    # reste à 0 tant qu'il ne l'est pas, ce fix ne la corrige pas à lui seul.
     results_disk = _query(f'smartmon_temperature_celsius_raw_value{{node="{node}"}}')
     disk_temps = [_val(r) for r in results_disk if _val(r) > 0]
     m["disk_temp_max_c"] = round(max(disk_temps), 1) if disk_temps else 0.0
@@ -382,7 +335,7 @@ def _metriques_temperature(node: str) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 def _metriques_smart(node: str) -> dict:
     """
-    Nécessite smartmon_exporter — pas encore installé/scrapé. Restera à 0
+    Nécessite smartmon_exporter -- pas encore installé/scrapé. Restera à 0
     jusque-là, et probablement structurellement non pertinent ici : les
     disques de pve1/pve2 sont des vmdk VMware, pas des disques physiques.
     """
@@ -421,7 +374,7 @@ def _metriques_smart(node: str) -> dict:
 def _metriques_zfs(node: str) -> dict:
     """
     Hit rate idéal > 90%. Ce cluster utilise LVM-thin, pas ZFS (confirmé via
-    lvs -a) — zfs_available restera donc False ici, correctement, grâce au
+    lvs -a) -- zfs_available restera donc False ici, correctement, grâce au
     garde-fou déjà en place ci-dessous. Rien à corriger sur cette fonction.
     """
     m = {
@@ -435,10 +388,6 @@ def _metriques_zfs(node: str) -> dict:
     if results:
         taille = round(_val(results[0]) / (1024**3), 2)
         m["zfs_arc_size_gb"] = taille
-        # zfs_available = True seulement si le cache ARC contient réellement
-        # des données. Le module kernel ZFS de Proxmox VE expose toujours
-        # node_zfs_arc_size même sans pool actif (LVM-thin uniquement) —
-        # sans ce garde-fou, "ZFS available" est un faux positif systématique.
         m["zfs_available"] = taille > 0.01
 
     results = _query(f'node_zfs_arc_c_max{{node="{node}"}}')
@@ -460,18 +409,11 @@ def _metriques_zfs(node: str) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 def _metriques_corosync(node: str) -> dict:
     """
-    ← RÉÉCRIT ENTIÈREMENT : les noms d'origine (corosync_cluster_members_count,
-    corosync_quorum_ok, corosync_ring_avg_delay...) n'ont jamais existé --
-    supposés avant qu'un vrai exportateur ne soit installé, jamais vérifiés.
     Confirmé par requête directe sur pve1 (paquet Debian
     prometheus-hacluster-exporter, service systemd ha_cluster_exporter,
     port 9664) : tout est préfixé "ha_cluster_corosync_", pas "corosync_".
-
-    Différence honnête à connaître : cet exportateur n'expose PAS de latence
-    d'anneau (aucun équivalent à corosync_ring_avg_delay) -- seulement un
-    compte d'erreurs (ha_cluster_corosync_ring_errors). corosync_ring_latency_ms
-    reste donc à 0.0 en permanence, pas par bug, par absence réelle de cette
-    donnée précise chez cet exportateur.
+    corosync_ring_latency_ms reste à 0.0 en permanence -- pas un bug, cet
+    exportateur n'expose pas cette donnée précise.
     """
     m = {
         "corosync_ok": True, "corosync_quorum_ok": True, "corosync_members": 0,
@@ -479,9 +421,6 @@ def _metriques_corosync(node: str) -> dict:
         "corosync_ring_errors": 0,
     }
 
-    # Un membre = une série avec un label "node" (celui du membre, ex.
-    # local="true"/"false") ; compter les séries donne le nombre de membres,
-    # sommer leurs votes donne le total de votes actifs pour CE nœud.
     results = _query(f'ha_cluster_corosync_member_votes{{node="{node}"}}')
     if results:
         m["corosync_available"]  = True
@@ -509,9 +448,8 @@ def _metriques_corosync(node: str) -> dict:
 def _metriques_alimentation(node: str) -> dict:
     """
     Nécessite ipmi_exporter ET un vrai contrôleur IPMI/BMC physique. pve1 et
-    pve2 sont des VMs VMware Workstation, pas des serveurs physiques — cette
-    fonction restera à 0 en permanence, structurellement, comme les alertes
-    GPU SVGA II déjà supprimées pour la même raison.
+    pve2 sont des VMs VMware Workstation, pas des serveurs physiques -- cette
+    fonction restera à 0 en permanence, structurellement.
     """
     m = {"power_watts": 0.0, "power_ok": True, "ipmi_available": False}
 
@@ -532,7 +470,7 @@ def collecter_metriques_cluster() -> dict:
     """
     Collecte toutes les métriques :
     CPU, RAM, Disk, I/O, Swap, Réseau (avec erreurs/drops),
-    Processus, Load average, Cluster Proxmox
+    Processus, Load average, Cluster Proxmox, Sauvegarde
     """
     timestamp = datetime.now().isoformat()
 
@@ -609,6 +547,9 @@ def collecter_metriques_cluster() -> dict:
         "corosync_ok":            all(x.get("corosync_ok", True) for x in metriques_noeuds),
         "corosync_quorum_ok":     all(x.get("corosync_quorum_ok", True) for x in metriques_noeuds),
         "total_power_watts":      round(sum(x.get("power_watts",0) for x in metriques_noeuds), 1),
+        # total_vms_sans_sauvegarde vient déjà de **cluster_info ci-dessus
+        # (une seule requête niveau cluster) -- pas resommé ici, évite le
+        # double comptage corrigé (2+2=4 devenait 2).
     }
 
     return {

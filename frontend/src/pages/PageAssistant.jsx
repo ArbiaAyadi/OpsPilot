@@ -1,7 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { C } from '../utils/colors'
-import { severityColor, normalizeSeverity } from '../styles/theme'
-import { Chip } from '../components/Common'
 import { MD } from '../components/MD'
 
 const QUICK = [
@@ -171,6 +169,14 @@ function UserMessage({ msg, onEdit, thinking }) {
 }
 
 // ── Page principale ───────────────────────────────────────────────────────────
+// ← MODIFIÉ : ce chat reste désormais strictement question/réponse.
+// Les alertes automatiques d'incident ne sont plus jamais poussées dans
+// "messages" (voir App.jsx, handler WebSocket type==='alerte' -- le
+// setChatMessages(...) correspondant a été retiré) ; elles continuent
+// d'alimenter Recommendations, Incidents et System Log normalement,
+// simplement plus mélangées à cette conversation. Le rendu "AUTOMATED
+// INCIDENT ALERT" (msg.type==='alerte') est retiré ici en conséquence --
+// mort depuis ce changement, jamais plus atteint en pratique.
 export function PageAssistant({ messages, thinking, input, setInput, onSend, onEdit, onClear, connected, send }) {
   const endRef = useRef(null)
   const [conversations, setConversations] = useState([])
@@ -242,7 +248,8 @@ export function PageAssistant({ messages, thinking, input, setInput, onSend, onE
           {messages.length === 0 && (
             <div style={{ maxWidth:620, margin:'40px auto', animation:'fadeUp 0.4s ease', padding:'0 16px' }}>
               <div style={{ textAlign:'center', marginBottom:28 }}>
-                <div style={{ width:52, height:52, borderRadius:14, background:C.blue, display:'flex', alignItems:'center', justifyContent:'center', fontSize:24, margin:'0 auto 16px', boxShadow:`0 0 24px ${C.blue}40` }}>⬡</div>
+                {/* ← RETIRÉ : pastille hexagonale bleue au-dessus du
+                    titre -- le titre en dégradé suffit à porter l'accent. */}
                 <div style={{ fontSize:22, fontWeight:800, color:C.text, letterSpacing:'-0.02em', marginBottom:6 }}>OpsPilot AI Assistant</div>
                 <div style={{ fontSize:13, color:C.muted }}>Infrastructure expert · Proxmox VE · Based on live cluster data</div>
               </div>
@@ -263,7 +270,6 @@ export function PageAssistant({ messages, thinking, input, setInput, onSend, onE
           <div style={{ maxWidth:760, margin:'0 auto', padding:'0 16px' }}>
             {messages.map((msg, i) => {
               const isUser  = msg.role === 'user'
-              const isAlert = msg.type === 'alerte'
               const isSys   = msg.type === 'systeme'
 
               if (isSys) return (
@@ -276,21 +282,14 @@ export function PageAssistant({ messages, thinking, input, setInput, onSend, onE
               if (isUser) return <UserMessage key={msg.id||i} msg={msg} onEdit={onEdit} thinking={thinking}/>
               return (
                 <div key={msg.id||i} style={{ display:'flex', gap:12, padding:'8px 0', alignItems:'flex-start', animation:'fadeUp 0.3s ease' }}>
-                  <div style={{ width:34, height:34, borderRadius:9, flexShrink:0, marginTop:2, background:isAlert?'#180808':'#080e22', border:`1px solid ${isAlert?C.red+'40':C.border}`, display:'flex', alignItems:'center', justifyContent:'center', fontSize:15 }}>
-                    {isAlert ? '⚠' : '⬡'}
+                  <div style={{ width:34, height:34, borderRadius:9, flexShrink:0, marginTop:2, background:'#080e22', border:`1px solid ${C.border}`, display:'flex', alignItems:'center', justifyContent:'center', fontSize:15 }}>
+                    ⬡
                   </div>
-                  <div style={{ maxWidth:'78%', background:isAlert?'#110606':C.card, border:`1px solid ${isAlert?C.red+'30':C.border}`, borderRadius:'3px 14px 14px 14px', padding:'12px 16px' }}>
-                    {isAlert && (
-                      <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:10, paddingBottom:10, borderBottom:`1px solid ${C.red}20` }}>
-                        <span style={{ fontSize:11, fontWeight:700, color:C.red, fontFamily:'JetBrains Mono, monospace', letterSpacing:'0.08em' }}>⚠ AUTOMATED INCIDENT ALERT</span>
-                        {msg.anomalies?.map((a, j) => <Chip key={j} label={normalizeSeverity(a.niveau)} color={severityColor(a.niveau)}/>)}
-                      </div>
-                    )}
+                  <div style={{ maxWidth:'78%', background:C.card, border:`1px solid ${C.border}`, borderRadius:'3px 14px 14px 14px', padding:'12px 16px' }}>
                     <MD text={msg.content}/>
                     <div style={{ fontSize:11, color:C.muted, marginTop:8, textAlign:'right', fontFamily:'JetBrains Mono, monospace', display:'flex', justifyContent:'flex-end', gap:10, alignItems:'center' }}>
                       {msg.llm && <span style={{ color:msg.llm==='claude'?C.purple:C.cyan, fontSize:9, fontWeight:700, letterSpacing:'0.08em' }}>◆ {(msg.model||msg.llm||'groq').toUpperCase()}</span>}
                       {msg.timestamp?.slice(11,19)}
-                      {msg.rapport && <span style={{ color:C.yellow }}>📄 {msg.rapport}</span>}
                     </div>
                   </div>
                 </div>

@@ -53,8 +53,6 @@ function RoleTags({ tags }) {
 }
 
 // ── Badges "détecté en direct" via Prometheus ──────────────────────────────────
-// Cliquable seulement là où selected/onSelect sont fournis (dans VmDetail) --
-// reste un simple badge non-interactif dans la carte de la liste des VMs.
 function DetectedServices({ services, selected = null, onSelect = null }) {
   if (!services || !services.length) return null
   const clickable = !!onSelect
@@ -135,10 +133,6 @@ function ExtraServiceMetrics({ m }) {
   return (
     <>
       {entries.map(([k, v]) => {
-        // ← NOUVEAU : "up" vient de PromQL (1.0/0.0, pas un booléen JS) --
-        // sans ce cas particulier, une panne (up=0) s'affichait comme un
-        // nombre neutre "0" en vert, au lieu d'être signalée en rouge
-        // comme "healthy" (déjà un vrai booléen) l'est juste à côté.
         if (k === 'up') {
           return <InfraMetricRow key={k} label="Up" value="" isOk={v === 1 || v === 1.0}/>
         }
@@ -156,9 +150,88 @@ function ExtraServiceMetrics({ m }) {
   )
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// ← AJOUT : même principe qu'ExtraServiceMetrics ci-dessus, appliqué au
+// niveau NŒUD et VM -- avant, seules les métriques explicitement codées en
+// dur dans NodeDetail/VmDetail (une <InfraMetricRow> écrite à la main par
+// champ) apparaissaient à l'écran. Une métrique réellement collectée par
+// metriques_proxmox.py (etat["noeuds"][i]["fd_used_pct"], par exemple --
+// confirmé présente dans les données, jamais affichée nulle part sur cette
+// page) restait invisible tant que personne n'ajoutait sa ligne à la main.
+// Exactement l'écart entre "collecté automatiquement" et "affiché
+// automatiquement" -- fermé ici de la même façon que pour les services,
+// déjà prouvée fonctionner. Toute métrique future ajoutée à
+// metriques_proxmox.py (ex: total_vms_sans_sauvegarde) apparaît
+// désormais ici sans toucher ce fichier.
+// ══════════════════════════════════════════════════════════════════════════════
+const CLES_CONNUES_NOEUD = new Set([
+  'node', 'nom', 'timestamp', 'statut',
+  'cpu_pct', 'cpu_iowait_pct', 'cpu_steal_pct', 'load_avg_1m', 'cpu_cores', 'cpu_temp_max_c',
+  'ram_pct', 'ram_used_gb', 'ram_total_gb',
+  'swap_pct', 'swap_used_gb',
+  'disk_pct', 'disk_used_gb', 'disk_total_gb', 'disk_read_iops', 'disk_write_iops',
+  'disk_read_latency_ms', 'disk_write_latency_ms',
+  'zfs_available', 'zfs_arc_hit_rate', 'zfs_arc_size_gb',
+  'smart_ok', 'smart_disks_monitored',
+  'net_in_mbps', 'net_out_mbps', 'net_errors_in', 'net_errors_out', 'net_drop_in', 'net_drop_out',
+  'uptime_h', 'vms_running',
+  'corosync_available', 'corosync_ok', 'corosync_quorum_ok', 'corosync_ring_latency_ms',
+  'power_watts',
+])
+
+function ExtraNodeMetrics({ n }) {
+  const entries = Object.entries(n || {}).filter(
+    ([k, v]) => !CLES_CONNUES_NOEUD.has(k) && v !== null && v !== undefined && typeof v !== 'object'
+  )
+  if (!entries.length) return null
+  return (
+    <>
+      <div style={{ fontSize:11, color:C.muted, fontFamily:'JetBrains Mono,monospace', letterSpacing:'0.08em', padding:'10px 0 6px 0' }}>OTHER</div>
+      {entries.map(([k, v]) => {
+        if (typeof v === 'boolean') {
+          return <InfraMetricRow key={k} label={humaniser(k)} value="" isBool={v}/>
+        }
+        const unit = k.endsWith('_pct') ? '%' : k.endsWith('_ms') ? 'ms' : k.endsWith('_gb') ? ' GB'
+          : k.endsWith('_mbps') ? ' MB/s' : k.endsWith('_c') ? '°C' : k.endsWith('_watts') ? ' W' : ''
+        const val = typeof v === 'number' ? Math.round(v * 100) / 100 : v
+        return <InfraMetricRow key={k} label={humaniser(k)} value={val} unit={unit} warn={99999} crit={99999}/>
+      })}
+    </>
+  )
+}
+
+const CLES_CONNUES_VM = new Set([
+  'vmid', 'nom', 'name', 'node', 'noeud', 'type', 'statut',
+  'cpu_pct', 'vcpus',
+  'ram_pct', 'ram_used_gb', 'ram_total_gb', 'maxmem_gb',
+  'disk_pct', 'disk_used_gb', 'disk_total_gb', 'maxdisk_gb',
+  'disk_read_mbps', 'disk_write_mbps',
+  'net_in_mbps', 'net_out_mbps',
+  'uptime_h', 'tags', 'services_detectes', 'metriques_services',
+])
+
+function ExtraVmMetrics({ v }) {
+  const entries = Object.entries(v || {}).filter(
+    ([k, val]) => !CLES_CONNUES_VM.has(k) && val !== null && val !== undefined && typeof val !== 'object'
+  )
+  if (!entries.length) return null
+  return (
+    <>
+      <div style={{ fontSize:11, color:C.muted, fontFamily:'JetBrains Mono,monospace', letterSpacing:'0.08em', padding:'10px 0 6px 0' }}>OTHER</div>
+      {entries.map(([k, val]) => {
+        if (typeof val === 'boolean') {
+          return <InfraMetricRow key={k} label={humaniser(k)} value="" isBool={val}/>
+        }
+        const unit = k.endsWith('_pct') ? '%' : k.endsWith('_ms') ? 'ms' : k.endsWith('_gb') ? ' GB'
+          : k.endsWith('_mbps') ? ' MB/s' : k.endsWith('_c') ? '°C' : ''
+        const v2 = typeof val === 'number' ? Math.round(val * 100) / 100 : val
+        return <InfraMetricRow key={k} label={humaniser(k)} value={v2} unit={unit} warn={99999} crit={99999}/>
+      })}
+    </>
+  )
+}
+
 // ── Carte séparée : métriques réelles du service sélectionné (process-exporter) ─
-// S'affiche comme une 3e carte indépendante, à droite de la carte VM, avec
-// son propre header + bouton fermer.
 function ServiceDetailCard({ service, metriques, onClose }) {
   if (!service || !metriques || !metriques[service]) return null
   const m = metriques[service]
@@ -189,27 +262,6 @@ function ServiceDetailCard({ service, metriques, onClose }) {
   )
 }
 
-// ── Pilule de contexte infra -- RETIRÉE : remplacée par des cartes
-// structurées (voir HypervisorBadge/HostPcBadge plus bas), le format
-// pilule à une ligne ne tenait plus une fois passé à 5-6 métriques.
-
-// ── Hyperviseur détecté (couche VMware/KVM/physique sous Proxmox) ─────────────
-// ← AJOUT : metriques param optionnel (etat["hyperviseur_metriques"], via
-// hypervisor_metrics.py) -- reste rétrocompatible, la puce fonctionne comme
-// avant si absent. Mots explicites partout ("VMs using", "RAM") -- leçon du
-// bug précédent sur HostPcBadge (chiffres sans étiquette).
-// ← CORRECTION : le chiffre RAM des VMs a été retiré -- vérifié non
-// fiable pour VMware Workstation (aucun champ mémoire Windows standard ne
-// reflète la RAM du système invité, voir hypervisor_metrics.py). Un mauvais
-// chiffre est pire qu'aucun chiffre. Le CPU reste affiché : fiable, suit le
-// temps CPU par processus de façon standard côté OS.
-// ← REDESSINÉ : la pilule à une ligne a dépassé son format une fois passée
-// à 6 informations (VMs, CPU, RAM/disque alloués, marge réelle) -- sur une
-// fenêtre étroite, le texte cassait au milieu des mots ("Running / on").
-// Remplacé par une petite carte structurée, même InfraMetricRow (étiquette
-// gauche, valeur droite) déjà utilisé partout ailleurs sur cette page
-// (nœuds, VMs, services) -- cohérent avec le reste, plus jamais de
-// dépendance à la largeur disponible pour rester lisible.
 function HypervisorBadge({ hyperviseur, metriques, isSelected, onSelect }) {
   if (!hyperviseur || hyperviseur.type === 'unknown') return null
   const accent = '#a855f7'
@@ -228,9 +280,6 @@ function HypervisorBadge({ hyperviseur, metriques, isSelected, onSelect }) {
         <span style={{ fontSize:13, fontWeight:700, color:C.text }}>{hyperviseur.produit}</span>
       </div>
       {metriques && metriques.disponible && (<>
-        {/* ← Clarifie explicitement la base du pourcentage -- sans ça,
-            "RAM 50%" ne dit pas si c'est 50% du PC ou 50% de la RAM
-            allouée à VMware, question posée directement par l'utilisateur. */}
         <div style={{ fontSize:10, color:C.muted, fontStyle:'italic', marginBottom:8 }}>
           % relative to total PC capacity
         </div>
@@ -270,10 +319,6 @@ function HypervisorBadge({ hyperviseur, metriques, isSelected, onSelect }) {
   )
 }
 
-// ── Ressources réelles du PC hôte physique (metriques_pc_hote.py) ───────────
-// ← REDESSINÉ en grille horizontale de tuiles, même schéma visuel que les
-// tuiles CPU/RAM/DISK déjà utilisées pour les nœuds/VMs (voir plus bas) --
-// cohérent avec le reste de la page plutôt qu'empilé verticalement.
 function HostPcBadge({ hote, isSelected, onSelect }) {
   if (!hote || !hote.disponible) return null
   const accent = '#f59e0b'
@@ -356,13 +401,18 @@ function NodeDetail({ n, vms = [] }) {
       {(n.power_watts??0) > 0 && (
         <InfraMetricRow label="Power"             value={n.power_watts??0}          unit="W" warn={999}/>
       )}
+
+      {/* ← AJOUT : toute métrique collectée par metriques_proxmox.py et
+          non explicitement listée ci-dessus s'affiche automatiquement ici
+          -- ex: fd_used_pct, procs_blocked, swap_in_rate/out_rate, les
+          détails SMART fins, les compteurs corosync détaillés... Rien à
+          ajouter à la main ici la prochaine fois qu'une métrique est
+          ajoutée côté collecte. */}
+      <ExtraNodeMetrics n={n}/>
     </div>
   )
 }
 
-// selectedService/onSelectService viennent du parent (PageInfrastructure)
-// pour afficher les métriques du service dans une carte séparée (3e colonne)
-// plutôt qu'ici.
 function VmDetail({ v, selectedService, onSelectService }) {
   const hasBadges = v.tags || (v.services_detectes && v.services_detectes.length > 0)
   return (
@@ -390,11 +440,13 @@ function VmDetail({ v, selectedService, onSelectService }) {
       <div style={{ fontSize:11, color:C.muted, fontFamily:'JetBrains Mono,monospace', letterSpacing:'0.08em', padding:'10px 0 6px 0' }}>INFO</div>
       <InfraMetricRow label="Uptime"         value={fmtUptime(v.uptime_h)} unit="" warn={999}/>
       <InfraMetricRow label="Hosted on"      value={v.noeud??v.node??'?'} unit="" warn={999}/>
+
+      {/* ← AJOUT : même principe que NodeDetail ci-dessus. */}
+      <ExtraVmMetrics v={v}/>
     </div>
   )
 }
 
-// ── Panneau complet PC hôte (au clic sur la carte Host PC) ──────────────────
 function HostPcDetail({ hote }) {
   if (!hote || !hote.disponible) {
     return <div style={{ fontSize:13, color:C.muted, padding:'12px 0' }}>Host PC metrics not available this cycle.</div>
@@ -421,7 +473,6 @@ function HostPcDetail({ hote }) {
   )
 }
 
-// ── Panneau complet hyperviseur (au clic sur la carte "Running on...") ──────
 function HypervisorDetail({ hyperviseur, metriques }) {
   return (
     <div style={{ display:'flex', flexDirection:'column', gap:0 }}>
@@ -468,9 +519,6 @@ function HypervisorDetail({ hyperviseur, metriques }) {
 
 export function PageInfrastructure({ cluster }) {
   const [sel, setSel] = useState(null)
-  // État du service sélectionné, remonté ici (au lieu de VmDetail) pour
-  // piloter l'affichage de la 3e colonne. Se réinitialise à chaque
-  // changement de sélection (nouvelle VM, nouveau node, ou fermeture).
   const [selectedService, setSelectedService] = useState(null)
 
   useEffect(() => { setSelectedService(null) }, [sel])
@@ -494,7 +542,9 @@ export function PageInfrastructure({ cluster }) {
     <div style={{ display:'flex', flexDirection:'column', gap:16 }}>
       <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
         <div>
-          <h2 style={{ fontSize:22, fontWeight:800, color:C.text, marginBottom:6 }}>Infrastructure</h2>
+          <h2 style={{ fontSize:22, fontWeight:800, marginBottom:6, letterSpacing:'-0.02em',
+                         background:'linear-gradient(180deg, #ffffff 0%, #b9c9dd 130%)',
+                         WebkitBackgroundClip:'text', WebkitTextFillColor:'transparent' }}>Infrastructure</h2>
           <div style={{ fontSize:13, color:C.sub }}>{noeuds.length} hypervisor{noeuds.length>1?'s':''} · {vms.length} VM{vms.length>1?'s':''} · Click any resource to see all metrics</div>
         </div>
         <div style={{ display:'flex', gap:8 }}>

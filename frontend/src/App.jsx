@@ -1,16 +1,4 @@
-/**
- * OpsPilot Enterprise — Infrastructure AI Platform
- * Point d'entree : gere le WebSocket, le state global de l'app,
- * la sidebar de navigation, et route vers la bonne page.
- *
- * ← MODIFIÉ (bloc "alerte") : lit maintenant data.structured directement
- * (JSON généré par le LLM, voir incident_prompt.py + surveillance.py) au
- * lieu de découper data.content par ---INCIDENT---/---RECOMMENDATION--- et
- * d'extraire le titre par regex. target_node/target_vmid viennent du champ
- * structuré (déjà connu avec certitude côté backend), plus jamais devinés
- * depuis un texte libre.
- */
-import { useState, useCallback, useEffect } from 'react'
+import { useState, useCallback, useEffect, useRef } from 'react'
 import { C } from './utils/colors'
 import { fmtTime } from './utils/formatters'
 import { useWebSocket } from './hooks/useWebSocket'
@@ -22,8 +10,8 @@ import { PageMonitoringRules } from './pages/PageMonitoringRules'
 import { PageRecommendations } from './pages/PageRecommendations'
 import { PageSystemLog } from './pages/PageSystemLog'
 import { PageAssistant } from './pages/PageAssistant'
+import { PageAuth } from './pages/PageAuth'
 
-// ── Icônes SVG inline propres ──────────────────────────────────────────────
 const Icons = {
   overview: (active, color) => (
     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke={active ? color : '#4a5568'} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
@@ -96,10 +84,6 @@ const PAGES = [
   { id:'assistant',       icon:'assistant',       label:'AI Assistant',     desc:'Infrastructure chat'       },
 ]
 
-// ← AJOUT : sorti du composant (portée module) pour être réutilisable à la
-// fois par le chargement initial (useEffect) et loadMoreHistory (déclenché
-// par le bouton "Load more" dans PageIncidents.jsx) sans dupliquer cette
-// logique de conversion à deux endroits.
 const NIVEAU_VERS_SEVERITE = { critique:'CRITICAL', important:'HIGH', surveillance:'MONITORING' }
 function rapportVersIncident(r) {
   const m = r.nom.match(/report_(\d{8})_(\d{6})_(\w+)\.md/)
@@ -120,8 +104,206 @@ function rapportVersIncident(r) {
   }
 }
 
+// ← AJOUT : consolide nom + "Change password" + "Sign out" (trois éléments
+// séparés dans l'en-tête) en un seul bouton -- le nom lui-même, foncé,
+// cliquable -- qui ouvre un petit menu avec les coordonnées du compte et
+// les deux actions. Fermeture au clic extérieur (mousedown, pas click --
+// se déclenche avant le prochain onClick, évite un clic qui rouvrirait le
+// menu juste après l'avoir fermé) ou à la touche Échap.
+function UserMenuButton({ user, onChangePassword, onLogout }) {
+  const [ouvert, setOuvert] = useState(false)
+  const ref = useRef(null)
+  // ← Valeurs identiques à celles définies dans App() (ligne ~574) --
+  // ce composant est déclaré en dehors de App, ces const locales n'y sont
+  // pas visibles (portée de fonction JS, pas une erreur de frappe).
+  const C_RED    = '#ef4444'
+  const C_MUTED  = '#4a5568'
+  const C_SUB    = '#94a3b8'
+  const C_BORDER = '#1e293b'
+
+  useEffect(() => {
+    if (!ouvert) return
+    const fermerSiExterieur = (e) => {
+      if (ref.current && !ref.current.contains(e.target)) setOuvert(false)
+    }
+    const fermerSurEchap = (e) => { if (e.key === 'Escape') setOuvert(false) }
+    document.addEventListener('mousedown', fermerSiExterieur)
+    document.addEventListener('keydown', fermerSurEchap)
+    return () => {
+      document.removeEventListener('mousedown', fermerSiExterieur)
+      document.removeEventListener('keydown', fermerSurEchap)
+    }
+  }, [ouvert])
+
+  return (
+    <div ref={ref} style={{ position: 'relative' }}>
+      <button
+        onClick={() => setOuvert(v => !v)}
+        style={{
+          display: 'flex', alignItems: 'center', gap: 7,
+          background: '#0a1220', border: `1px solid ${C_BORDER}`, borderRadius: 8,
+          color: '#e2e8f0', fontSize: 12, fontWeight: 600, padding: '6px 12px',
+          cursor: 'pointer', fontFamily: "'Inter', sans-serif",
+        }}
+      >
+        {user?.nom}
+        <span style={{ fontSize: 9, color: C_MUTED, transform: ouvert ? 'rotate(180deg)' : 'none', transition: 'transform 0.15s' }}>▼</span>
+      </button>
+
+      {ouvert && (
+        <div style={{
+          position: 'absolute', top: 'calc(100% + 6px)', right: 0, minWidth: 200, zIndex: 50,
+          background: '#0a1220', border: `1px solid ${C_BORDER}`, borderRadius: 10,
+          boxShadow: '0 8px 24px rgba(0,0,0,0.4)', overflow: 'hidden',
+        }}>
+          <div style={{ padding: '10px 14px', borderBottom: `1px solid ${C_BORDER}` }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: '#e2e8f0' }}>{user?.nom}</div>
+            <div style={{ fontSize: 11, color: C_MUTED, marginTop: 2 }}>{user?.email}</div>
+          </div>
+          <button
+            onClick={() => { setOuvert(false); onChangePassword() }}
+            style={{ display: 'block', width: '100%', textAlign: 'left', background: 'transparent', border: 'none',
+                     color: C_SUB, fontSize: 12, padding: '9px 14px', cursor: 'pointer', fontFamily: "'Inter', sans-serif" }}
+            onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(255,255,255,0.04)'}
+            onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}
+          >
+            Change password
+          </button>
+          <button
+            onClick={() => { setOuvert(false); onLogout() }}
+            style={{ display: 'block', width: '100%', textAlign: 'left', background: 'transparent', border: 'none',
+                     borderTop: `1px solid ${C_BORDER}`,
+                     color: C_RED, fontSize: 12, padding: '9px 14px', cursor: 'pointer', fontFamily: "'Inter', sans-serif" }}
+            onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(239,68,68,0.08)'}
+            onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}
+          >
+            Sign out
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ← AJOUT : changement de mot de passe depuis l'app -- le backend
+// (/api/auth/change-password) existait déjà, cette modale était la seule
+// pièce manquante. Déconnecte automatiquement les autres appareils
+// (comportement du backend, pas quelque chose que ce composant décide) --
+// voir auth_routes.py pour le raisonnement complet.
+function ChangePasswordModal({ onClose }) {
+  const [current, setCurrent] = useState('')
+  const [nouveau, setNouveau] = useState('')
+  const [erreur, setErreur]   = useState(null)
+  const [succes, setSucces]   = useState(false)
+  const [chargement, setChargement] = useState(false)
+
+  const soumettre = async (e) => {
+    e.preventDefault()
+    if (chargement) return
+    setErreur(null)
+    setChargement(true)
+    try {
+      const r = await fetch('/api/auth/change-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ current_password: current, new_password: nouveau }),
+      })
+      const data = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(data.detail || 'Could not change password.')
+      setSucces(true)
+    } catch (err) {
+      setErreur(err.message)
+    } finally {
+      setChargement(false)
+    }
+  }
+
+  return (
+    <div onClick={onClose} style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.6)', display:'flex',
+                                     alignItems:'center', justifyContent:'center', zIndex:1000 }}>
+      <div onClick={e => e.stopPropagation()} style={{ width:360, background:'#0a1220', border:'1px solid #1e293b',
+                                                         borderRadius:14, padding:24 }}>
+        <div style={{ fontSize:15, fontWeight:700, color:'#e2e8f0', marginBottom:16 }}>Change password</div>
+        {succes ? (
+          <>
+            <div style={{ padding:'9px 12px', borderRadius:7, background:'rgba(34,197,94,0.1)', border:'1px solid rgba(34,197,94,0.3)',
+                          color:'#22c55e', fontSize:12, marginBottom:16, lineHeight:1.5 }}>
+              Password updated. Other devices have been signed out.
+            </div>
+            <button onClick={onClose} style={{ width:'100%', padding:'10px 0', borderRadius:8, border:'none',
+                                                 background:'#3b82f6', color:'#fff', fontSize:13, fontWeight:700, cursor:'pointer' }}>
+              Close
+            </button>
+          </>
+        ) : (
+          <form onSubmit={soumettre}>
+            {erreur && (
+              <div style={{ padding:'9px 12px', borderRadius:7, background:'rgba(239,68,68,0.1)', border:'1px solid rgba(239,68,68,0.3)',
+                            color:'#ef4444', fontSize:12, marginBottom:14, lineHeight:1.5 }}>
+                {erreur}
+              </div>
+            )}
+            <label style={{ display:'block', fontSize:11, color:'#94a3b8', marginBottom:6, fontFamily:'JetBrains Mono, monospace' }}>CURRENT PASSWORD</label>
+            <input type="password" value={current} onChange={e => setCurrent(e.target.value)} required autoFocus
+                   style={{ width:'100%', padding:'10px 12px', borderRadius:8, border:'1px solid #1e293b', background:'#070d18',
+                            color:'#e2e8f0', fontSize:13, outline:'none', boxSizing:'border-box', marginBottom:14 }} />
+            <label style={{ display:'block', fontSize:11, color:'#94a3b8', marginBottom:6, fontFamily:'JetBrains Mono, monospace' }}>NEW PASSWORD</label>
+            <input type="password" value={nouveau} onChange={e => setNouveau(e.target.value)} required
+                   style={{ width:'100%', padding:'10px 12px', borderRadius:8, border:'1px solid #1e293b', background:'#070d18',
+                            color:'#e2e8f0', fontSize:13, outline:'none', boxSizing:'border-box' }} />
+            <div style={{ fontSize:10, color:'#4a5568', marginTop:6, marginBottom:16 }}>At least 12 characters.</div>
+            <div style={{ display:'flex', gap:8 }}>
+              <button type="button" onClick={onClose} style={{ flex:1, padding:'10px 0', borderRadius:8, border:'1px solid #1e293b',
+                                                                  background:'transparent', color:'#94a3b8', fontSize:13, cursor:'pointer' }}>
+                Cancel
+              </button>
+              <button type="submit" disabled={chargement} style={{ flex:1, padding:'10px 0', borderRadius:8, border:'none',
+                                                                     background:'#3b82f6', color:'#fff', fontSize:13, fontWeight:700,
+                                                                     cursor:'pointer', opacity:chargement?0.6:1 }}>
+                {chargement ? 'Saving...' : 'Save'}
+              </button>
+            </div>
+          </form>
+        )}
+      </div>
+    </div>
+  )
+}
+
 export default function App() {
-  const { connected, send, handlerRef } = useWebSocket(`ws://${window.location.host}/ws`)
+  // ← AJOUT : vérifie la session au montage, avant tout le reste.
+  // authChecked distingue "en cours de vérification" de "vérifié, pas
+  // connecté" -- sans ça, un court instant sans utilisateur pourrait
+  // afficher la page de login puis basculer vers le dashboard, un
+  // scintillement visible à chaque chargement.
+  const [authChecked, setAuthChecked] = useState(false)
+  const [currentUser, setCurrentUser] = useState(null)
+
+  useEffect(() => {
+    fetch('/api/auth/me')
+      .then(r => r.ok ? r.json() : Promise.reject())
+      .then(d => setCurrentUser(d.user))
+      .catch(() => setCurrentUser(null))
+      .finally(() => setAuthChecked(true))
+  }, [])
+
+  const [showChangePwd, setShowChangePwd] = useState(false)
+
+  const handleLogout = useCallback(() => {
+    fetch('/api/auth/logout', { method: 'POST' }).finally(() => {
+      setCurrentUser(null)
+      window.location.reload()  // repart de zero -- coupe la connexion WS, vide tout l'etat en memoire
+    })
+  }, [])
+
+  // ← CORRIGÉ : ws:// était toujours utilisé, même quand la page est
+  // chargée en https:// -- le navigateur bloque alors silencieusement
+  // cette connexion non sécurisée (politique de contenu mixte), sans
+  // message toujours évident. Construit maintenant le protocole selon
+  // celui de la page elle-même : wss:// en HTTPS, ws:// en HTTP --
+  // fonctionne dans les deux cas, plus jamais câblé en dur.
+  const wsProtocole = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  const { connected, send, handlerRef } = useWebSocket(`${wsProtocole}//${window.location.host}/ws`)
   const [page,         setPage]         = useState('dashboard')
   const [cluster,      setCluster]      = useState(null)
   const [history,      setHistory]      = useState([])
@@ -133,16 +315,11 @@ export default function App() {
   const [thinking,     setThinking]     = useState(false)
   const [uptime,       setUptime]       = useState(0)
   const [rapports,     setRapports]     = useState([])
-  // ← AJOUT : pagination de l'historique -- total/offset viennent du
-  // backend (compter_rapports), loadingMore pour l'état du bouton "Load
-  // more history".
   const [historyTotal,   setHistoryTotal]   = useState(0)
   const [historyOffset,  setHistoryOffset]  = useState(0)
   const [loadingMore,    setLoadingMore]    = useState(false)
   const [dernierLstm,  setDernierLstm]  = useState({ score:0, seuil:0.5, score_if:0, score_lstm:0, lstm_ready:false, drift:false })
   const [reglesDyn,    setReglesDyn]    = useState([])
-  // ← NOUVEAU : suit si les règles en cache sont périmées (Proxmox injoignable
-  // au dernier cycle de surveillance) — vient de /api/regles → regles_perimees
   const [reglesStale,  setReglesStale]  = useState(false)
 
   const logTime = () => new Date().toLocaleTimeString('fr-FR', { hour:'2-digit', minute:'2-digit', second:'2-digit' })
@@ -167,21 +344,15 @@ export default function App() {
     if (data.type==='alerte') {
       if (data.lstm) setDernierLstm(prev => ({...prev, ...data.lstm}))
 
-      // ← MODIFIÉ : data.structured est le JSON généré par le LLM (voir
-      // incident_prompt.py), déjà validé côté backend (action_id/params).
-      // data.content reste un texte markdown lisible (surveillance._rendre_markdown,
-      // rendu déterministe depuis structured -- jamais une 2e requête LLM),
-      // utilisé ici pour le fil de chat et comme repli si le parsing JSON a échoué.
       const structured   = data.structured || {}
-      const parseFailed  = !!structured._parse_failed
-      const cleanContent = (data.content || '').trim()
 
-      setChatMessages(m=>[...m,{...data, content: cleanContent, id:data.id||`alert_${Date.now()}`}])
+      // ← RETIRÉ : setChatMessages(...) qui ajoutait cette alerte à la
+      // conversation du chat. Le chat de l'AI Assistant reste maintenant
+      // strictement question/réponse -- l'alerte continue d'alimenter
+      // Recommendations (setSuggestions), Incidents (setIncidents) et
+      // System Log (addLog juste plus bas), ses trois destinations
+      // naturelles, simplement plus mélangée à la conversation.
 
-      // Récupérer les métriques complètes du nœud concerné (niveaux 1+2+3)
-      // pour les injecter dans la carte Recommendations -- target_node vient
-      // maintenant directement du LLM (champ structuré, validé côté
-      // backend), plus jamais deviné depuis une phrase.
       const cibleNoeud = structured.target_node || data.anomalies?.[0]?.cible || ''
       const noeudLive  = cluster?.noeuds?.find(n =>
         n.nom?.toLowerCase() === cibleNoeud?.toLowerCase() ||
@@ -190,6 +361,11 @@ export default function App() {
 
       setSuggestions(s=>[...s, {
         structured,
+        // ← AJOUT : id assigné par la base au moment de la sauvegarde
+        // (voir surveillance.py) -- permet de marquer cette recommendation
+        // résolue plus tard sans ambiguïté, y compris pour celles chargées
+        // au démarrage (voir useEffect de chargement initial plus bas).
+        recommendation_id: data.recommendation_id ?? null,
         title:       structured.fix_title || data.anomalies?.[0]?.message || 'Infrastructure Issue',
         severity:    structured.severity || data.anomalies?.[0]?.niveau || 'HIGH',
         status:      'OPEN',
@@ -197,13 +373,11 @@ export default function App() {
         target:      structured.target_node || data.anomalies?.[0]?.cible || 'cluster',
         target_vmid: structured.target_vmid ?? null,
         rapport:     data.rapport,
-        // Métriques niveau 1
         cpu_pct:     noeudLive.cpu_pct     ?? null,
         ram_pct:     noeudLive.ram_pct     ?? null,
         disk_pct:    noeudLive.disk_pct    ?? null,
         ram_used_gb: noeudLive.ram_used_gb ?? null,
         ram_total_gb:noeudLive.ram_total_gb?? null,
-        // Métriques niveau 2
         swap_pct:              noeudLive.swap_pct              ?? null,
         swap_used_gb:          noeudLive.swap_used_gb          ?? null,
         cpu_iowait_pct:        noeudLive.cpu_iowait_pct        ?? null,
@@ -215,7 +389,6 @@ export default function App() {
         net_errors_out:        noeudLive.net_errors_out        ?? null,
         net_drop_in:           noeudLive.net_drop_in           ?? null,
         net_drop_out:          noeudLive.net_drop_out          ?? null,
-        // Métriques niveau 3
         cpu_temp_max_c:            noeudLive.cpu_temp_max_c            ?? null,
         smart_ok:                  noeudLive.smart_ok                  ?? null,
         smart_reallocated_sectors: noeudLive.smart_reallocated_sectors ?? null,
@@ -227,19 +400,6 @@ export default function App() {
         load_avg_1m:               noeudLive.load_avg_1m               ?? null,
       }])
 
-      // ← CORRIGÉ : UNE seule entrée par événement "alerte" (une analyse
-      // LLM = un incident), pas une par anomalie brute dans .map(). Avant,
-      // 7 anomalies détectées au même cycle créaient 7 cartes distinctes
-      // dans Incidents, toutes avec le MÊME "structured" collé dessus --
-      // cliquer sur n'importe laquelle affichait un contenu identique,
-      // donnant l'impression trompeuse d'une répétition sans fin. Même
-      // principe que suggestions (PageRecommendations) juste au-dessus,
-      // qui faisait déjà ça correctement -- les deux pages représentent
-      // maintenant la même chose : une occurrence d'incident, pas une
-      // anomalie individuelle. La liste complète des anomalies reste
-      // disponible via inc.anomalies (tableau), affichée en plus dans
-      // PageIncidents.jsx -- une info que Recommendations ne montre pas
-      // (elle, ne montre que les causes retenues par le LLM).
       setIncidents(a=>[...a, {
         anomalies: data.anomalies || [],
         timestamp: data.timestamp,
@@ -247,6 +407,11 @@ export default function App() {
         rapport:   data.rapport,
         structured,
       }])
+      // ← AJOUT : chaque incident reçu en direct fait grandir le vrai
+      // total d'autant -- sans ça, historyTotal ne reflète que
+      // l'instantané pris au montage (ou à la dernière reconnexion) et se
+      // périme dès le premier nouvel incident de la journée.
+      setHistoryTotal(t => t + 1)
       addLog('AI Engine',`Incident: ${data.anomalies?.[0]?.message?.slice(0,50)||'anomaly'}`,'#ef4444')
       return
     }
@@ -260,18 +425,15 @@ export default function App() {
       }); return
     }
     if (data.type==='conversation_created') {
-      // Nouvelle conversation — vider les messages immédiatement
       setChatMessages([])
       return
     }
     if (data.type==='conversation_switched') {
-      // Charger les messages de la conversation sélectionnée
       const msgs = data.messages || []
       setChatMessages(msgs.map(m=>({...m, type:m.role==='user'?'question':'reponse'})))
       return
     }
     if (data.type==='conversation_deleted') {
-      // Charger la nouvelle conversation active (vide si nouvelle)
       const msgs = data.messages || []
       setChatMessages(msgs.map(m=>({...m, type:m.role==='user'?'question':'reponse'})))
       return
@@ -283,87 +445,69 @@ export default function App() {
     if (data.type==='history_cleared') { setChatMessages([]); return }
   }, [addLog])
 
-  useEffect(() => {
-    fetch('/api/cluster').then(r=>r.json()).then(d=>{if(!d.error)setCluster(d)}).catch(()=>{})
-    // ← MODIFIÉ : on lit maintenant aussi regles_perimees dans la réponse
-    // (point 3/9 — bandeau "STALE" dans PageMonitoringRules)
-    const loadRegles=()=>fetch('/api/regles').then(r=>r.json()).then(d=>{
-      if(d.regles&&d.regles.length>0)setReglesDyn(d.regles)
-      setReglesStale(!!d.regles_perimees)
-    }).catch(()=>{})
-    loadRegles()
-    // ← AJOUT : charge l'historique des incidents depuis /api/rapports
-    // (déjà existant côté backend, jamais appelé jusqu'ici -- exactement
-    // le même trou que /api/regles avant son propre correctif). Chaque
-    // rapport .md encode déjà tout ce qu'il faut dans son propre nom de
-    // fichier ("report_20260811_023953_critique.md" -> date + sévérité) --
-    // reconstruire depuis ça est plus simple et plus fiable que regrouper
-    // des lignes d'anomalies éparses depuis /api/anomalies/historique.
-    // Ces entrées historiques n'ont pas le JSON structuré complet (jamais
-    // persisté séparément, seulement rendu dans le texte du .md) -- la
-    // liste "anomalies" reste vide et "structured" absent pour elles ;
-    // PageIncidents.jsx gère déjà ce cas (repli propre), le bouton
-    // "Open report" reste pleinement fonctionnel pour voir l'analyse
-    // complète depuis le fichier persisté.
-    // ← MODIFIÉ (pagination) : /api/rapports retourne maintenant
-    // {rapports, total, offset, limit} au lieu d'un tableau brut -- charge
-    // 100 rapports au démarrage (rapide), avec loadMoreHistory()
-    // permettant de charger les suivants à la demande plutôt que tout
-    // d'un coup, indispensable après des mois d'utilisation avec des
-    // milliers de rapports accumulés.
+  // ← AJOUT : extrait en fonction nommée réutilisable -- appelée au
+  // montage ET à chaque reconnexion WebSocket (voir plus bas), pas
+  // seulement une fois. Sans ça, historyTotal ne se resynchronise jamais
+  // après une coupure réseau et peut dériver silencieusement de la vérité
+  // backend au fil des jours -- exactement ce que l'utilisateur a demandé
+  // d'éviter ("correct dès maintenant et tous les jours"). Ne dépend que
+  // de setters stables (garantis par React), donc [] comme dépendances est
+  // correct : cette fonction ne change jamais d'identité.
+  const syncHistoryFromBackend = useCallback(() => {
     fetch('/api/rapports?limit=100&offset=0').then(r=>r.json()).then(data=>{
       const rapports = data.rapports || []
       setHistoryTotal(data.total || 0)
-      setHistoryOffset(rapports.length)
+      // Ne jamais faire reculer l'offset déjà atteint via "Load more" --
+      // ce resync ne doit rafraîchir que le total et rattraper les
+      // incidents apparus pendant une éventuelle coupure, jamais annuler
+      // une pagination déjà chargée par l'utilisateur.
+      setHistoryOffset(o => Math.max(o, rapports.length))
       if (rapports.length === 0) return
-      const historique = rapports.map(rapportVersIncident).reverse() // plus recent au plus ancien -> reverse() car PageIncidents affiche déjà [...incidents].reverse()
-      // ← CORRIGÉ (course critique) : avant, setIncidents(historique)
-      // REMPLAÇAIT tout l'état -- si un incident arrivait EN DIRECT (avec
-      // ses données riches) pendant que cet appel réseau était encore en
-      // cours, et que l'appel se terminait APRÈS, il écrasait cet
-      // incident fraîchement arrivé par sa version dégradée (juste le
-      // résumé, déjà réécrite sur disque à ce moment-là). Fusionne
-      // maintenant avec ce qui existe déjà -- dédoublonné par nom de
-      // rapport, la version EN DIRECT (plus riche) est toujours
-      // prioritaire sur le doublon venant de l'historique.
-      //
-      // ← RETIRÉ : Recommendations n'a volontairement PAS de rechargement
-      // d'historique, contrairement à Incidents. Essayé une fois, retiré --
-      // ça affichait des centaines d'entrées "PAST" sans bouton
-      // fonctionnel, étiquetées par erreur "AI response could not be
-      // parsed" (message FAUX : l'IA n'a jamais échoué, l'analyse complète
-      // n'a simplement jamais été sauvegardée nulle part de récupérable).
-      // Recommendations reste l'espace de travail pour ce qui est
-      // actionnable MAINTENANT -- l'historique complet, avec son vrai
-      // contexte, reste consultable sur la page Incidents et via le
-      // rapport persisté, sans dupliquer (en pire) ce même contenu ici.
+      const historique = rapports.map(rapportVersIncident).reverse()
       setIncidents(actuels => {
         const rapportsExistants = new Set(actuels.map(inc => inc.rapport).filter(Boolean))
         const historiqueSansDoublons = historique.filter(h => !rapportsExistants.has(h.rapport))
         return [...historiqueSansDoublons, ...actuels]
       })
     }).catch(()=>{})
+  }, [])
+
+  useEffect(() => {
+    fetch('/api/cluster').then(r=>r.json()).then(d=>{if(!d.error)setCluster(d)}).catch(()=>{})
+    const loadRegles=()=>fetch('/api/regles').then(r=>r.json()).then(d=>{
+      if(d.regles&&d.regles.length>0)setReglesDyn(d.regles)
+      setReglesStale(!!d.regles_perimees)
+    }).catch(()=>{})
+    loadRegles()
+    syncHistoryFromBackend()
+    // ← AJOUT : charge les recommendations encore OUVERTES depuis le
+    // backend au démarrage -- avant, "suggestions" ne vivait qu'en mémoire
+    // React, perdue à chaque rechargement de page. Ne charge QUE les
+    // ouvertes (déjà filtré côté backend, voir /api/recommendations) --
+    // volontairement borné, pas un historique qui grossit.
+    fetch('/api/recommendations').then(r=>r.json()).then(d=>{
+      if (d.recommendations?.length > 0) setSuggestions(s => [...d.recommendations, ...s])
+    }).catch(()=>{})
     const t1=setInterval(()=>setUptime(u=>u+1),1000), t3=setInterval(loadRegles,300000)
     addLog('System','OpsPilot initialized','#3b82f6')
     addLog('Connectivity','Cluster connection established','#22c55e')
     return()=>{clearInterval(t1);clearInterval(t3)}
-  }, [])
-  useEffect(()=>{if(connected)addLog('Network','Real-time stream active','#22c55e')},[connected])
-  // ← AJOUT : document.title suit maintenant la page active -- avant,
-  // rien ne le mettait à jour nulle part dans le code vu cette session,
-  // il restait figé sur un ancien nom de projet ("Agent AI — Monitoring
-  // Autonome", antérieur au renommage en OpsPilot). Ce useEffect écrase
-  // ce titre statique dès le montage, puis le met à jour à chaque
-  // changement de page.
+  }, [syncHistoryFromBackend])
+  useEffect(()=>{
+    if(connected) {
+      addLog('Network','Real-time stream active','#22c55e')
+      // ← AJOUT : resynchronise historyTotal/historyOffset avec le backend
+      // à chaque (re)connexion -- rattrape tout incident manqué et corrige
+      // toute dérive du compteur après une coupure réseau, pas seulement
+      // au tout premier chargement de la page.
+      syncHistoryFromBackend()
+    }
+  },[connected, syncHistoryFromBackend])
   useEffect(()=>{
     const p = PAGES.find(x=>x.id===page)
     document.title = p ? `OpsPilot — ${p.label}` : 'OpsPilot'
   },[page])
 
-  // ← AJOUT : charge le lot suivant de rapports historiques à la demande
-  // (bouton "Load more" dans PageIncidents.jsx) -- plutôt que de tout
-  // charger au démarrage, indispensable une fois des mois de rapports
-  // accumulés.
   const loadMoreHistory = useCallback(async () => {
     if (loadingMore) return
     setLoadingMore(true)
@@ -385,6 +529,30 @@ export default function App() {
     finally { setLoadingMore(false) }
   }, [historyOffset, loadingMore])
 
+  // ← AJOUT : marque une recommendation résolue -- déclenché soit par un
+  // clic explicite sur la carte, soit automatiquement quand une action
+  // proposée s'exécute avec succès (voir PageRecommendations.jsx). Retire
+  // du state local immédiatement (pas d'attente de la réponse serveur) --
+  // cohérent avec "seulement les OPEN sont affichées", et évite un délai
+  // visible pour une action déjà confirmée côté UI (le bouton n'affiche
+  // "success" qu'après la vraie exécution).
+  const resolveRecommendation = useCallback((recId) => {
+    if (!recId) return
+    setSuggestions(s => s.filter(sug => sug.recommendation_id !== recId))
+    fetch(`/api/recommendations/${recId}/resolve`, { method: 'POST' }).catch(()=>{})
+  }, [])
+
+  // ← AJOUT : suppression définitive d'une recommendation ACTIVE --
+  // distincte de resolveRecommendation ci-dessus (qui garde une trace
+  // dans l'historique). Delete ne laisse rien derrière, pour un faux
+  // positif ou du bruit. Retire du state local immédiatement, même
+  // principe que resolveRecommendation.
+  const deleteRecommendation = useCallback((recId) => {
+    if (!recId) return
+    setSuggestions(s => s.filter(sug => sug.recommendation_id !== recId))
+    fetch(`/api/recommendations/${recId}`, { method: 'DELETE' }).catch(()=>{})
+  }, [])
+
   const sendChat = useCallback((text=chatInput)=>{
     const q=(text||chatInput).trim(); if(!q||thinking) return
     const tmpId=`tmp_${Date.now()}`
@@ -397,10 +565,19 @@ export default function App() {
   const clearChat      = useCallback(()=>{ send({type:'clear_history'}) },[send])
 
   const alertCount    = cluster?.alertes?.length ?? 0
-  const incidentCount = incidents.length
+  // ← CORRIGÉ : le badge doit refléter le vrai total backend, pas
+  // seulement ce qui est chargé en mémoire côté frontend -- avec 801
+  // incidents réels et seulement 100 chargés au démarrage, le badge
+  // affichait 100 (visible dans la capture d'écran). historyTotal est
+  // maintenant tenu à jour en continu : synchronisé au montage ET à
+  // chaque reconnexion WebSocket (syncHistoryFromBackend), incrémenté à
+  // chaque nouvel incident reçu en direct (voir handlerRef, bloc
+  // "alerte"). Math.max() protège uniquement la toute première fraction
+  // de seconde avant que /api/rapports n'ait répondu (historyTotal encore
+  // à 0 à ce moment-là).
+  const incidentCount = Math.max(incidents.length, historyTotal)
   const isHealthy     = alertCount === 0
 
-  // Noeuds + VMs dynamiques depuis cluster — plus aucun hardcode
   const noeudsLive = cluster?.noeuds || []
   const vmsLive    = cluster?.vms    || []
   const allAssets  = [
@@ -415,10 +592,45 @@ export default function App() {
   const C_GREEN     = '#22c55e'
   const C_MUTED     = '#4a5568'
   const C_SUB       = '#94a3b8'
-  const C_BORDER    = '#1e293b'
+  const C_BORDER    = '#1c2f4a'
+
+  // ← AJOUT : bloque l'accès à tout le reste tant que la session n'est
+  // pas vérifiée, ou l'affiche la page de connexion si elle est absente.
+  // Placé APRÈS toutes les déclarations de hooks (useState/useEffect/
+  // useCallback ci-dessus) -- jamais avant, un retour anticipé entre des
+  // hooks casserait les règles de React (nombre de hooks doit rester
+  // identique à chaque rendu).
+  if (!authChecked) {
+    return (
+      <div style={{ display:'flex', alignItems:'center', justifyContent:'center', height:'100vh', background:'#050a14', color:'#4a5568', fontSize:13, fontFamily:'JetBrains Mono, monospace' }}>
+        Loading...
+      </div>
+    )
+  }
+  if (!currentUser) {
+    return <PageAuth onAuthenticated={setCurrentUser} />
+  }
 
   return (
-    <div style={{ display:'flex', height:'100vh', background:'#050d1a', color:'#e2e8f0', fontFamily:"'Inter','Segoe UI',sans-serif", overflow:'hidden' }}>
+    <div style={{
+      display:'flex', height:'100vh', color:'#e2e8f0',
+      fontFamily:"'Inter','Segoe UI',sans-serif", overflow:'hidden',
+      // ← MODIFIÉ : aplat '#050d1a' -> dégradé bleu en profondeur.
+      // Trois couches superposées, uniquement en CSS (aucune image, donc
+      // rien à charger) :
+      //  1. une lueur bleue diffuse en haut à gauche, qui donne l'impression
+      //     d'une source de lumière plutôt qu'un fond plat ;
+      //  2. une seconde lueur, cyan et plus discrète, en bas à droite,
+      //     pour éviter que le dégradé paraisse unidirectionnel ;
+      //  3. un dégradé linéaire de base, du bleu nuit vers le presque-noir.
+      // C'est ce qui donne à la référence sa profondeur : la lumière ne
+      // vient pas de partout à la fois.
+      background:
+        'radial-gradient(1100px 700px at 12% -8%, rgba(37,99,235,0.16) 0%, transparent 62%),' +
+        'radial-gradient(900px 600px at 108% 108%, rgba(34,211,238,0.10) 0%, transparent 58%),' +
+        'linear-gradient(168deg, #071427 0%, #050c18 46%, #03070f 100%)',
+      backgroundAttachment: 'fixed',
+    }}>
       <style>{`
         *{box-sizing:border-box;margin:0;padding:0}
         html,body{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;text-rendering:optimizeLegibility}
@@ -432,18 +644,37 @@ export default function App() {
         textarea{resize:none;outline:none}
         button{font-family:inherit;cursor:pointer;border:none;background:none}
         h1,h2,h3{font-weight:800;letter-spacing:-0.02em}
-        .nav-btn:hover{background:rgba(59,130,246,0.10) !important;color:#f1f5f9 !important}
-        .nav-btn:hover svg{stroke:#3b82f6 !important}
+        .nav-btn:hover{background:rgba(34,211,238,0.10) !important;color:#f1f5f9 !important}
+        .nav-btn:hover svg{stroke:#22d3ee !important}
         .nav-btn{transition:all 0.12s}
+        /* ← AJOUT : trame géométrique très discrète sur le fond, comme les
+           lignes diagonales à peine visibles de la référence. Opacité
+           volontairement minime -- elle doit se deviner, jamais se
+           remarquer. pointer-events:none pour qu'elle n'intercepte aucun
+           clic. */
+        .fond-trame{
+          position:fixed; inset:0; pointer-events:none; z-index:0;
+          background-image:
+            linear-gradient(115deg, transparent 0%, transparent 49.6%, rgba(59,130,246,0.055) 49.8%, transparent 50%),
+            linear-gradient(65deg,  transparent 0%, transparent 49.6%, rgba(34,211,238,0.045) 49.8%, transparent 50%);
+          background-size: 340px 340px, 470px 470px;
+        }
+        /* Panneaux légèrement translucides : le dégradé du fond transparaît
+           à travers la barre latérale et l'en-tête, au lieu de les couper
+           par deux aplats opaques. */
+        .panneau-verre{
+          background: rgba(9,18,32,0.72) !important;
+          backdrop-filter: blur(14px);
+          -webkit-backdrop-filter: blur(14px);
+        }
       `}</style>
 
-      {/* ══════════════════════════ SIDEBAR ══════════════════════════ */}
-      <nav style={{ width:236, flexShrink:0, background:'#080f1e', borderRight:`1px solid ${C_BORDER}`, display:'flex', flexDirection:'column' }}>
+      <div className="fond-trame"/>
 
-        {/* ── Logo OpsPilot ── */}
+      <nav className="panneau-verre" style={{ width:236, flexShrink:0, borderRight:`1px solid ${C_BORDER}`, display:'flex', flexDirection:'column', position:'relative', zIndex:1 }}>
+
         <div style={{ padding:'18px 16px 16px', borderBottom:`1px solid ${C_BORDER}` }}>
           <div style={{ display:'flex', alignItems:'center', gap:11 }}>
-            {/* Logo SVG géométrique */}
             <svg width="34" height="34" viewBox="0 0 34 34" fill="none">
               <rect width="34" height="34" rx="9" fill="#0f2744"/>
               <polygon points="17,5 27,11 27,23 17,29 7,23 7,11" fill="none" stroke="#3b82f6" strokeWidth="1.5"/>
@@ -454,24 +685,38 @@ export default function App() {
             </svg>
             <div>
               <div style={{
-                fontSize: 18,
+                // ← MODIFIÉ : 18 -> 23px. Le nom du produit est l'élément
+                // le plus important de la barre latérale ; à 18px il pesait
+                // moins lourd que les libellés de navigation juste en
+                // dessous, ce qui inversait la hiérarchie.
+                fontSize: 23,
                 fontWeight: 800,
-                letterSpacing: '-0.04em',
-                background: 'linear-gradient(90deg, #60a5fa 0%, #a78bfa 100%)',
+                letterSpacing: '-0.035em',
+                // ← MODIFIÉ : le dégradé finissait sur du violet (#a78bfa),
+                // une couleur qui n'existe nulle part ailleurs dans
+                // l'interface. Remplacé par un vrai dégradé de BLEUS :
+                // bleu ciel pâle -> bleu franc, en diagonale (105deg
+                // plutôt que 90deg, pour que la transition suive le regard
+                // plutôt que de couper le mot horizontalement).
+                background: 'linear-gradient(105deg, #bae6fd 0%, #60a5fa 46%, #3b82f6 100%)',
                 WebkitBackgroundClip: 'text',
                 WebkitTextFillColor: 'transparent',
-                lineHeight: 1.1,
+                lineHeight: 1.05,
               }}>
                 OpsPilot
               </div>
-              <div style={{ fontSize:10, color:C_MUTED, letterSpacing:'0.14em', fontFamily:'JetBrains Mono, monospace', marginTop:3 }}>
+              {/* ← MODIFIÉ : marginTop 3 -> 7 (le sous-titre était collé au
+                  nom, les deux se lisaient comme un seul bloc), et couleur
+                  #4a5568 -> #3c5169, plus foncée. Un sur-titre de ce type
+                  doit se deviner, pas concurrencer le nom du produit --
+                  reste au-dessus du seuil de lisibilité sur ce fond. */}
+              <div style={{ fontSize:9.5, color:'#3c5169', letterSpacing:'0.16em', fontFamily:'JetBrains Mono, monospace', marginTop:7 }}>
                 CLUSTER INTELLIGENCE
               </div>
             </div>
           </div>
         </div>
 
-        {/* ── Navigation ── */}
         <div style={{ flex:1, padding:'8px 8px', display:'flex', flexDirection:'column', gap:1, overflowY:'auto' }}>
           <div style={{ fontSize:10, color:C_MUTED, letterSpacing:'0.13em', fontFamily:'JetBrains Mono, monospace', padding:'10px 8px 5px' }}>
             NAVIGATION
@@ -516,13 +761,11 @@ export default function App() {
 
         </div>
 
-        {/* ── Infrastructure Status dynamique ── */}
         <div style={{ padding:'12px 14px 14px', borderTop:`1px solid ${C_BORDER}` }}>
           <div style={{ fontSize:10, color:C_MUTED, letterSpacing:'0.13em', fontFamily:'JetBrains Mono, monospace', marginBottom:9 }}>
             INFRASTRUCTURE STATUS
           </div>
 
-          {/* Skeleton si pas encore chargé */}
           {allAssets.length === 0 ? (
             [0,1,2,3].map(i => (
               <div key={i} style={{ display:'flex', alignItems:'center', gap:8, marginBottom:7 }}>
@@ -544,7 +787,6 @@ export default function App() {
             ))
           )}
 
-          {/* Connexion + uptime */}
           <div style={{ marginTop:10, paddingTop:10, borderTop:`1px solid ${C_BORDER}`, display:'flex', justifyContent:'space-between', alignItems:'center', fontSize:11, color:C_MUTED, fontFamily:'JetBrains Mono, monospace' }}>
             <div style={{ display:'flex', alignItems:'center', gap:5 }}>
               <div style={{ width:6, height:6, borderRadius:'50%', background: connected ? C_GREEN : C_YELLOW, animation: connected ? 'none' : 'pulse 1.5s infinite' }}/>
@@ -555,15 +797,26 @@ export default function App() {
         </div>
       </nav>
 
-      {/* ══════════════════════ CONTENU PRINCIPAL ══════════════════════ */}
-      <div style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden' }}>
+      <div style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden', position:'relative', zIndex:1 }}>
 
-        {/* ── Header ── */}
-        <header style={{ height:52, borderBottom:`1px solid ${C_BORDER}`, background:'#080f1e', display:'flex', alignItems:'center', justifyContent:'space-between', padding:'0 24px', flexShrink:0 }}>
+        <header className="panneau-verre" style={{ height:52, borderBottom:`1px solid ${C_BORDER}`, display:'flex', alignItems:'center', justifyContent:'space-between', padding:'0 24px', flexShrink:0 }}>
           <div style={{ display:'flex', alignItems:'center', gap:10 }}>
             {Icons[currentPage?.icon]?.(true, C_BLUE)}
             <div>
-              <span style={{ fontWeight:800, fontSize:16, color:'#f1f5f9' }}>{currentPage?.label}</span>
+              {/* ← MODIFIÉ : blanc plat -> dégradé bleu clair/cyan, comme
+                  les titres de page eux-mêmes. Un blanc pur tranchait
+                  durement sur le nouveau fond bleu ; le dégradé s'y pose
+                  naturellement tout en restant parfaitement lisible. */}
+              {/* ← MODIFIÉ (3e passe) : ni blanc pur (dur), ni bleu (se
+                  confond avec le fond), ni blanc chaud -- un dégradé
+                  VERTICAL du blanc vers un gris-bleu très pâle. Le texte
+                  garde la lisibilité d'un blanc franc en haut et gagne
+                  une légère profondeur vers le bas, technique courante
+                  sur les interfaces produit soignées où un aplat blanc
+                  paraît toujours un peu brut. */}
+              <span style={{ fontWeight:800, fontSize:16, letterSpacing:'-0.01em',
+                             background:'linear-gradient(180deg, #ffffff 0%, #b9c9dd 130%)',
+                             WebkitBackgroundClip:'text', WebkitTextFillColor:'transparent' }}>{currentPage?.label}</span>
               <span style={{ fontSize:12, color:C_MUTED, marginLeft:10 }}>{currentPage?.desc}</span>
             </div>
           </div>
@@ -584,22 +837,27 @@ export default function App() {
               <div style={{ width:6, height:6, borderRadius:'50%', background: isHealthy ? C_GREEN : C_RED }}/>
               {isHealthy ? 'OPERATIONAL' : 'INCIDENT ACTIVE'}
             </div>
+            {/* ← MODIFIÉ : nom + Change password + Sign out consolidés en un
+                seul bouton foncé (le nom lui-même) qui ouvre un menu --
+                remplace les trois éléments séparés précédents. */}
+            <div style={{ paddingLeft: 14, borderLeft: `1px solid ${C_BORDER}` }}>
+              <UserMenuButton user={currentUser} onChangePassword={() => setShowChangePwd(true)} onLogout={handleLogout} />
+            </div>
           </div>
         </header>
 
-        {/* ── Pages ── */}
         <main style={{ flex:1, overflow:page==='assistant'?'hidden':'auto', padding:'20px 24px', display:'flex', flexDirection:'column' }}>
           {page==='dashboard'       && <PageDashboard       cluster={cluster} history={history} incidents={incidents} agentLog={agentLog} dernier_lstm={dernierLstm}/>}
           {page==='infrastructure'  && <PageInfrastructure  cluster={cluster} history={history}/>}
           {page==='incidents'       && <PageIncidents       incidents={incidents} historyTotal={historyTotal} historyOffset={historyOffset} loadingMore={loadingMore} onLoadMore={loadMoreHistory}/>}
-          {/* ← MODIFIÉ : ajout de stale={reglesStale} (point 3/9, bandeau STALE) */}
           {page==='rules'           && <PageMonitoringRules reglesDynamiques={reglesDyn} stale={reglesStale}/>}
-          {page==='recommendations' && <PageRecommendations suggestions={suggestions} vms={vmsLive} hasHistory={incidents.length > 0}/>}
+          {page==='recommendations' && <PageRecommendations suggestions={suggestions} vms={vmsLive} hasHistory={incidents.length > 0} onResolve={resolveRecommendation} onDelete={deleteRecommendation}/>}
           {page==='log'             && <PageSystemLog       agentLog={agentLog}/>}
           {page==='assistant'       && <PageAssistant messages={chatMessages} thinking={thinking} input={chatInput} setInput={setChatInput} onSend={sendChat} onEdit={editChat} onClear={clearChat} connected={connected} send={send}/>}
         </main>
       </div>
 
+      {showChangePwd && <ChangePasswordModal onClose={() => setShowChangePwd(false)} />}
     </div>
   )
 }

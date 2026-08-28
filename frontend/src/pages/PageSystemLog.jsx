@@ -9,7 +9,9 @@ export function PageSystemLog({ agentLog }) {
     <div style={{ display:'flex', flexDirection:'column', gap:16, height:'100%' }}>
       <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
         <div>
-          <h2 style={{ fontSize:22, fontWeight:800, color:C.text, marginBottom:6 }}>System Audit Log</h2>
+          <h2 style={{ fontSize:22, fontWeight:800, marginBottom:6, letterSpacing:'-0.02em',
+                         background:'linear-gradient(180deg, #ffffff 0%, #b9c9dd 130%)',
+                         WebkitBackgroundClip:'text', WebkitTextFillColor:'transparent' }}>System Audit Log</h2>
           <div style={{ fontSize:13, color:C.sub }}>Real-time operational event stream</div>
         </div>
         <div style={{ display:'flex', alignItems:'center', gap:8 }}>

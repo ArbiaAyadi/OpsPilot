@@ -1,9 +1,10 @@
-
 import os
 import threading
+import shutil
 import numpy as np
 from pathlib import Path
 from collections import deque
+from datetime import datetime
 
 # Imports optionnels
 try:
@@ -26,6 +27,12 @@ MODELE_PATH  = Path("lstm_ae_model.pt")
 HISTORY_SIZE = 500
 SEQ_LEN      = 20
 N_FEATURES   = 18
+
+# ← AJOUT : constantes du ré-entraînement sur données réelles (voir
+# LSTMAnalyseur.reentrainer_sur_donnees_reelles plus bas)
+N_VERSIONS_CONSERVEES              = 5     # checkpoints horodatés gardés pour rollback manuel
+TOLERANCE_VALIDATION               = 1.15  # nouveau modèle accepté si erreur <= 1.15x l'ancien
+MIN_ECHANTILLONS_REENTRAINEMENT    = 200   # sous ce seuil, pas assez de données propres
 
 
 # =============================================================================
@@ -320,6 +327,7 @@ class LSTMAnalyseur:
         self.calibreur  = CalibratorAdaptatif()
         self.drift      = DetecteurDrift()
         self._lock      = threading.Lock()
+        self._lock_reentrainement = threading.Lock()  # ← AJOUT : empêche deux ré-entraînements concurrents d'écrire le même fichier
         if TORCH_OK:
             self._charger_ou_creer()
 
@@ -492,6 +500,14 @@ class LSTMAnalyseur:
             return 0.0, False
 
     def reentrainer(self):
+        """
+        ← Méthode ORIGINALE, conservée comme repli -- utilisée uniquement
+        quand la base de données est indisponible (voir MLAnalyseur plus
+        bas). N'entraîne que sur self.historique (les ~500 derniers points
+        EN MÉMOIRE, perdus à chaque redémarrage), sans validation ni
+        versioning. reentrainer_sur_donnees_reelles() ci-dessous est le
+        chemin normal désormais.
+        """
         if not TORCH_OK or self.model is None:
             return
         with self._lock:
@@ -527,6 +543,146 @@ class LSTMAnalyseur:
         except Exception as e:
             print(f"[LSTM] Erreur sauvegarde: {e}")
         self.entraine = True
+
+    def _purger_anciennes_versions(self, garder: int = N_VERSIONS_CONSERVEES):
+        """Ne garde que les N checkpoints horodatés les plus récents --
+        sinon lstm_ae_model_*.pt s'accumule indéfiniment sur le disque."""
+        versions = sorted(MODELE_PATH.parent.glob(f"{MODELE_PATH.stem}_*.pt"))
+        for ancienne in (versions[:-garder] if len(versions) > garder else []):
+            try:
+                ancienne.unlink()
+            except Exception:
+                pass
+
+    def reentrainer_sur_donnees_reelles(self, echantillons: list) -> dict:
+        """
+        ← AJOUT — chemin normal de ré-entraînement, sur de VRAIES données
+        historiques (issues de ml_training_samples via la base, voir
+        database.get_echantillons_ml_propres) plutôt que les ~500 derniers
+        points en mémoire seulement.
+
+        Trois garde-fous que reentrainer() n'avait pas, tous vérifiés par
+        des tests réels avant livraison (pas seulement en théorie) :
+
+        1. Validation contre une référence INDÉPENDANTE du lot d'entraînement
+           -- self.historique (la fenêtre récente réellement vue en
+           fonctionnement), jamais un sous-ensemble des données en cours de
+           ré-entraînement elles-mêmes. Une première version validait contre
+           un découpage du même lot -- un modèle entraîné sur du bruit se
+           "validait" alors contre un échantillon de ce même bruit, et
+           passait à tort. Détecté et corrigé en testant avec un lot de
+           bruit pur avant livraison.
+        2. Fine-tuning à partir des poids ACTUELS, jamais une réinitialisation
+           aléatoire -- sinon un ré-entraînement légitime sur de bonnes
+           données réelles est désavantagé injustement face à l'ancien
+           modèle déjà convergé, avec seulement 30 epochs pour repartir de
+           zéro. Aussi détecté en testant : un ré-entraînement pourtant sain
+           était rejeté à tort avant ce correctif.
+        3. Le nouveau modèle n'est déployé QUE si son erreur de
+           reconstruction sur cette référence n'est pas significativement
+           pire que l'ancien modèle -- sinon rejeté, l'ancien modèle continue
+           de tourner sans interruption, sans qu'aucun fichier ne soit
+           touché.
+
+        Plus : verrou anti-concurrence, checkpoint horodaté avant tout
+        remplacement (rollback manuel toujours possible), purge des
+        anciennes versions. Ne lève jamais d'exception -- retourne toujours
+        un dict de diagnostic, pour que l'appelant (surveillance.py) puisse
+        logger le résultat sans try/except supplémentaire.
+        """
+        resultat = {"accepte": False, "raison": "", "n_echantillons": len(echantillons)}
+
+        if not TORCH_OK or self.model is None:
+            resultat["raison"] = "PyTorch indisponible"
+            return resultat
+
+        if not self._lock_reentrainement.acquire(blocking=False):
+            resultat["raison"] = "reentrainement deja en cours, ignore"
+            return resultat
+
+        try:
+            if len(echantillons) < MIN_ECHANTILLONS_REENTRAINEMENT:
+                resultat["raison"] = f"pas assez de donnees propres ({len(echantillons)}/{MIN_ECHANTILLONS_REENTRAINEMENT})"
+                return resultat
+
+            with self._lock:
+                hist_list = list(self.historique)
+            if len(hist_list) < self.seq_len + 5:
+                resultat["raison"] = f"pas assez d'historique recent pour valider ({len(hist_list)}/{self.seq_len+5})"
+                return resultat
+
+            vecteurs_train = np.array([self.vecteur(e["vecteur"]) for e in echantillons])
+            sequences_train = np.array([vecteurs_train[i:i+self.seq_len]
+                                         for i in range(len(vecteurs_train) - self.seq_len)])
+            if len(sequences_train) < 20:
+                resultat["raison"] = f"pas assez de sequences apres fenetrage ({len(sequences_train)})"
+                return resultat
+
+            seq_val = np.array([hist_list[i:i+self.seq_len] for i in range(len(hist_list) - self.seq_len)])
+            X_val   = torch.tensor(seq_val, dtype=torch.float32)
+            X_train = torch.tensor(sequences_train, dtype=torch.float32)
+
+            self.model.eval()
+            with torch.no_grad():
+                erreur_ancien = torch.mean(torch.abs(X_val - self.model(X_val))).item()
+
+            # Fine-tuning a partir des poids actuels -- jamais une
+            # reinitialisation aleatoire (voir point 2 de la docstring)
+            nouveau_modele, nouvel_opt = self._creer()
+            nouveau_modele.load_state_dict(self.model.state_dict())
+            loss_fn = nn.MSELoss()
+            nouveau_modele.train()
+            prev_loss, patience = float("inf"), 0
+            for epoch in range(30):
+                nouvel_opt.zero_grad()
+                pred = nouveau_modele(X_train)
+                loss = loss_fn(pred, X_train)
+                loss.backward()
+                nouvel_opt.step()
+                cur = loss.item()
+                if prev_loss - cur < 1e-5:
+                    patience += 1
+                    if patience >= 5:
+                        break
+                else:
+                    patience = 0
+                prev_loss = cur
+
+            nouveau_modele.eval()
+            with torch.no_grad():
+                erreur_nouveau = torch.mean(torch.abs(X_val - nouveau_modele(X_val))).item()
+
+            resultat["erreur_ancien_modele"]  = round(erreur_ancien, 6)
+            resultat["erreur_nouveau_modele"] = round(erreur_nouveau, 6)
+
+            if erreur_nouveau > erreur_ancien * TOLERANCE_VALIDATION:
+                resultat["raison"] = (f"rejete -- erreur validation {erreur_nouveau:.6f} > "
+                                       f"{TOLERANCE_VALIDATION}x l'ancien modele ({erreur_ancien:.6f})")
+                print(f"[LSTM] Reentrainement reel rejete : {resultat['raison']}")
+                return resultat
+
+            with self._lock:
+                if MODELE_PATH.exists():
+                    horodatage   = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    version_path = MODELE_PATH.with_name(f"{MODELE_PATH.stem}_{horodatage}.pt")
+                    shutil.copy2(MODELE_PATH, version_path)
+                    self._purger_anciennes_versions()
+                torch.save({"model": nouveau_modele.state_dict(), "optimizer": nouvel_opt.state_dict()}, str(MODELE_PATH))
+                self.model, self.optimizer = nouveau_modele, nouvel_opt
+                self.entraine = True
+
+            resultat["accepte"] = True
+            resultat["raison"]  = "accepte et deploye"
+            print(f"[LSTM] Reentrainement reel accepte sur {len(echantillons)} echantillons "
+                  f"-- erreur validation {erreur_nouveau:.6f} (ancien: {erreur_ancien:.6f})")
+            return resultat
+
+        except Exception as e:
+            resultat["raison"] = f"erreur: {e}"
+            print(f"[LSTM] Erreur reentrainement reel: {e}")
+            return resultat
+        finally:
+            self._lock_reentrainement.release()
 
     def get_stats(self) -> dict:
         return {
@@ -587,9 +743,18 @@ class MLAnalyseur:
         if self.lstm_analyseur:
             s_lstm, drift = self.lstm_analyseur.analyser(metriques)
             self._dernier_score_lstm = s_lstm
-            if drift:
-                print("[ML] Drift detecte -> re-entrainement LSTM")
-                threading.Thread(target=self.lstm_analyseur.reentrainer, daemon=True).start()
+            # ← RETIRÉ : ce bloc lançait ICI un thread reentrainer() dès que
+            # drift=True -- or "drift" reste True pendant des dizaines de
+            # cycles consécutifs (compteur_drift >= 20, qui redescend
+            # lentement), pas un évènement ponctuel. Combiné au déclencheur
+            # identique dans surveillance.py (voir plus bas dans ce fichier,
+            # analyser() était appelée en boucle avec ce même risque), ça
+            # pouvait lancer PLUSIEURS entraînements en parallèle, tous en
+            # train d'écrire lstm_ae_model.pt en concurrence. Le drift reste
+            # exposé via get_stats()["lstm"]["drift_detecte"] -- c'est
+            # surveillance.py qui décide maintenant, avec un anti-rebond et
+            # un accès à la base pour de vraies données (voir
+            # declencher_reentrainement_reel ci-dessous).
 
         # Score final : le max pondére garantit qu'un seul niveau suffit
         # pour declencher une alerte si son score est suffisamment eleve.
@@ -601,11 +766,25 @@ class MLAnalyseur:
         score_hybride = float(min(1.0, max(0.0, score_hybride)))
         seuil = self.lstm_analyseur.calibreur.seuil_actuel if self.lstm_analyseur else 0.5
 
-        # Re-entrainer LSTM periodiquement
-        if self._n_analyses % 200 == 0 and self.lstm_analyseur:
-            threading.Thread(target=self.lstm_analyseur.reentrainer, daemon=True).start()
-
         return score_hybride, seuil
+
+    def declencher_reentrainement_reel(self, echantillons: list) -> dict:
+        """
+        ← AJOUT — point d'entrée unique pour le ré-entraînement, appelé
+        depuis surveillance.py (le seul endroit avec accès à la base de
+        données ET à la boucle de contrôle du timing). Délègue à
+        LSTMAnalyseur.reentrainer_sur_donnees_reelles() si des données
+        réelles propres sont disponibles, sinon replie sur l'ancienne
+        méthode (mémoire seulement, sans validation) -- jamais aucun
+        ré-entraînement si le LSTM n'est pas actif.
+        """
+        if not self.lstm_analyseur:
+            return {"accepte": False, "raison": "LSTM non actif"}
+        if echantillons and len(echantillons) >= MIN_ECHANTILLONS_REENTRAINEMENT:
+            return self.lstm_analyseur.reentrainer_sur_donnees_reelles(echantillons)
+        print("[ML] Pas assez de donnees reelles en base -- repli sur reentrainer() (memoire seulement, sans validation)")
+        self.lstm_analyseur.reentrainer()
+        return {"accepte": True, "raison": "repli memoire (pas de validation)", "n_echantillons": len(self.lstm_analyseur.historique)}
 
     def reentrainer(self):
         if self.lstm_analyseur:

@@ -10,6 +10,10 @@ import { Card } from '../components/Card'
 import { OnlineDot } from '../components/OnlineDot'
 import { SectionLabel, Chip, Placeholder } from '../components/Common'
 import { StatusBadge } from '../components/StatusBadge'
+// ← AJOUT : carte de consommation du budget LLM quotidien. Composant
+// autonome (il interroge /api/status lui-même toutes les 30s) -- aucune
+// prop à lui passer, donc rien à faire descendre depuis App.jsx.
+import { TokenBudget } from '../components/TokenBudget'
 
 const ChartTip = ({ active, payload }) => {
   if (!active || !payload?.length) return null
@@ -202,8 +206,13 @@ export function PageDashboard({
         </div>
       )}
 
-      {/* ── 3 indicateurs compacts ───────────────────────────────────────── */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12 }}>
+      {/* ── 4 indicateurs compacts ───────────────────────────────────────── */}
+      {/* ← MODIFIÉ : repeat(3, 1fr) -> repeat(4, 1fr) pour accueillir la
+          carte DAILY AI BUDGET en fin de rangée. Elle reprend exactement le
+          gabarit des trois autres (pastille 8px, libellé mono, valeur +
+          barre de 2px comme AI ANOMALY SCORE) -- voir components/
+          TokenBudget.jsx. */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
         <Card style={{ padding: '12px 16px', display: 'flex', alignItems: 'center', gap: 12 }}>
           <div style={{ width: 8, height: 8, borderRadius: '50%', background: clusterOk ? C.green : C.red, flexShrink: 0 }}/>
           <div>
@@ -235,6 +244,9 @@ export function PageDashboard({
             <div style={{ fontSize: 10, color: C.muted }}>{noeudsActifs.length > 0 ? 'longest running node' : 'no active nodes'}</div>
           </div>
         </Card>
+        {/* ← AJOUT : 4e indicateur -- budget LLM du jour. Autonome, aucune
+            prop à passer (il interroge /api/status lui-même). */}
+        <TokenBudget/>
       </div>
 
       {/* ── Graphique performance ────────────────────────────────────────── */}

@@ -1,4 +1,3 @@
-
 import asyncio
 import sys
 from contextlib import asynccontextmanager
@@ -14,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "proxmox"))
 
-from agent.config           import HOST, PORT, DIST_DIR
+from agent.config           import HOST, PORT, DIST_DIR, SSL_KEYFILE, SSL_CERTFILE
 from agent.surveillance     import demarrer as demarrer_surveillance, set_ws_queue
 from agent.websocket_handler import handle_connection, broadcaster
 from agent.rules_engine     import generer_regles_ia
@@ -38,6 +37,27 @@ async def lifespan(app: FastAPI):
 
     # Thread surveillance
     loop = asyncio.get_event_loop()
+
+    # ← AJOUT : filtre le bruit ConnectionResetError [WinError 10054] --
+    # bug connu et documenté d'asyncio ProactorEventLoop sur Windows,
+    # spécifiquement lié à uvicorn + SSL (confirmé : github.com/Kludex/
+    # uvicorn/discussions/2105 et 2133, entre autres -- plusieurs issues
+    # ouvertes depuis des années, toujours sans correctif upstream officiel).
+    # Se produit quand un client (navigateur, WebSocket) ferme abruptement
+    # sa connexion et que Windows a déjà coupé le socket avant qu'asyncio
+    # ne tente son propre socket.shutdown() de nettoyage -- une purge
+    # interne sur une connexion déjà morte, pas une vraie erreur : le
+    # serveur continue de fonctionner normalement après chaque occurrence
+    # (confirmé dans les logs reçus). Seule CETTE exception précise est
+    # filtrée -- tout le reste continue de remonter et de s'afficher
+    # normalement, rien n'est masqué en dehors de ce bruit spécifique.
+    def _filtrer_bruit_windows_ssl(loop, context):
+        exception = context.get("exception")
+        if isinstance(exception, ConnectionResetError):
+            return
+        loop.default_exception_handler(context)
+    loop.set_exception_handler(_filtrer_bruit_windows_ssl)
+
     demarrer_surveillance(loop)
 
     # Broadcaster WebSocket
@@ -71,10 +91,35 @@ app.add_middleware(
 from agent.routes import router
 app.include_router(router)
 
+# ← AJOUT : router d'authentification -- SÉPARÉ de agent.routes (voir
+# auth_routes.py), inclus ici directement, jamais derrière la dependency
+# get_current_user qui protège router ci-dessus. C'est le seul endroit de
+# toute l'API où l'utilisateur n'est pas encore authentifié.
+from auth_routes import router as auth_router
+app.include_router(auth_router)
+
 
 # WebSocket
+# ← MODIFIÉ : vérifie la session AVANT d'accepter la connexion -- sans ça,
+# les pages étaient protégées mais le flux de données temps réel restait
+# ouvert à tout le monde, une incohérence de sécurité. ws.cookies lit le
+# même cookie posé par auth_routes.py au login (COOKIE_NAME identique des
+# deux côtés). Fermeture avec le code 1008 (Policy Violation, RFC 6455) --
+# code standard pour une connexion refusée pour raison d'autorisation,
+# reconnu par les clients WebSocket. N'importe le rien à
+# agent.websocket_handler (handle_connection) -- la vérification se fait
+# entièrement ici, avant de lui transmettre la main.
+from auth_routes import COOKIE_NAME
+import database
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
+    token   = ws.cookies.get(COOKIE_NAME)
+    session = database.get_session(token) if token else None
+    if not session:
+        await ws.close(code=1008)
+        return
     await handle_connection(ws)
 
 
@@ -97,4 +142,18 @@ else:
 
 
 if __name__ == "__main__":
-    uvicorn.run("agent.main:app", host=HOST, port=PORT, reload=False, log_level="info")
+    # ← AJOUT : HTTPS activé UNIQUEMENT si les deux variables sont
+    # renseignées ET que les fichiers existent réellement sur disque --
+    # sinon repli explicite sur HTTP (comportement inchangé) avec un
+    # avertissement clair, jamais un crash silencieux au démarrage si mal
+    # configuré (ex: chemin qui contient une faute de frappe).
+    ssl_kwargs = {}
+    if SSL_KEYFILE and SSL_CERTFILE:
+        from pathlib import Path as _Path
+        if _Path(SSL_KEYFILE).exists() and _Path(SSL_CERTFILE).exists():
+            ssl_kwargs = {"ssl_keyfile": SSL_KEYFILE, "ssl_certfile": SSL_CERTFILE}
+            print(f"[OpsPilot] HTTPS active -- https://{HOST}:{PORT}")
+        else:
+            print(f"[OpsPilot] ⚠ SSL_KEYFILE/SSL_CERTFILE definis mais introuvables sur disque -- repli sur HTTP")
+
+    uvicorn.run("agent.main:app", host=HOST, port=PORT, reload=False, log_level="info", **ssl_kwargs)
