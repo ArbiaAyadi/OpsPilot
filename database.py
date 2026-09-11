@@ -56,7 +56,16 @@ DB_CONFIG = {
     "port":     int(os.getenv("DB_PORT", "5432")),
     "dbname":   os.getenv("DB_NAME", "opspilot"),
     "user":     os.getenv("DB_USER", "opspilot"),
-    "password": os.getenv("DB_PASSWORD", "opspilot_secret"),
+    # ← CORRIGÉ (exposition réelle) : la valeur par défaut était le mot
+    # de passe RÉEL de la base. Ce dépôt étant public, il était lisible
+    # par n'importe qui sur GitHub -- une valeur par défaut n'est pas un
+    # secret, c'est du code source. Un identifiant ne doit JAMAIS avoir
+    # de valeur par défaut : mieux vaut un démarrage qui échoue avec un
+    # message clair qu'un démarrage silencieux avec un mot de passe
+    # publié. Même principe que PROXMOX_TOKEN_SECRET et SSH_PASSWORD,
+    # déjà à "" ailleurs dans ce projet -- cette ligne était la seule
+    # exception.
+    "password": os.getenv("DB_PASSWORD", ""),
     # ← AJOUT : sans timeout explicite, une tentative de connexion vers un
     # hôte injoignable (coupure réseau, VM éteinte...) peut rester bloquée
     # bien plus longtemps que ça avant d'échouer (dépend du système) --
@@ -65,6 +74,14 @@ DB_CONFIG = {
     # vite et proprement plutôt que de laisser une requête pendre.
     "connect_timeout": int(os.getenv("DB_CONNECT_TIMEOUT_S", "5")),
 }
+
+# ← AJOUT : sans mot de passe, la connexion échouera avec une erreur
+# d'authentification peu explicite ("password authentication failed"),
+# qui oriente vers un mauvais mot de passe alors qu'il est simplement
+# absent. Ce message le dit d'emblée, au démarrage.
+if not DB_CONFIG["password"]:
+    print("[DB] ⚠ DB_PASSWORD absent de .env — la connexion PostgreSQL va echouer")
+    print("[DB]   Ajoute : DB_PASSWORD=<mot_de_passe> dans ton fichier .env")
 
 _pool: Optional[object] = None
 DB_OK = False
