@@ -57,16 +57,16 @@ function ActionButton({ actionId, params, risk, onSuccess }) {
       const data = await r.json()
       setStatus(data.ok ? 'success' : 'error')
       setMessage(data.message || data.error || '')
-      // ← CORRIGÉ : onSuccess() (qui fait disparaître toute la carte
-      // parente) était appelé DANS LA MÊME FONCTION, juste après
-      // setStatus('success') -- React n'avait pas le temps de peindre le
-      // message de confirmation vert avant que le parent ne retire la
-      // carte entière. Résultat concret : cliquer "Accepter & Exécuter"
-      // faisait disparaître toute la recommendation sans jamais voir la
-      // confirmation -- exactement ce qui ressemble à "la recommendation
-      // disparaît" sans raison apparente. Délai de 2s : assez pour que le
-      // message soit lu, assez court pour ne pas sembler bloqué.
-      if (data.ok && onSuccess) setTimeout(onSuccess, 2000)
+      // ← SIMPLIFIÉ : le délai de 2s n'a plus de raison d'être. Il servait
+      // à laisser voir la confirmation avant que la carte ne disparaisse
+      // -- or la carte ne disparaît plus (voir le rendu des étapes, plus
+      // bas : onActionSuccess n'est plus passé). Le message de succès
+      // reste maintenant affiché tant que la carte est ouverte, ce qui
+      // permet aussi de voir d'un coup d'œil quelles étapes ont déjà été
+      // appliquées avant de traiter les suivantes.
+      // onSuccess reste supporté pour un appelant qui en aurait besoin,
+      // mais n'est plus utilisé par la page Recommendations.
+      if (data.ok && onSuccess) onSuccess()
     } catch (e) {
       setStatus('error')
       setMessage('Erreur réseau')
@@ -448,7 +448,28 @@ function RecoCard({ s, vms, resolved = false, onResolve, onDelete, selectionMode
                 {(structured.steps || []).length === 0 ? (
                   <div style={{ fontSize: 12, color: C.muted, fontStyle: 'italic' }}>No steps returned.</div>
                 ) : (
-                  structured.steps.map((step, i) => <StepRow key={i} step={step} onActionSuccess={resolved ? undefined : resolve} />)
+                  /* ← CORRIGÉ (bug constaté en conditions réelles) :
+                     onActionSuccess={resolve} était passé à CHAQUE étape.
+                     Exécuter une seule action marquait donc la
+                     recommendation ENTIÈRE comme résolue, et la carte
+                     disparaissait avec toutes les étapes non encore
+                     traitées -- impossible d'accepter la 2e action, ni
+                     même de refuser la 3e après avoir accepté la 1re.
+
+                     Un plan d'action a par nature plusieurs étapes, dont
+                     certaines volontairement refusées (cas réel : migrer
+                     vers un nœud plus chargé). Résoudre au premier clic
+                     supprime précisément le choix que ce système existe
+                     pour offrir.
+
+                     La carte ne se résout donc plus automatiquement : on
+                     ne passe plus onActionSuccess du tout. Chaque étape
+                     garde son état individuel (succès vert, échec rouge),
+                     et c'est l'utilisateur qui décide, via le bouton
+                     "Resolve" en haut de la carte, quand le problème est
+                     réellement traité -- lui seul sait si toutes les
+                     étapes utiles ont été appliquées. */
+                  structured.steps.map((step, i) => <StepRow key={i} step={step} />)
                 )}
               </div>
 

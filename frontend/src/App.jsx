@@ -359,7 +359,19 @@ export default function App() {
         cibleNoeud?.toLowerCase().includes(n.nom?.toLowerCase())
       ) || cluster?.noeuds?.[0] || {}
 
-      setSuggestions(s=>[...s, {
+      // ← CORRIGÉ (compteur qui chute au rafraîchissement) : cette liste
+      // AJOUTAIT systématiquement chaque recommendation reçue, alors que
+      // le backend, lui, FUSIONNE par cible (voir database.py,
+      // sauvegarder_recommendation : une seconde alerte sur pve2 met à
+      // jour la ligne existante au lieu d'en créer une nouvelle). Les deux
+      // divergeaient donc immédiatement : 6 cartes à l'écran pour 3 lignes
+      // réellement en base, et le rafraîchissement — qui relit la base —
+      // faisait tomber le compte à 3. Le nombre affiché en direct était le
+      // faux ; celui d'après rafraîchissement était le vrai.
+      // On applique désormais la MÊME règle côté frontend : si une
+      // recommendation porte un recommendation_id déjà présent, elle
+      // REMPLACE l'entrée existante au lieu de s'y ajouter.
+      const nouvelleSuggestion = {
         structured,
         // ← AJOUT : id assigné par la base au moment de la sauvegarde
         // (voir surveillance.py) -- permet de marquer cette recommendation
@@ -398,7 +410,20 @@ export default function App() {
         corosync_ok:               noeudLive.corosync_ok               ?? null,
         corosync_quorum_ok:        noeudLive.corosync_quorum_ok        ?? null,
         load_avg_1m:               noeudLive.load_avg_1m               ?? null,
-      }])
+      }
+      setSuggestions(s => {
+        const id = nouvelleSuggestion.recommendation_id
+        // Sans id (repli mémoire côté backend, ou sauvegarde échouée), on
+        // ne peut pas identifier de doublon de façon fiable -- on ajoute,
+        // comme avant, plutôt que de risquer d'écraser une entrée
+        // différente.
+        if (id == null) return [...s, nouvelleSuggestion]
+        const idx = s.findIndex(sug => sug.recommendation_id === id)
+        if (idx === -1) return [...s, nouvelleSuggestion]
+        const copie = [...s]
+        copie[idx] = nouvelleSuggestion   // rafraîchit la carte existante
+        return copie
+      })
 
       setIncidents(a=>[...a, {
         anomalies: data.anomalies || [],

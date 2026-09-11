@@ -634,13 +634,69 @@ STRICT RULES:
         return _regles_ia
     reponse = re.sub(r'<think>.*?</think>', '', reponse, flags=re.DOTALL).strip()
 
+    # ← AJOUT (diagnostic trompeur constaté) : appeler_groq() ne lève
+    # jamais -- en cas d'échec, il RETOURNE une chaîne d'erreur lisible
+    # ("Groq temporarily unavailable...", "Cle Groq invalide...", "Groq
+    # API non configure..."). Cette chaîne ne contient évidemment aucun
+    # JSON, et tombait donc dans "aucun JSON trouve dans la reponse LLM"
+    # -- un message qui oriente vers un problème de FORMAT de sortie du
+    # modèle, alors que la vraie cause est qu'on n'a jamais atteint le
+    # modèle. Diagnostic radicalement différent, remède radicalement
+    # différent : attendre la fin d'une limitation n'a rien à voir avec
+    # ajuster un prompt.
+    _ERREURS_CLIENT = (
+        "Groq temporarily unavailable",
+        "Groq API non configure",
+        "Cle Groq invalide",
+    )
+    if any(reponse.strip().startswith(e) for e in _ERREURS_CLIENT):
+        _marquer_echec(f"le modele n'a pas ete atteint -- {reponse.strip()[:90]}")
+        return _regles_ia
+
     try:
         json_match = re.search(r'\[.*?\]', reponse, re.DOTALL)
         if not json_match:
-            _marquer_echec("aucun JSON trouve dans la reponse LLM")
-            return _regles_ia
+            # ← AJOUT (cas réel : 10875 caractères de JSON PARFAITEMENT
+            # VALIDE rejetés en bloc) : quand la réponse est tronquée, le
+            # crochet fermant du tableau manque, la recherche échoue, et
+            # TOUTES les règles déjà correctement formées sont perdues --
+            # une trentaine dans le cas observé, pour une seule règle
+            # incomplète à la fin.
+            #
+            # C'est un mauvais compromis : chaque règle est un objet JSON
+            # INDÉPENDANT. Rien ne justifie de jeter les 33 premières
+            # parce que la 34e est coupée. On récupère donc tous les
+            # objets complets, et on ignore le fragment final.
+            #
+            # Augmenter max_tokens ne règle pas le problème durablement :
+            # il suffit que l'infrastructure grandisse pour retomber
+            # dessus. Cette récupération, elle, tient quelle que soit la
+            # taille de la réponse.
+            if reponse.lstrip().startswith('['):
+                objets = re.findall(r'\{[^{}]*\}', reponse, re.DOTALL)
+                recuperees = []
+                for o in objets:
+                    try:
+                        recuperees.append(json.loads(o))
+                    except json.JSONDecodeError:
+                        continue   # fragment final incomplet -- attendu, ignoré
+                if recuperees:
+                    print(f"[AI Rules] Reponse tronquee -- {len(recuperees)} regles completes "
+                          f"recuperees sur {len(objets)} objets detectes "
+                          f"(la derniere, incomplete, est ignoree)")
+                    regles = recuperees
+                    json_match = None   # on saute le parsing normal plus bas
+                else:
+                    _marquer_echec(f"reponse tronquee, aucune regle complete recuperable "
+                                   f"(longueur: {len(reponse)} caracteres)")
+                    return _regles_ia
+            else:
+                _marquer_echec(f"aucun JSON trouve (longueur: {len(reponse)} caracteres, "
+                               f"debut: '{reponse[:80]}')")
+                return _regles_ia
+        else:
+            regles = json.loads(json_match.group())
 
-        regles = json.loads(json_match.group())
         if not (isinstance(regles, list) and len(regles) > 0):
             _marquer_echec("JSON parse mais vide ou de mauvais type")
             return _regles_ia
@@ -730,6 +786,23 @@ def regles_services_actives(etat: dict) -> list:
     # casse entre deux sources différentes.
     services_normalises = {str(s).lower() for s in services_detectes}
 
+    # ← AJOUT : commandes de diagnostic RÉELLES par service, à la place
+    # d'un commentaire pointant vers un fichier source. Un ingénieur qui
+    # consulte la page Monitoring Rules veut savoir QUOI TAPER quand
+    # l'alerte se déclenche -- pas dans quel fichier Python le seuil est
+    # défini. Le renvoi au code s'adressait à un développeur relisant le
+    # projet, jamais à l'utilisateur du tableau de bord.
+    _DIAGNOSTIC_SERVICE = {
+        ("postgresql", "cache_hit_pct"):  "psql -c \"SELECT datname, blks_hit, blks_read FROM pg_stat_database WHERE datname='opspilot';\"",
+        ("postgresql", "rollback_rate"):  "psql -c \"SELECT datname, xact_commit, xact_rollback FROM pg_stat_database WHERE datname='opspilot';\"",
+        ("postgresql", "latency_ms"):     "pg_isready && psql -c \"SELECT count(*) FROM pg_stat_activity WHERE state='active';\"",
+        ("postgresql", "scrape_ok"):      "systemctl status postgres_exporter && curl -s localhost:9187/metrics | head",
+        ("docker",     "total_disk_gb"):  "docker system df -v",
+        ("prometheus", "series_actives"): "curl -s localhost:9090/api/v1/status/tsdb | head -30",
+        ("prometheus", "chunks_memoire"): "curl -s localhost:9090/api/v1/status/tsdb | head -30",
+        ("prometheus", "config_ok"):      "curl -s localhost:9090/api/v1/status/config | head && promtool check config /etc/prometheus/prometheus.yml",
+    }
+
     regles = []
     for (svc, champ), (warn, crit, inverse) in SEUILS_METRIQUES_SERVICE.items():
         if str(svc).lower() not in services_normalises:
@@ -741,9 +814,12 @@ def regles_services_actives(etat: dict) -> list:
             "operateur": "<" if inverse else ">", "seuil": crit,
             "duree_min": 0, "severite": "CRITIQUE", "cible": svc,
             "titre": f"{nom_affiche} {champ.replace('_', ' ')}",
-            "description": f"{'Below' if inverse else 'Above'} {crit}{unite} indicates a real operational problem for {nom_affiche} -- see vm_app_monitor.py SEUILS_METRIQUES_SERVICE for the reasoning.",
-            "action": f"# voir vm_app_monitor.py -- seuil déjà appliqué en direct, pas une suggestion",
-            "source": "Existing service threshold (vm_app_monitor.py) -- surfaced here, not newly invented",
+            "description": (f"{nom_affiche}: alert when this metric goes "
+                            f"{'below' if inverse else 'above'} {crit}{unite} "
+                            f"(warning at {warn}{unite}). This threshold is evaluated on every "
+                            f"monitoring cycle against live service metrics."),
+            "action": _DIAGNOSTIC_SERVICE.get((svc, champ), f"# inspect {nom_affiche} on its host VM"),
+            "source": "Service threshold — applied live on every cycle",
         })
 
     for (svc, champ), description in CHAMPS_BOOLEENS_CRITIQUES.items():
@@ -756,8 +832,8 @@ def regles_services_actives(etat: dict) -> list:
             "duree_min": 0, "severite": "CRITIQUE", "cible": svc,
             "titre": f"{nom_affiche} {champ.replace('_', ' ')}",
             "description": description,
-            "action": f"# voir vm_app_monitor.py -- seuil déjà appliqué en direct, pas une suggestion",
-            "source": "Existing service threshold (vm_app_monitor.py) -- surfaced here, not newly invented",
+            "action": _DIAGNOSTIC_SERVICE.get((svc, champ), f"systemctl status {svc} --no-pager -l"),
+            "source": "Service threshold — applied live on every cycle",
         })
 
     return regles

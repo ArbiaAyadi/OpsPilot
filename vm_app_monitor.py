@@ -559,16 +559,39 @@ def detecter_derive_num_procs(vmid, service_key: str, num_procs: int,
 #     1-5/s indique un problème applicatif (transactions qui échouent en
 #     boucle), pas un pic ponctuel normal.
 SEUILS_METRIQUES_SERVICE = {
-    ("docker",     "total_disk_gb"):   (15,  25, False),
-    ("postgresql", "cache_hit_pct"):   (90,  80, True),
-    ("postgresql", "rollback_rate"):   (1,   5,  False),
+    ("docker",     "total_disk_gb"):   (15,  25,  False),
+    ("postgresql", "cache_hit_pct"):   (90,  80,  True),
+    ("postgresql", "rollback_rate"):   (1,   5,   False),
+    # ← AJOUT : latence de connexion TCP (check_postgres_health) -- sur un
+    # réseau local (LAN), une connexion devrait normalement prendre <5ms ;
+    # ces seuils restent volontairement généreux pour éviter le bruit sur
+    # un pic ponctuel, tout en captant une vraie dégradation réseau/hôte.
+    ("postgresql", "latency_ms"):      (50,  200, False),
+    # ← AJOUT : ces deux-là sont des POINTS DE DÉPART, moins établis que
+    # les autres -- pas de précédent direct (contrairement à Docker/VM103)
+    # ni de guidance standard équivalente à PostgreSQL. Pour une petite
+    # infra comme celle-ci (2 noeuds, 2 VMs, ~20 métriques), quelques
+    # milliers de séries est normal ; 50k+ indique typiquement une
+    # cardinalité qui a dérapé (ex: un label avec des valeurs illimitées,
+    # comme un timestamp ou un ID utilisateur) -- le mode de panne classique
+    # qui fait OOM Prometheus. À resserrer ou desserrer une fois ta vraie
+    # baseline connue.
+    ("prometheus", "series_actives"):  (50000, 100000, False),
+    ("prometheus", "chunks_memoire"):  (100000, 300000, False),
 }
 
 # Champs booléens où False EST le problème (pas de notion de palier
 # warning/critical -- soit c'est bon, soit non). Format (cle_service,
 # champ) -> message si False.
 CHAMPS_BOOLEENS_CRITIQUES = {
-    ("prometheus", "config_ok"): "config reload failed -- check for a syntax error in the last edit to prometheus.yml",
+    ("prometheus", "config_ok"):     "config reload failed -- check for a syntax error in the last edit to prometheus.yml",
+    # ← AJOUT : distinct de pg_up -- scrape_ok=False signifie que
+    # Prometheus n'arrive même pas à JOINDRE postgres_exporter (réseau,
+    # exportateur planté), différent de "l'exportateur tourne mais ne peut
+    # pas se connecter à PostgreSQL" (déjà couvert par pg_up via
+    # _generer_alertes_apps). Les deux pannes ont des causes et des
+    # correctifs différents, d'où deux signaux séparés.
+    ("postgresql", "scrape_ok"):     "Prometheus cannot reach postgres_exporter — check the exporter process and network path",
 }
 
 INTERVALLE_REESCALADE_SEUIL_SERVICE_S = 1800  # 30 min -- cohérent avec anomaly_detector.py
@@ -615,7 +638,16 @@ def detecter_seuils_metriques_service(vmid, cle_service: str, metriques: dict) -
         )
         if (palier and palier != palier_avant) or doit_reescalader:
             mot   = "critical" if palier == "CRITIQUE" else "high"
-            unite = "GB" if champ.endswith("_gb") else ("%" if champ.endswith("_pct") else "/s")
+            if champ.endswith("_gb"):
+                unite = "GB"
+            elif champ.endswith("_pct"):
+                unite = "%"
+            elif champ.endswith("_ms"):
+                unite = "ms"
+            elif champ == "rollback_rate":
+                unite = "/s"
+            else:
+                unite = ""  # compteurs bruts (series_actives, chunks_memoire...) -- pas d'unite a coller
             alertes.append({
                 "niveau":  palier,
                 "cible":   f"vm-{vmid}/{cle_svc}",
@@ -632,7 +664,14 @@ def detecter_seuils_metriques_service(vmid, cle_service: str, metriques: dict) -
         if valeur is None:
             continue
         cle_etat = (str(vmid), cle_svc, champ)
-        mauvais_maintenant = (valeur is False)
+        # ← "== False" et non "is False" : config_ok est déjà un vrai bool
+        # Python (comparé via ==1.0 à la source, dans _enrichir_prometheus),
+        # mais scrape_ok reste un float brut (0.0/1.0) tel que Prometheus le
+        # renvoie -- "0.0 is False" vaut toujours False en Python (types
+        # différents), ce qui aurait rendu ce test totalement silencieux
+        # pour scrape_ok. Le garde-fou "valeur is None" juste au-dessus
+        # empêche déjà tout faux positif de "None == False".
+        mauvais_maintenant = (valeur == False)
         etait_mauvais       = _dernier_palier_seuil_service.get(cle_etat) == "CRITIQUE"
         doit_reescalader = (
             mauvais_maintenant
@@ -767,13 +806,68 @@ def _generer_alertes_apps(pg, pg_health) -> list:
     """
     alertes = []
 
-    if pg.get("pg_up", 1) == 0 or not pg_health.get("healthy", True):
+    # ← CORRIGÉ (fausse alerte critique constatée en conditions réelles) :
+    # la condition testait pg_up sans vérifier d'abord si l'EXPORTATEUR
+    # était joignable. Quand postgres_exporter est arrêté (ex: après un
+    # redémarrage de VM où le service n'est pas activé au démarrage),
+    # Prometheus ne récupère plus rien, pg_up devient absent, et l'agent
+    # concluait "PostgreSQL is DOWN — database unavailable" alors que la
+    # base tournait parfaitement (confirmé par pg_isready : "accepting
+    # connections"). Une fausse alerte CRITIQUE est particulièrement
+    # grave sur un outil de supervision : elle détruit la confiance dans
+    # toutes les autres alertes.
+    #
+    # pg_scrape_ok existait déjà pour distinguer les deux cas (voir
+    # l'en-tête de ce fichier) mais n'était pas utilisé ici. Les deux
+    # signaux donnent désormais deux alertes DIFFÉRENTES, avec deux
+    # niveaux et deux remèdes différents :
+    #   - exportateur injoignable  -> IMPORTANT, "vérifier l'exportateur"
+    #   - exportateur joignable ET pg_up=0 -> CRITIQUE, "base tombée"
+    scrape_ok = pg.get("pg_scrape_ok")
+    exportateur_injoignable = scrape_ok is not None and float(scrape_ok) == 0
+
+    if exportateur_injoignable:
         alertes.append({
-            "niveau":  "CRITIQUE",
-            "cible":   "linux-vm1/postgresql",
-            "message": "PostgreSQL is DOWN on linux-vm1 — database unavailable",
-            "type":    "service_down",
+            "niveau":  "IMPORTANT",
+            "cible":   "linux-vm1/postgres_exporter",
+            "message": ("postgres_exporter unreachable on linux-vm1 — PostgreSQL metrics unavailable. "
+                        "The database itself may be running: verify with 'pg_isready' before assuming an outage."),
+            "type":    "exporter_down",
         })
+    elif pg.get("pg_up", 1) == 0 or not pg_health.get("healthy", True):
+        # ← RENFORCÉ (2e passe) : la vérification TCP directe
+        # (check_postgres_health) fait désormais autorité sur pg_up. Elle
+        # se connecte au port 5432 SANS passer par Prometheus ni par
+        # l'exportateur -- c'est donc le seul témoin qui observe réellement
+        # la base, là où pg_up n'est qu'une valeur relayée par une chaîne
+        # de composants pouvant défaillir indépendamment.
+        #
+        # Cas concret constaté : pg_up=0 alors que 'pg_isready' répondait
+        # "accepting connections". La base tournait ; seule la remontée de
+        # métriques était cassée. Annoncer une panne de base dans ce cas
+        # est une fausse alerte CRITIQUE.
+        #
+        # On ne déclare donc une panne que si le PORT NE RÉPOND PAS. Si le
+        # port répond mais que pg_up vaut 0, c'est un problème de mesure,
+        # signalé comme tel -- IMPORTANT, pas CRITIQUE.
+        port_repond = pg_health.get("healthy", True)
+        if not port_repond:
+            alertes.append({
+                "niveau":  "CRITIQUE",
+                "cible":   "linux-vm1/postgresql",
+                "message": (f"PostgreSQL is DOWN on linux-vm1 — port 5432 not responding "
+                            f"({pg_health.get('error', 'connection refused')})"),
+                "type":    "service_down",
+            })
+        else:
+            alertes.append({
+                "niveau":  "IMPORTANT",
+                "cible":   "linux-vm1/postgresql",
+                "message": ("PostgreSQL metrics report down (pg_up=0) but port 5432 accepts connections "
+                            f"in {pg_health.get('latency_ms', '?')}ms — the database is running, "
+                            "the metrics path is broken. Check postgres_exporter and its DB credentials."),
+                "type":    "metrics_inconsistent",
+            })
 
     conn_pct = pg.get("pg_connections_pct", 0)
     if conn_pct > 80:

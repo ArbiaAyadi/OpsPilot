@@ -405,7 +405,15 @@ def construire_prompt_specifique(anomalies: list, etat: dict, lstm: dict) -> str
         metriques_services = v.get("metriques_services", {})
         services_str = f" | services: {', '.join(services)}" if services else ""
         vms_ctx += (
-            f"  VM{v.get('vmid','?')} {v.get('nom','?')} on {v.get('noeud','?')}: "
+            # ← AJOUT : type d'invité (QEMU/LXC) transmis au modèle. Il
+            # était collecté mais jamais envoyé, obligeant le modèle à
+            # deviner l'outil -- erreur réelle : "pct exec 101 -- systemctl
+            # restart postgresql" proposé pour une VM QEMU, commande qui
+            # aurait échoué. C'est ce prompt-ci qui produit les
+            # recommandations affichées, donc la correction devait s'y
+            # appliquer aussi, pas seulement au chat.
+            f"  [{str(v.get('type','qemu')).upper()}] "
+            f"VM{v.get('vmid','?')} {v.get('nom','?')} on {v.get('noeud','?')}: "
             f"status={v.get('statut','?')} CPU={v.get('cpu_pct',0):.1f}% RAM={v.get('ram_pct',0):.1f}% "
             f"maxmem={v.get('maxmem_gb',0):.1f}GB{services_str}\n"
         )
@@ -612,6 +620,11 @@ matches one of these -- otherwise action_id must be null, the step stays informa
 {doc_context}
 
 RULES:
+- Each guest is labelled [QEMU] or [LXC] above. Use the matching tool: 'qm' for QEMU guests,
+  'pct' for LXC containers -- never mix them, the wrong tool always fails with
+  '<id> does not exist'. To run a command INSIDE a QEMU guest use
+  'qm guest exec <vmid> -- <cmd>' (needs the guest agent); if unsure it is installed, give the
+  command to run over SSH inside the guest rather than guessing.
 1. pve1/pve2 are HYPERVISOR NODES — NEVER use pct commands on them
 2. Copy threshold values verbatim from EXACT THRESHOLD STATUS above — never round up or invent
 3. severity must be "CRITICAL" if a CRITICAL threshold was breached, "HIGH" if only WARNING was breached
@@ -663,6 +676,24 @@ def _commande_reelle(action_id: str, params: dict) -> str | None:
         return f"qm set {params.get('vmid','<vmid>')} --cpulimit {params.get('limit', 1.0)}"
     if action_id == "clean_logs":
         return "journalctl --vacuum-size=200M && apt-get clean -y"
+    # ← AJOUT (incohérence constatée) : ces trois actions ont été ajoutées
+    # au catalogue (action_executor.ACTION_META) sans être déclarées ici.
+    # Conséquence : _valider_step() ne pouvait pas régénérer leur commande
+    # et laissait celle écrite par le LLM -- souvent fausse. Cas réel :
+    # "pvesh set /nodes/pve1/config -swappiness 10" affiché sous un bouton
+    # qui, lui, exécutait bien la bonne commande (sysctl). L'utilisateur
+    # voyait donc une commande inexistante, et aurait pu la copier telle
+    # quelle. drop_caches, lui, n'affichait AUCUNE commande.
+    #
+    # Ces chaînes doivent rester le reflet exact de ce que fait
+    # action_executor.py -- c'est leur seule raison d'être : montrer à
+    # l'utilisateur ce qui sera réellement exécuté avant qu'il n'accepte.
+    if action_id == "set_swappiness":
+        return f"sysctl -w vm.swappiness={params.get('valeur', 10)}"
+    if action_id == "drop_caches":
+        return "sync && echo 1 > /proc/sys/vm/drop_caches"
+    if action_id == "restart_exporter":
+        return f"systemctl restart {params.get('exporter', '<exporter>')}"
     return None
 
 

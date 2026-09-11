@@ -18,7 +18,7 @@ from agent.anomaly_detector import detecter_anomalies
 from agent.rules_engine  import generer_regles_ia, regles_necessitent_regeneration, marquer_etat_accessibilite
 from agent.report_writer import sauvegarder_rapport
 from agent.etat_normalizer import normaliser_etat
-from agent.incident_prompt import classifier_anomalies, construire_prompt_specifique, parser_reponse_llm, obtenir_doc_url
+from agent.incident_prompt import classifier_anomalies, construire_prompt_specifique, parser_reponse_llm, obtenir_doc_url, _bucket_depuis_metric
 
 _normaliser_etat = normaliser_etat
 
@@ -50,20 +50,19 @@ ws_queue: asyncio.Queue = None
 # anomalie, indépendamment du chronomètre de ré-escalade). Stocke
 # maintenant (horodatage, niveau) par cible -- le frein ne s'applique que
 # si la nouvelle sévérité n'est PAS pire que celle déjà analysée.
-_dernier_appel_llm_par_cible: dict = {}  # cible -> (timestamp, niveau, nb_reanalyses)
+_dernier_appel_llm_par_cible: dict = {}  # (cible, categorie) -> (timestamp, niveau, nb_reanalyses)
 
-# ← AJOUT : dernière analyse IA COMPLÈTE par cible (le dict "structured"
-# tel que produit par le LLM). Quand une ré-analyse est volontairement
-# sautée pour une condition chronique, on réaffiche cette analyse-là
-# plutôt qu'un message dégradé : les causes et les actions recommandées
-# (KSM, ballooning...) restent valables tant que le problème persiste --
-# c'est précisément la raison pour laquelle on ne rappelle pas le LLM.
-# Cas concret observé : analyse complète et correcte à 21:54, puis à 22:21
-# le même problème affichait "AI response could not be parsed" alors que
-# rien n'avait échoué -- le frein avait simplement fonctionné comme prévu,
-# mais son message empruntait le drapeau _parse_failed, que le frontend
-# interprète comme une erreur de parsing.
-_derniere_analyse_par_cible: dict = {}  # cible -> {"structured": ..., "markdown": ..., "ts": ...}
+# ← MODIFIÉ (cas réel observé) : clé désormais (cible, categorie) plutôt
+# que cible seule. Avant, une cible n'avait qu'UNE catégorie enregistrée
+# à la fois -- si "linux-vm2" était analysée pour RAM à 98%, puis qu'une
+# action corrective (KSM+ballooning) faisait redescendre la RAM sous le
+# seuil, un NOUVEAU problème CPU sur la même VM était bloqué par le
+# backoff de RAM (jamais vu comme sa propre catégorie), tombant dans le
+# message dégradé alors qu'aucune analyse CPU n'avait jamais eu lieu.
+# Chaque (cible, categorie) a maintenant son propre chronomètre et son
+# propre cache -- un problème RAM résolu n'empêche plus jamais un
+# problème CPU sur la même cible d'être analysé pour la première fois.
+_derniere_analyse_par_cible: dict = {}  # (cible, categorie) -> {"structured": ..., "markdown": ..., "ts": ...}
 
 # ← AJOUT (amélioration du rapport d'incident) : instant de PREMIÈRE
 # détection d'une condition par cible, et nombre total de signalements.
@@ -243,7 +242,17 @@ async def analyser_anomalie_llm(anomalies: list, etat: dict) -> dict:
         # format_json=True : contraint un fournisseur de secours a produire du
         # JSON valide (voir groq_client.py). Cet appel attend strictement du
         # JSON structure -- sans effet sur Groq, dont le formatage est deja fiable.
-        lambda: appeler_groq(system_prompt_surveillance(etat, lstm), [], prompt, 3000, format_json=True),
+        # ← MODIFIÉ (3e ajustement) : 3000 -> 5000. Preuve directe reçue :
+        # un lot d'anomalies couvrant DEUX cibles à la fois (linux-vm1 RAM
+        # + pve2/VM103 RAM+CPU dans le même cycle) produisait un JSON
+        # encore tronqué à 3000 -- coupé en plein milieu de "physical host
+        # has negative RAM...". Un lot multi-cibles double naturellement
+        # le contenu nécessaire (causes et étapes pour CHAQUE cible), pas
+        # seulement pour une. Alignement sur 5000, déjà utilisé et éprouvé
+        # sans excès pour la génération de règles (agent/rules_engine.py,
+        # REGLES_MAX_TOKENS) -- cohérence entre les deux plafonds plutôt
+        # qu'une valeur inventée séparément ici.
+        lambda: appeler_groq(system_prompt_surveillance(etat, lstm), [], prompt, 5000, format_json=True),
     )
     donnees = parser_reponse_llm(reponse_brute)
     if not donnees.get("_parse_failed"):
@@ -257,7 +266,260 @@ async def analyser_anomalie_llm(anomalies: list, etat: dict) -> dict:
     }
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Analyse de secours déterministe — filet de sécurité universel
+# ══════════════════════════════════════════════════════════════════════════════
+# ← AJOUT (solution de fond, après plusieurs correctifs ponctuels) :
+# jusqu'ici, chaque fois que la sortie du LLM ne pouvait pas être exploitée
+# (troncature, réponse inattendue, quota, panne réseau, format différent
+# d'un fournisseur de secours...), la carte affichait le drapeau
+# "_parse_failed" et le texte brut -- ce qui se présente à l'utilisateur
+# comme une panne du produit, alors que l'infrastructure, elle, a bien un
+# problème réel à traiter.
+#
+# Chaque cause individuelle a été corrigée tour à tour (max_tokens 1400 ->
+# 2000 -> 3000 -> 5000, balises <think>, format JSON strict, cache par
+# catégorie...) mais une nouvelle finissait toujours par apparaître. Ce
+# n'est pas une bataille qu'on gagne cause par cause : un service externe
+# PEUT toujours renvoyer quelque chose d'inattendu.
+#
+# Approche définitive : ne plus jamais dépendre du LLM pour produire une
+# carte exploitable. Cette fonction construit une analyse structurée
+# COMPLÈTE (mêmes champs que le LLM : severity, summary, causes, warning,
+# steps) uniquement à partir des anomalies détectées et de l'état réel du
+# cluster -- aucun appel réseau, aucun parsing, donc elle ne peut pas
+# échouer. Les actions proposées suivent exactement l'ordre établi dans ce
+# projet (migration -> KSM -> ballooning -> RAM physique -> nœud
+# supplémentaire) et n'incluent JAMAIS de réduction de RAM ou de vCPU
+# d'une VM en production.
+#
+# Marquée "_source": "regles" pour rester honnête : ce n'est pas une
+# analyse IA, et l'interface peut l'indiquer plutôt que de laisser croire
+# le contraire.
+_PLAYBOOK_SECOURS = {
+    "ram": {
+        "titre": "Reduce memory pressure",
+        "causes": [
+            "Node RAM usage is above the configured threshold, forcing the kernel to swap.",
+            "Sustained swap usage degrades every VM sharing this node's storage.",
+        ],
+        "warning": "Never reduce an existing VM's RAM in production — this can crash running applications.",
+        "steps": [
+            ("immediate",  "Enable Kernel Same-page Merging to deduplicate identical memory pages across VMs", "echo 1 > /sys/kernel/mm/ksm/run", "enable_ksm", ["node"]),
+            ("short_term", "Enable ballooning so idle guest memory can be reclaimed by the hypervisor", "qm set {vmid} --balloon {balloon}", "enable_balloon", ["node", "vmid", "min_mb"]),
+            ("long_term",  "Add physical RAM to the host, or migrate a VM to another node to spread the load", "qm migrate {vmid} {autre_noeud} --online", "migrate_vm", ["node", "vmid", "target_node"]),
+        ],
+    },
+    "cpu": {
+        "titre": "Relieve CPU saturation",
+        "causes": [
+            "CPU usage is above the configured threshold on this target.",
+            "Sustained saturation causes scheduling delays for every workload on the node.",
+        ],
+        "warning": "Never reduce an existing VM's vCPU count in production — this can destabilise running services.",
+        "steps": [
+            ("immediate",  "Identify the top CPU consumers before changing any allocation", "ps aux --sort=-%cpu | head -15", None, []),
+            ("short_term", "Migrate a VM to a less loaded node to spread CPU demand", "qm migrate {vmid} {autre_noeud} --online", "migrate_vm", ["node", "vmid", "target_node"]),
+            ("long_term",  "Add vCPUs only if the physical host has real spare cores available", "qm set {vmid} --cores <n>", None, []),
+        ],
+    },
+    "iowait": {
+        "titre": "Investigate storage saturation",
+        "causes": [
+            "Disk latency or I/O wait is above threshold — processes are blocked waiting on storage.",
+            "Concurrent I/O from several guests on a shared physical disk multiplies latency.",
+        ],
+        "warning": "Do not move workloads onto the same physical disk while it is already saturated.",
+        "steps": [
+            ("immediate",  "Measure per-device latency to confirm which disk is saturated", "iostat -x 1 5", None, []),
+            ("short_term", "Identify the processes generating the I/O", "iotop -o -b -n 3", None, []),
+            ("long_term",  "Spread guests across separate physical disks, or move to faster storage", "", None, []),
+        ],
+    },
+    "disk": {
+        "titre": "Free storage space",
+        "causes": [
+            "Disk usage is above the configured threshold.",
+            "On LVM-thin, a full pool causes writes to fail silently and can corrupt guests.",
+        ],
+        "warning": "Never delete guest disk images to free space — remove backups and logs first.",
+        "steps": [
+            ("immediate",  "Check what is consuming space on the storage pool", "pvesm status && df -h", None, []),
+            ("short_term", "Reclaim space from journal logs and the package cache", "journalctl --vacuum-size=200M && apt-get clean -y", "clean_logs", ["node"]),
+            ("long_term",  "Review old backup archives before deleting any (needs a human decision)", "du -sh /var/lib/vz/dump/* | sort -rh | head -10", None, []),
+        ],
+    },
+    "swap": {
+        "titre": "RAM saturated — swap in use",
+        "causes": [
+            "Swap usage is high, which means physical RAM is exhausted.",
+            "Swapping to disk is orders of magnitude slower than RAM and degrades every workload.",
+        ],
+        "warning": "Never reduce an existing VM's RAM in production.",
+        "steps": [
+            ("immediate",  "Enable KSM to reclaim duplicated memory pages", "echo 1 > /sys/kernel/mm/ksm/run", "enable_ksm", ["node"]),
+            ("short_term", "Reduce swap aggressiveness so the kernel prefers RAM", "sysctl vm.swappiness=10", None, []),
+            ("long_term",  "Add physical RAM to the host — this is the only durable fix", "", None, []),
+        ],
+    },
+    "service": {
+        "titre": "Restore the failed service",
+        "causes": [
+            "A monitored application service is no longer responding on its host VM.",
+            "A service outage is usually caused by the process having stopped, by memory pressure "
+            "(OOM kill), or by a full disk preventing it from writing.",
+        ],
+        "warning": "Investigate WHY the service stopped before restarting it — an immediate restart on an "
+                   "unresolved cause (OOM, full disk) will simply fail again.",
+        "steps": [
+            ("immediate",  "Check the service state and its most recent log lines on the host VM", "systemctl status {service} --no-pager -l", None, []),
+            ("short_term", "Look for an out-of-memory kill or a disk-full error around the time it stopped", "journalctl -u {service} --since '30 min ago' --no-pager | tail -40", None, []),
+            ("long_term",  "Once the cause is understood and fixed, restart the service", "systemctl restart {service}", None, []),
+        ],
+    },
+    "quorum": {
+        "titre": "Cluster communication at risk",
+        "causes": [
+            "Corosync reports a degraded state or lost quorum.",
+            "Without quorum, Proxmox fences nodes and stops guests to prevent split-brain corruption.",
+        ],
+        "warning": "Do not restart corosync on several nodes at once — this can worsen the split.",
+        "steps": [
+            ("immediate",  "Check the current cluster state", "pvecm status", None, []),
+            ("short_term", "Inspect the corosync rings for errors", "corosync-cfgtool -s", None, []),
+            ("long_term",  "Review the cluster network path between nodes", "journalctl -u corosync -n 50", None, []),
+        ],
+    },
+}
+
+_PLAYBOOK_GENERIQUE = {
+    "titre": "Investigate threshold breach",
+    "causes": ["A monitored metric has crossed its configured threshold on this target."],
+    "warning": "Verify the current value before applying any change.",
+    "steps": [
+        ("immediate", "Review this target's live metrics on the Infrastructure page", "", None, []),
+    ],
+}
+
+
+def _analyse_de_secours(anomalies: list, etat: dict, dominant_type: str,
+                         anomalie_dominante: dict, raison: str) -> dict:
+    """Construit une analyse structurée COMPLÈTE sans aucun appel externe.
+    Ne peut pas échouer : pas de réseau, pas de parsing, uniquement les
+    données déjà en mémoire. Voir le commentaire au-dessus pour le
+    raisonnement."""
+    playbook = _PLAYBOOK_SECOURS.get(dominant_type, _PLAYBOOK_GENERIQUE)
+    cible    = anomalie_dominante.get("cible", "cluster")
+    niveau   = anomalie_dominante.get("niveau", "IMPORTANT")
+
+    # Contexte réel pour rendre les commandes exécutables telles quelles,
+    # plutôt que de laisser des placeholders que l'utilisateur devrait
+    # remplir à la main.
+    # ← AJOUT : une cible de service arrive sous la forme "vm/service"
+    # (ex: "linux-vm1/postgresql") -- il faut isoler les deux parties pour
+    # retrouver la VM d'accueil ET nommer le service dans les commandes.
+    nom_service = None
+    cible_vm = cible
+    if "/" in str(cible):
+        cible_vm, nom_service = str(cible).split("/", 1)
+
+    vms = etat.get("vms", []) or []
+    vm_cible = next((v for v in vms if str(v.get("nom", "")).lower() == str(cible_vm).lower()), None)
+    if vm_cible is None:
+        vm_cible = next((v for v in vms if str(v.get("noeud", "")).lower() == str(cible_vm).lower()), None)
+    vmid = str(vm_cible.get("vmid")) if vm_cible else "<vmid>"
+
+    noeuds = etat.get("noeuds", []) or []
+    # ← Le nœud à éviter est celui qui HÉBERGE la cible, pas la cible
+    # elle-même : quand la cible est une VM (ex: "linux-vm1"), comparer
+    # les noms de nœuds à "linux-vm1" ne correspond à rien, et le premier
+    # nœud en ligne — souvent celui qui l'héberge déjà — était proposé
+    # comme destination. La commande de migration devenait alors sans
+    # effet ("qm migrate 101 pve1" alors que 101 est déjà sur pve1).
+    noeud_actuel = (vm_cible.get("noeud") if vm_cible else None) or cible_vm
+    autre_noeud = next(
+        (n.get("nom") for n in noeuds
+         if str(n.get("nom", "")).lower() != str(noeud_actuel).lower()
+         and str(n.get("statut", "")).lower() in ("online", "up", "en ligne")),
+        "<autre-noeud>",
+    )
+    balloon = "256"
+    if vm_cible and vm_cible.get("ram_total_gb"):
+        # Moitié de l'allocation, jamais en dessous de 128 Mo -- le
+        # ballooning réclame de la mémoire INACTIVE, il ne force jamais une
+        # VM sous ce dont elle a réellement besoin.
+        balloon = str(max(128, int(float(vm_cible["ram_total_gb"]) * 1024 / 2)))
+
+    steps = []
+    for phase, action, commande, action_id, params_requis in playbook["steps"]:
+        cmd = commande.format(vmid=vmid, autre_noeud=autre_noeud, balloon=balloon,
+                              service=(nom_service or "<service>")) if commande else ""
+        step = {"phase": phase, "action": action, "command": cmd,
+                "action_id": None, "action_params": None}
+        # ← AJOUT : renseigne action_id + action_params avec de VRAIES
+        # valeurs, pour que les étapes de secours obtiennent les boutons
+        # "Accepter & Exécuter" exactement comme celles produites par le
+        # LLM. Sans ça, une recommandation de secours restait purement
+        # informative -- l'utilisateur voyait la bonne commande mais devait
+        # la copier à la main, alors que l'action est déjà dans le
+        # catalogue pré-approuvé.
+        if action_id:
+            valeurs = {
+                "node":        noeud_actuel,
+                "vmid":        vmid,
+                "target_node": autre_noeud,
+                "min_mb":      balloon,
+            }
+            # Une action n'est proposée en un clic que si TOUS ses
+            # paramètres ont une valeur réelle -- jamais avec un
+            # placeholder non résolu, qui produirait une commande
+            # invalide au moment de l'exécution.
+            fournis = {k: valeurs.get(k) for k in params_requis}
+            if all(v and not str(v).startswith("<") for v in fournis.values()):
+                step["action_id"]     = action_id
+                step["action_params"] = fournis
+        steps.append(step)
+
+    # ← Passe par la MÊME validation que les étapes issues du LLM
+    # (agent/incident_prompt.py, _valider_step) : vérifie que l'action_id
+    # existe réellement dans le catalogue exécutable de cet environnement,
+    # que tous les paramètres requis sont présents, et régénère la commande
+    # affichée depuis ces paramètres. Réutiliser cette fonction plutôt que
+    # d'en écrire une seconde garantit que les deux chemins ne peuvent pas
+    # diverger avec le temps.
+    try:
+        from agent.incident_prompt import _valider_step
+        steps = [_valider_step(s) for s in steps]
+    except Exception:
+        # Si la validation n'est pas disponible, on retombe sur des étapes
+        # purement informatives -- jamais sur une action non validée.
+        for s in steps:
+            s["action_id"] = None
+            s["action_params"] = None
+
+    messages = [a.get("message", "") for a in anomalies if a.get("message")]
+    resume = (f"{anomalie_dominante.get('message', 'Threshold breach detected')} "
+              f"— rule-based analysis (AI analysis unavailable: {raison}).")
+
+    return {
+        "severity":    "CRITICAL" if str(niveau).upper().startswith("CRIT") else "HIGH",
+        "target_node": cible,
+        "target_vmid": vmid if vmid != "<vmid>" else None,
+        "summary":     resume,
+        "causes":      list(playbook["causes"]) + ([f"Also detected this cycle: {m}" for m in messages[1:4]] if len(messages) > 1 else []),
+        "fix_title":   playbook["titre"] + f" on {cible}",
+        "warning":     playbook["warning"],
+        "steps":       steps,
+        # ← Honnêteté : cette analyse n'est PAS produite par l'IA.
+        # L'interface peut s'appuyer sur ce champ pour l'indiquer, plutôt
+        # que de laisser croire à une analyse IA qui n'a pas eu lieu.
+        "_source":     "regles",
+        "_raison_secours": raison,
+    }
+
+
 def _boucle_surveillance(loop: asyncio.AbstractEventLoop):
+
     global dernier_etat, dernier_lstm, dernier_rapport_ts, _dernier_ai_niveau, _derniere_alerte_ai_ts, _dernier_reentrainement_ts
 
     try:
@@ -601,11 +863,38 @@ def _boucle_surveillance(loop: asyncio.AbstractEventLoop):
                 # persistant redéclenchait un appel LLM complet à chaque
                 # ré-escalade de 30 min).
                 types_dict, dominant_type = classifier_anomalies(nouvelles)
-                anomalie_dominante = types_dict[dominant_type][0] if types_dict.get(dominant_type) else nouvelles[0]
+                # ← CORRIGÉ (titre/contenu incohérents, observés en
+                # conditions réelles) : types_dict[dominant_type][0]
+                # prenait la PREMIÈRE anomalie ajoutée au groupe dominant,
+                # peu importe sa sévérité au sein de ce groupe. Deux
+                # anomalies RAM sur des cibles différentes (linux-vm1
+                # HIGH, pve2 CRITIQUE) tombent toutes les deux dans le
+                # même groupe "ram" -- l'index [0] choisissait alors
+                # linux-vm1 simplement parce qu'elle avait été détectée
+                # en premier ce cycle-là, alors que pve2 (CRITIQUE) est
+                # objectivement la plus grave. La carte de recommendation
+                # se titrait "linux-vm1 RAM 85.1%" tout en contenant une
+                # analyse portant sur pve2/VM103 -- le LLM, lui, priorise
+                # correctement par sévérité dans son propre raisonnement,
+                # seul le choix du titre affiché ne le faisait pas.
+                # Choisit maintenant la PIRE sévérité au sein du groupe
+                # dominant, avec l'ordre d'origine comme départage seulement
+                # entre anomalies de MÊME sévérité (pas de choix arbitraire
+                # supplémentaire au-delà de ce cas).
+                groupe_dominant    = types_dict.get(dominant_type) or nouvelles
+                anomalie_dominante = groupe_dominant[0]
+                for a in groupe_dominant[1:]:
+                    if not _severite_pire_ou_egale(a.get("niveau", "IMPORTANT"), anomalie_dominante.get("niveau", "IMPORTANT")):
+                        anomalie_dominante = a
                 cible_dominante      = anomalie_dominante.get("cible", "cluster")
                 niveau_dominant      = anomalie_dominante.get("niveau", "IMPORTANT")
+                # ← MODIFIÉ : clé (cible, categorie) au lieu de cible seule
+                # -- voir le raisonnement complet en tête de fichier
+                # (_dernier_appel_llm_par_cible). dominant_type vient déjà
+                # de classifier_anomalies() plus haut, réutilisé tel quel.
+                cle_suivi = (cible_dominante, dominant_type)
                 dernier_ts, dernier_niveau, nb_reanalyses = _dernier_appel_llm_par_cible.get(
-                    cible_dominante, (0, "INFO", 0)
+                    cle_suivi, (0, "INFO", 0)
                 )
                 # ← AJOUT : si la condition a été SILENCIEUSE plus longtemps
                 # que le plafond d'espacement, elle a probablement été
@@ -648,62 +937,59 @@ def _boucle_surveillance(loop: asyncio.AbstractEventLoop):
                           f"{nb_reanalyses}x, espacement actuel {intervalle_requis//60}min, sans aggravation -- "
                           f"pas de nouvel appel Groq (encore ~{minutes_restantes}min)")
                     lignes    = "\n".join(f"- [{a['niveau']}] {a['message']}" for a in nouvelles)
-                    precedente = _derniere_analyse_par_cible.get(cible_dominante)
-                    # ← Réutilisation autorisée UNIQUEMENT si la catégorie
-                    # dominante est la MÊME (ram/cpu/disk/iowait...).
-                    # Sans cette condition, une analyse produite pour un
-                    # pic CPU était réaffichée telle quelle pour une
-                    # anomalie RAM sur la même cible -- le rapport annonçait
-                    # alors "Anomalie détectée : RAM 88%" suivi de "Cause :
-                    # CPU à 106.9%", incohérence constatée en conditions
-                    # réelles. Une analyse ne vaut que pour le type de
-                    # problème qu'elle a réellement examiné.
+                    # ← MODIFIÉ : clé (cible, categorie) -- la vérification
+                    # de catégorie explicite qui existait ici avant devient
+                    # inutile : la clé elle-même garantit qu'on ne retrouve
+                    # QUE l'analyse de cette catégorie précise pour cette
+                    # cible précise, jamais une autre.
+                    precedente = _derniere_analyse_par_cible.get(cle_suivi)
                     reutilisable = (
                         precedente
                         and isinstance(precedente.get("structured"), dict)
                         and not precedente["structured"].get("_parse_failed")
-                        and precedente.get("categorie") == dominant_type
                     )
                     if reutilisable:
                         # ← On réutilise l'analyse IA complète produite pour
-                        # cette même cible : causes, avertissements et actions
-                        # restent valables tant que la condition persiste --
-                        # c'est justement pour ça qu'on ne rappelle pas le LLM.
-                        # La carte affiche donc une vraie recommandation
-                        # actionnable, au lieu d'un message d'erreur trompeur.
+                        # cette même cible ET cette même catégorie : causes,
+                        # avertissements et actions restent valables tant que
+                        # la condition persiste -- c'est justement pour ça
+                        # qu'on ne rappelle pas le LLM. La carte affiche donc
+                        # une vraie recommandation actionnable, au lieu d'un
+                        # message d'erreur trompeur.
                         structured = dict(precedente["structured"])
                         structured["_analyse_reutilisee"] = True
                         heure_origine = datetime.fromtimestamp(precedente["ts"]).strftime("%H:%M")
                         structured["_analysee_a"] = heure_origine
-                        # ← Mention insérée DANS le résumé, pas seulement dans
-                        # un champ de métadonnées : les chiffres de l'analyse
-                        # d'origine (ex. "RAM 94.7%") sont figés à l'heure où
-                        # elle a été produite. Sans cette mention, ils se
-                        # lisent comme des mesures actuelles -- constaté en
-                        # conditions réelles sur des cartes espacées d'une
-                        # heure affichant toutes la même valeur. Les mesures
-                        # en direct restent disponibles sur la page
-                        # Infrastructure et dans la section "Cluster State"
-                        # du rapport, qui elles sont bien recalculées.
                         prefixe = (f"[Analyse de {heure_origine} — condition toujours active, "
                                    f"valeurs ci-dessous datées de cette analyse] ")
                         if structured.get("summary"):
                             structured["summary"] = prefixe + structured["summary"]
                         analyse = f"_{prefixe.strip()}_\n\n" + precedente["markdown"]
                     else:
-                        # Aucune analyse antérieure exploitable (premier
-                        # démarrage, ou la précédente avait elle-même échoué).
-                        # _statut distingue ce cas d'un vrai échec de parsing.
-                        analyse    = (f"**Anomalies** (problème persistant sur {cible_dominante}, déjà "
-                                      f"analysé récemment -- pas de nouvelle analyse IA, pour préserver le quota)\n\n{lignes}")
-                        structured = {"_parse_failed": True, "_statut": "analyse_differee", "_raw": analyse}
+                        # ← CORRIGÉ (texte trompeur signalé) : "pour préserver
+                        # le quota" laissait croire que le budget Groq était
+                        # en cause, ce qui n'est PAS ce que cette branche
+                        # vérifie -- elle se déclenche uniquement sur le
+                        # délai et la sévérité (reanalyse_trop_recente),
+                        # totalement indépendamment du budget restant. La
+                        # branche budget_insuffisant_pour_ce_niveau, plus
+                        # bas, est la SEULE qui parle réellement de quota --
+                        # jamais celle-ci. Reformulé pour dire la vraie
+                        # raison : cette catégorie précise, pour cette
+                        # cible précise, vient d'être analysée sans
+                        # s'aggraver, donc pas encore ré-analysée -- avec la
+                        # première analyse ratée (aucun cache exploitable
+                        # encore), ce qui reste rare mais possible juste
+                        # après un redémarrage.
+                        structured = _analyse_de_secours(nouvelles, etat, dominant_type,
+                                                          anomalie_dominante, "recently analysed, awaiting re-analysis")
+                        analyse    = _rendre_markdown(structured)
                 elif budget_insuffisant_pour_ce_niveau:
                     print(f"[Monitoring] Budget journalier bas ({budget_restant} tokens restants) -- "
                           f"reserve aux incidents CRITIQUE uniquement, {niveau_dominant} mis en attente sans appel Groq")
-                    lignes     = "\n".join(f"- [{a['niveau']}] {a['message']}" for a in nouvelles)
-                    analyse    = (f"**Anomalies** (budget Groq journalier faible -- réservé aux incidents "
-                                  f"CRITIQUE, {niveau_dominant} en attente)\n\n{lignes}")
-                    structured = {"_parse_failed": True, "_statut": "budget_reserve", "_raw": analyse}
+                    structured = _analyse_de_secours(nouvelles, etat, dominant_type,
+                                                      anomalie_dominante, "daily budget reserved for critical incidents")
+                    analyse    = _rendre_markdown(structured)
                 elif slots >= 5:
                     try:
                         resultat_llm = asyncio.run_coroutine_threadsafe(
@@ -721,6 +1007,20 @@ def _boucle_surveillance(loop: asyncio.AbstractEventLoop):
                         ).result(timeout=120)
                         analyse    = resultat_llm["markdown"]
                         structured = resultat_llm["structured"]
+                        # ← AJOUT (filet universel) : le LLM a répondu mais
+                        # sa sortie n'a pas pu être exploitée. Plutôt que
+                        # d'afficher une erreur interne à l'utilisateur, on
+                        # produit une analyse déterministe complète (voir
+                        # _analyse_de_secours). La carte reste exploitable,
+                        # avec de vraies actions -- l'infrastructure a un
+                        # problème réel, il faut y répondre même quand le
+                        # service externe déçoit.
+                        if isinstance(structured, dict) and structured.get("_parse_failed"):
+                            print(f"[Monitoring] Sortie LLM inexploitable -- bascule sur l'analyse deterministe "
+                                  f"({dominant_type}, cible {cible_dominante})")
+                            structured = _analyse_de_secours(nouvelles, etat, dominant_type,
+                                                              anomalie_dominante, "unreadable model output")
+                            analyse    = _rendre_markdown(structured)
                         # ← AJOUT : trace du fournisseur qui a réellement
                         # produit CETTE analyse (groq, mistral, ollama...).
                         # Sans ça, impossible de savoir a posteriori si une
@@ -744,29 +1044,45 @@ def _boucle_surveillance(loop: asyncio.AbstractEventLoop):
                         # observé (linux-vm2 re-analysée 12 min après,
                         # alors que la cible dominante du lot précédent
                         # était différente).
-                        pires_par_cible = {}
+                        # ← MODIFIÉ : clé (cible, categorie) au lieu de
+                        # cible seule -- voir le raisonnement complet en
+                        # tête de fichier. Chaque anomalie du lot garde SA
+                        # PROPRE catégorie (déduite de son "metric" via
+                        # _bucket_depuis_metric), pas la seule catégorie
+                        # dominante du lot entier -- un lot mixte
+                        # (ex: pve2 RAM + linux-vm2 CPU) marque désormais
+                        # deux entrées distinctes, chacune avec son propre
+                        # chronomètre.
+                        pires_par_cle = {}
                         for a in nouvelles:
                             c = a.get("cible", "cluster")
                             n = a.get("niveau", "IMPORTANT")
-                            if c not in pires_par_cible or not _severite_pire_ou_egale(n, pires_par_cible[c]):
-                                pires_par_cible[c] = n
-                        for c, n in pires_par_cible.items():
-                            # ← Compteur incrémenté par cible : pilote
-                            # l'espacement progressif (_intervalle_pour)
+                            metric = a.get("metric")
+                            cat = _bucket_depuis_metric(metric) if metric else dominant_type
+                            cle = (c, cat)
+                            if cle not in pires_par_cle or not _severite_pire_ou_egale(n, pires_par_cle[cle]):
+                                pires_par_cle[cle] = n
+                        for cle, n in pires_par_cle.items():
+                            # ← Compteur incrémenté par (cible, categorie) :
+                            # pilote l'espacement progressif (_intervalle_pour)
                             # au cycle suivant. Remis à 0 quand la sévérité
                             # empire -- le problème a changé de nature, il
                             # redevient "neuf" et mérite un suivi rapproché.
-                            _, ancien_niveau, ancien_compteur = _dernier_appel_llm_par_cible.get(c, (0, "INFO", 0))
+                            _, ancien_niveau, ancien_compteur = _dernier_appel_llm_par_cible.get(cle, (0, "INFO", 0))
                             compteur = 0 if not _severite_pire_ou_egale(n, ancien_niveau) else ancien_compteur + 1
-                            _dernier_appel_llm_par_cible[c] = (now, n, compteur)
-                            # ← Mémorise l'analyse complète pour CETTE cible :
-                            # elle sera réaffichée telle quelle si le même
-                            # problème se re-signale pendant la fenêtre
-                            # d'espacement, au lieu d'un message dégradé.
-                            # Uniquement si le parsing a réussi -- réutiliser
-                            # une analyse ratée n'aurait aucun intérêt.
+                            _dernier_appel_llm_par_cible[cle] = (now, n, compteur)
+                            # ← Mémorise l'analyse complète pour CETTE
+                            # combinaison (cible, categorie) précise : elle
+                            # sera réaffichée telle quelle si LE MÊME
+                            # problème (même cible, même catégorie) se
+                            # re-signale pendant la fenêtre d'espacement --
+                            # jamais réutilisée pour une catégorie
+                            # différente sur la même cible, qui obtient sa
+                            # propre analyse fraîche. Uniquement si le
+                            # parsing a réussi -- réutiliser une analyse
+                            # ratée n'aurait aucun intérêt.
                             if isinstance(structured, dict) and not structured.get("_parse_failed"):
-                                _derniere_analyse_par_cible[c] = {
+                                _derniere_analyse_par_cible[cle] = {
                                     "structured": structured,
                                     "markdown":   analyse,
                                     "ts":         now,
@@ -775,17 +1091,24 @@ def _boucle_surveillance(loop: asyncio.AbstractEventLoop):
                                     # la réutilisation, pour ne jamais
                                     # réafficher une analyse CPU face à une
                                     # anomalie RAM.
-                                    "categorie":  dominant_type,
+                                    # categorie retirée : redondante, la clé
+                                    # (cible, categorie) l'encode déjà --
+                                    # la stocker à nouveau ici aurait risqué
+                                    # d'y mettre dominant_type (celui du lot
+                                    # entier) au lieu de "cat" (celui de
+                                    # cette entrée précise), une source
+                                    # d'incohérence silencieuse.
                                 }
                     except TimeoutError:
-                        print(f"[Monitoring] Analyse LLM trop lente (>120s) -- rapport degrade genere immediatement")
-                        lignes     = "\n".join(f"- [{a['niveau']}] {a['message']}" for a in nouvelles)
-                        analyse    = f"**Anomalies** (analyse IA indisponible -- delai depasse)\n\n{lignes}"
-                        structured = {"_parse_failed": True, "_raw": analyse}
+                        print(f"[Monitoring] Analyse LLM trop lente (>120s) -- bascule sur l'analyse deterministe")
+                        structured = _analyse_de_secours(nouvelles, etat, dominant_type,
+                                                          anomalie_dominante, "analysis timed out")
+                        analyse    = _rendre_markdown(structured)
                 else:
-                    lignes     = "\n".join(f"- [{a['niveau']}] {a['message']}" for a in nouvelles)
-                    analyse    = f"**Anomalies** (quota reserve)\n\n{lignes}"
-                    structured = {"_parse_failed": True, "_raw": analyse}
+                    print("[Monitoring] Debit par minute epuise -- bascule sur l'analyse deterministe")
+                    structured = _analyse_de_secours(nouvelles, etat, dominant_type,
+                                                      anomalie_dominante, "rate limit reached")
+                    analyse    = _rendre_markdown(structured)
 
                 # ← Suivi de la première détection et du nombre de
                 # signalements pour cette cible. Réinitialisé si la
@@ -811,8 +1134,25 @@ def _boucle_surveillance(loop: asyncio.AbstractEventLoop):
                     from database import sauvegarder_recommendation
                     rec_id = sauvegarder_recommendation({
                         "structured":  structured,
-                        "title":       structured.get("fix_title") or nouvelles[0].get("message", "Infrastructure Issue"),
-                        "severity":    structured.get("severity") or nouvelles[0].get("niveau", "HIGH"),
+                        # ← CORRIGÉ (incohérence titre/contenu observée) :
+                        # nouvelles[0] -> anomalie_dominante. nouvelles[0]
+                        # est simplement la première anomalie dans l'ordre
+                        # de détection (arbitraire, dépend de l'ordre
+                        # d'itération des nœuds/VMs) -- sans rapport avec
+                        # ce que le LLM a réellement jugé le plus sévère.
+                        # Cas observé : carte titrée "linux-vm1 RAM 85.1%"
+                        # contenant une analyse portant sur "pve2/VM103,
+                        # RAM 95%, CPU 105.8%" -- linux-vm1 se trouvait
+                        # juste être détectée en premier ce cycle-là.
+                        # anomalie_dominante (déjà calculée plus haut via
+                        # classifier_anomalies, utilisée pour la
+                        # notification) est la MÊME anomalie que le
+                        # prompt envoyé au LLM présente comme prioritaire
+                        # -- le titre affiché correspond désormais à ce
+                        # que l'analyse traite réellement, même quand le
+                        # parsing échoue et qu'on retombe sur ce repli.
+                        "title":       structured.get("fix_title") or anomalie_dominante.get("message", "Infrastructure Issue"),
+                        "severity":    structured.get("severity") or anomalie_dominante.get("niveau", "HIGH"),
                         "status":      "OPEN",
                         "timestamp":   datetime.now().isoformat(),
                         # ← CORRIGÉ (cause des cartes dupliquées) : la clé
@@ -835,6 +1175,15 @@ def _boucle_surveillance(loop: asyncio.AbstractEventLoop):
                         "target_vmid": structured.get("target_vmid"),
                         "rapport":     nom_rapport,
                     })
+                    # ← AJOUT : un id négatif signale un repli mémoire
+                    # (PostgreSQL injoignable au moment de l'écriture).
+                    # Sans ce journal, la divergence entre ce qui s'affiche
+                    # en direct et ce qui subsiste après rafraîchissement
+                    # restait totalement silencieuse -- impossible à
+                    # diagnostiquer autrement qu'en comptant les cartes.
+                    if rec_id < 0:
+                        print(f"[DB] Recommendation {cible_dominante} sauvegardee en MEMOIRE seulement "
+                              f"(id {rec_id}) -- PostgreSQL indisponible, elle ne survivra pas a un redemarrage")
                 except Exception as e:
                     print(f"[DB] Erreur sauvegarde recommendation: {e}")
 
@@ -846,7 +1195,22 @@ def _boucle_surveillance(loop: asyncio.AbstractEventLoop):
                         "anomalies": nouvelles,
                         "timestamp": datetime.now().isoformat(),
                         "rapport": nom_rapport, "lstm": dernier_lstm,
-                        "recommendation_id": rec_id if rec_id > 0 else None,
+                        # ← CORRIGÉ (cause du compteur qui chute au
+                        # rafraîchissement, ex: 5 -> 4) : un rec_id NÉGATIF
+                        # désigne une recommendation créée en repli mémoire
+                        # (voir database.py, sauvegarder_recommendation --
+                        # PostgreSQL momentanément injoignable). Le
+                        # convertir en None faisait apparaître la carte en
+                        # direct sans identifiant : impossible à dédupliquer
+                        # côté frontend, absente de la base, donc disparue
+                        # au premier rafraîchissement -- exactement l'écart
+                        # observé entre l'affichage direct et le rechargement.
+                        # Un id négatif est pourtant parfaitement utilisable :
+                        # marquer_recommendation_resolue() et
+                        # supprimer_recommendation() savent déjà le router
+                        # vers la mémoire plutôt que vers SQL. Seul 0 (ou
+                        # absence) reste sans identifiant.
+                        "recommendation_id": rec_id if rec_id != 0 else None,
                     }), loop)
 
                 try:

@@ -9,7 +9,7 @@ from agent.report_writer import lister_rapports, lire_rapport, generer_pdf, comp
 from agent.groq_client   import (GROQ_MODEL, GROQ_OK, rate_limiter,
                                   tokens_utilises_aujourdhui, budget_journalier_restant,
                                   TOKENS_QUOTIDIENS_LIMITE, _fournisseurs_secours,
-                                  DERNIER_FOURNISSEUR)
+                                  DERNIER_FOURNISSEUR, groq_bloque_jusqua)
 from agent.config        import INTERVALLE_REGENERATION_REGLES
 from agent.chat_history  import get_historique_complet, vider_historique
 
@@ -422,6 +422,13 @@ def api_status():
             for n in _fournisseurs_secours()
         ],
         "fournisseur_actif":      DERNIER_FOURNISSEUR,
+        # ← AJOUT : Groq peut rejeter tous les appels (limitation au niveau
+        # du compte) alors que notre compteur de tokens affiche un budget
+        # sain -- il n'incrémente que sur les appels REUSSIS. Sans cette
+        # information, le tableau de bord annonçait "HEALTHY" pendant
+        # qu'aucune analyse n'aboutissait. Secondes restantes avant de
+        # retenter, 0 si disponible.
+        "groq_bloque_secondes":   max(0, int(groq_bloque_jusqua() - time.time())) if groq_bloque_jusqua() else 0,
         "timestamp":     datetime.now().isoformat(),
     }
 

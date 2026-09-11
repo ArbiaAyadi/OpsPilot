@@ -169,8 +169,23 @@ class TestTokens:
         assert len(tokens) == 500
 
     def test_tokens_reset_uniques(self):
-        tokens = {auth.generer_token_reset() for _ in range(500)}
-        assert len(tokens) == 500
+        """← CORRIGÉ (test instable, pas le code) : exigeait 500 codes tous
+        distincts sur un espace de 1 000 000 (codes à 6 chiffres). Par le
+        paradoxe des anniversaires, la probabilité d'au moins une collision
+        est de ~11.7% à CHAQUE exécution -- le test échouait donc au hasard,
+        environ une fois sur huit, sans qu'aucun code ait changé. Un test
+        qui échoue aléatoirement est pire qu'inutile : il apprend à ignorer
+        les échecs.
+
+        Vérifie désormais ce qui compte réellement : le format (6 chiffres),
+        et un taux de collision cohérent avec un tirage aléatoire uniforme.
+        Une génération non aléatoire (compteur, valeur constante, faible
+        entropie) produirait bien plus de doublons et serait détectée."""
+        tokens = [auth.generer_token_reset() for _ in range(500)]
+        assert all(len(t) == 6 and t.isdigit() for t in tokens), "format attendu : 6 chiffres"
+        # Tolérance large : ~11.7% de chance d'avoir 1 collision, très peu
+        # d'avoir plus de 5. Un générateur défaillant en produirait des dizaines.
+        assert len(set(tokens)) >= 495, f"trop de doublons : {500 - len(set(tokens))}"
 
     def test_token_longueur_suffisante(self):
         """OWASP recommande >=128 bits d'entropie pour un identifiant de session."""

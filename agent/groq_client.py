@@ -111,6 +111,16 @@ def _enregistrer_tokens(nb_tokens: int, compte: str = "main"):
         _tokens_utilises_jour[compte] = _tokens_utilises_jour.get(compte, 0) + max(0, nb_tokens)
 
 
+def groq_bloque_jusqua() -> float:
+    """Instant (timestamp) jusqu'auquel Groq est en refroidissement, 0 si
+    disponible. Exposé pour que /api/status puisse l'afficher : sans ça,
+    le tableau de bord annonçait un budget sain (5%) pendant que Groq
+    rejetait TOUS les appels -- notre compteur n'incrémente que sur succès,
+    donc une série d'échecs reste invisible. Un opérateur voyait "HEALTHY"
+    et ne comprenait pas pourquoi aucune analyse n'aboutissait."""
+    return _bloque_jusqua if _groq_en_refroidissement() else 0.0
+
+
 def budget_journalier_restant(compte: str = "main") -> int:
     """Tokens restants estimes avant d'atteindre TOKENS_QUOTIDIENS_LIMITE
     aujourd'hui, POUR CE COMPTE PRÉCIS -- basé sur l'usage RÉEL rapporté
@@ -153,6 +163,39 @@ class RateLimiter:
 
 
 rate_limiter = RateLimiter(max_per_minute=30)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Refroidissement global après épuisement de tous les modèles
+# ══════════════════════════════════════════════════════════════════════════════
+# ← AJOUT (constaté en conditions réelles) : quand Groq limite l'accès au
+# niveau du COMPTE, les trois modèles échouent simultanément et
+# immédiatement. Le code retentait alors à chaque cycle de surveillance
+# (60s), en repassant à chaque fois par toute la cascade : 3 modèles x 5s
+# d'attente + 30s de pause + une tentative finale, soit 45+ secondes
+# perdues par cycle, pour un résultat toujours identique.
+#
+# Deux conséquences observées dans le log : chaque cycle traînait, et les
+# tentatives échouées consommaient malgré tout du quota réel côté Groq
+# (une requête rejetée reste une requête comptabilisée) tout en restant
+# invisibles dans notre compteur interne -- qui n'incrémente que sur
+# succès, d'où un budget affiché à 5% alors que Groq bloquait tout.
+#
+# Après un épuisement complet, on s'abstient donc pendant un délai, au
+# lieu de marteler. Les fournisseurs de secours, eux, restent essayés
+# normalement : ils ont leur propre quota, indépendant.
+_REFROIDISSEMENT_GLOBAL_S = int(os.getenv("GROQ_COOLDOWN_APRES_RATE_LIMIT_S", "900"))  # 15 min
+_bloque_jusqua = 0.0
+
+
+def _groq_en_refroidissement() -> bool:
+    return time.time() < _bloque_jusqua
+
+
+def _declencher_refroidissement():
+    global _bloque_jusqua
+    _bloque_jusqua = time.time() + _REFROIDISSEMENT_GLOBAL_S
+    print(f"[Groq] Tous les modeles limites -- pause de {_REFROIDISSEMENT_GLOBAL_S // 60}min "
+          f"avant toute nouvelle tentative (les fournisseurs de secours restent utilises)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -339,6 +382,15 @@ def _appeler_groq_impl(system_prompt: str, messages: list, user_message: str, ma
             "4. Relance : python -m agent.main"
         )
 
+    # ← AJOUT : si Groq nous a limités récemment, on ne retente pas -- on
+    # passe directement aux fournisseurs de secours, qui ont leur propre
+    # quota. Évite 45+ secondes perdues par cycle pour un échec certain.
+    if _groq_en_refroidissement():
+        secours = _essayer_secours(system_prompt, messages, user_message, max_tokens, format_json)
+        if secours:
+            return secours
+        return "Groq temporarily unavailable. Please retry in a moment."
+
     restant = budget_journalier_restant(compte)
     if restant < _MARGE_SECURITE_TOKENS:
         print(f"[Groq:{compte}] Budget journalier quasi épuisé ({restant} tokens restants estimés, "
@@ -401,7 +453,7 @@ def _appeler_groq_impl(system_prompt: str, messages: list, user_message: str, ma
                 print(f"[Groq:{compte}] Erreur {modele}: {str(e)[:120]}")
                 continue
 
-    print(f"[Groq:{compte}] Tous les modeles ont echoue - retry dans 30s")
+    print(f"[Groq:{compte}] Tous les modeles ont echoue - derniere tentative dans 30s")
     time.sleep(30)
     try:
         resp = client.chat.completions.create(
@@ -416,6 +468,12 @@ def _appeler_groq_impl(system_prompt: str, messages: list, user_message: str, ma
         return resp.choices[0].message.content
     except Exception as e:
         print(f"[Groq:{compte}] Retry final echoue: {e}")
+        # ← AJOUT : la tentative finale a échoué elle aussi. Si c'est une
+        # limitation (et non une panne ponctuelle), inutile de recommencer
+        # au prochain cycle -- on déclenche le refroidissement global.
+        err_finale = str(e).lower()
+        if "429" in err_finale or "rate_limit" in err_finale or "too_many" in err_finale or "quota" in err_finale:
+            _declencher_refroidissement()
         # ← Dernier recours avant d'abandonner : les fournisseurs de
         # secours. Couvre le cas d'une panne Groq (et non d'un simple
         # quota), où le budget restant est intact mais le service
