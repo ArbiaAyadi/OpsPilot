@@ -1,0 +1,194 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# OpsPilot — Intégration continue
+# ══════════════════════════════════════════════════════════════════════════════
+# S'exécute sur les serveurs GitHub à chaque push et chaque pull request.
+# Aucune ressource consommée sur le poste de développement — point important
+# ici, où la mémoire disponible est la contrainte principale.
+#
+# Quatre travaux indépendants, exécutés EN PARALLÈLE :
+#   tests    — les 235 tests, contre un vrai PostgreSQL éphémère
+#   qualite  — analyse statique (ruff)
+#   secrets  — recherche d'identifiants dans le code ET dans l'historique
+#   deps     — vulnérabilités connues des dépendances (Trivy)
+#
+# Le parallélisme est délibéré : un échec de lint ne doit pas masquer un
+# échec de test, et inversement. On veut TOUS les problèmes en un seul
+# passage, pas le premier rencontré.
+name: CI
+
+on:
+  push:
+    branches: [opspilot-v6, main, master]
+  pull_request:
+    branches: [opspilot-v6, main, master]
+  # Permet de relancer le pipeline à la demande depuis l'onglet Actions,
+  # utile pour une démonstration en direct sans avoir à pousser un commit.
+  workflow_dispatch:
+
+jobs:
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Tests — avec un VRAI PostgreSQL, pas le repli mémoire
+  # ────────────────────────────────────────────────────────────────────────
+  # Point important : en local, les tests s'exécutent souvent sans base
+  # accessible et empruntent alors le repli mémoire de database.py. Les
+  # vrais chemins SQL (INSERT, UPDATE, la requête de déduplication
+  # donnees->>'target') ne sont donc jamais exercés. Ce service PostgreSQL
+  # éphémère corrige ce trou de couverture : la CI teste ce que la
+  # production exécute réellement.
+  tests:
+    name: Tests (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 est la version de développement. 3.11 vérifie qu'aucune
+        # syntaxe trop récente ne s'est glissée dans le code — utile pour
+        # un déploiement client sur une distribution plus ancienne.
+        python-version: ['3.11', '3.12']
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_DB: opspilot
+          POSTGRES_USER: opspilot
+          POSTGRES_PASSWORD: opspilot_secret
+        ports:
+          - 5432:5432
+        # Sans ce contrôle de santé, les tests démarrent avant que
+        # PostgreSQL n'accepte les connexions et échouent au hasard.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Installer les dépendances
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            echo "::warning::requirements.txt absent — installation de la liste minimale"
+            pip install fastapi uvicorn psycopg2-binary requests python-dotenv \
+                        bcrypt paramiko fpdf2 numpy scikit-learn
+          fi
+          pip install pytest pytest-cov httpx
+
+      - name: Attendre que PostgreSQL soit prêt
+        run: |
+          for i in $(seq 1 30); do
+            pg_isready -h localhost -p 5432 -U opspilot && break
+            sleep 1
+          done
+
+      - name: Lancer la suite de tests
+        env:
+          DB_HOST: localhost
+          DB_PORT: '5432'
+          DB_NAME: opspilot
+          DB_USER: opspilot
+          DB_PASSWORD: opspilot_secret
+          # Valeurs factices : aucun appel réseau réel n'est fait pendant
+          # les tests, mais ces variables doivent exister pour que les
+          # modules s'importent sans avertissement bloquant.
+          GROQ_API_KEY: cle-factice-ci
+          SIGNUP_INVITE_CODE: code-ci
+          PROMETHEUS_URL: http://localhost:9090
+        run: |
+          pytest tests/ -v --cov=. --cov-report=term-missing --cov-report=xml
+
+      - name: Publier le rapport de couverture
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: couverture
+          path: coverage.xml
+          retention-days: 14
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Qualité du code
+  # ────────────────────────────────────────────────────────────────────────
+  qualite:
+    name: Qualité du code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Installer ruff
+        run: pip install ruff
+
+      # Deux passes délibérément séparées.
+      # La première BLOQUE : erreurs de syntaxe, noms non définis, imports
+      # cassés — des défauts qui font planter en production.
+      # La seconde INFORME : style, imports inutilisés, lignes trop longues.
+      # Un projet existant a toujours des écarts de style ; les traiter
+      # comme bloquants rendrait le pipeline rouge en permanence, et un
+      # pipeline toujours rouge n'est plus lu par personne.
+      - name: Erreurs bloquantes
+        run: ruff check . --select=E9,F63,F7,F82 --output-format=full
+
+      - name: Style et bonnes pratiques (informatif)
+        run: ruff check . --statistics || true
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Recherche de secrets — code ET historique
+  # ────────────────────────────────────────────────────────────────────────
+  # Ce projet manipule un mot de passe root Proxmox, un secret de jeton API
+  # et des clés de fournisseurs LLM. Un secret committé par inadvertance
+  # reste dans l'historique Git de façon permanente, même après suppression
+  # du fichier — d'où fetch-depth: 0, qui récupère TOUT l'historique et non
+  # le dernier commit seulement.
+  secrets:
+    name: Recherche de secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Vulnérabilités des dépendances
+  # ────────────────────────────────────────────────────────────────────────
+  deps:
+    name: Vulnérabilités des dépendances
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trivy — analyse du système de fichiers
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          # CRITICAL et HIGH seulement : signaler les vulnérabilités
+          # mineures d'une dépendance transitive noierait les vraies
+          # alertes sous du bruit.
+          severity: CRITICAL,HIGH
+          format: table
+          # exit-code 0 : informe sans bloquer. Une CVE peut apparaître
+          # dans une dépendance sans correctif disponible — bloquer le
+          # pipeline ne la corrigerait pas, mais empêcherait tout le reste
+          # d'avancer. Le rapport reste visible dans les logs.
+          exit-code: '0'
