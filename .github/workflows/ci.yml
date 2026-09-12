@@ -77,6 +77,11 @@ jobs:
       - name: Installer les dépendances
         run: |
           python -m pip install --upgrade pip
+          # PyTorch AVANT le reste, depuis l'index CPU : sinon pip
+          # récupère la variante GPU (plus de 2 Go de bibliothèques CUDA)
+          # pour un modèle LSTM qui tourne très bien sur processeur.
+          # Voir le commentaire correspondant dans requirements.txt.
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
