@@ -348,6 +348,26 @@ def sauvegarder_rapport(anomalies: list, analyse: str, etat: dict, score: float,
     # une fois ajoutée par le rendu). Une seule occurrence désormais.
     titre_seuils, tableau_seuils = _construire_tableau_seuils()
 
+    # ← CORRIGÉ (erreur détectée par la CI sur Python 3.11) : ces deux
+    # valeurs de repli étaient écrites directement dans l'expression de la
+    # f-string, avec un \n à l'intérieur. Python 3.12 l'autorise (PEP 701),
+    # mais 3.11 et antérieurs lèvent "SyntaxError: f-string expression part
+    # cannot include a backslash" -- le module devenait alors impossible à
+    # importer, et 68 tests échouaient en cascade.
+    #
+    # Le bug était invisible en développement local (Python 3.12) : seule
+    # l'exécution sur 3.11 dans la CI l'a révélé. C'est précisément la
+    # raison d'être de la matrice de versions -- le code doit rester
+    # installable chez un client dont la distribution fournit une version
+    # plus ancienne.
+    #
+    # Extraire les valeurs en variables est de toute façon plus lisible
+    # qu'un repli inline dans une chaîne de plusieurs dizaines de lignes.
+    ligne_aucun_noeud = "| No data  | —            | —            | —            | —          | —       |\n"
+    ligne_aucune_vm   = "| No VMs               | —      | —      | —     | —     | —       |\n"
+    noeuds_affiches   = noeuds_rows or ligne_aucun_noeud
+    vms_affichees     = vms_rows    or ligne_aucune_vm
+
     # ← AJOUT : fournisseur ayant réellement produit cette analyse. La
     # ligne "Platform" annonçait systématiquement Groq, même quand la
     # bascule vers un secours (Mistral, Ollama...) avait eu lieu --
@@ -405,7 +425,7 @@ def sauvegarder_rapport(anomalies: list, analyse: str, etat: dict, score: float,
 
 | Node     | CPU          | RAM          | Disk         | Swap       | Status  |
 |----------|--------------|--------------|--------------|------------|---------|
-{noeuds_rows or "| No data  | —            | —            | —            | —          | —       |\n"}
+{noeuds_affiches}
 
 > ⚠ = Critical threshold exceeded | ↑ = Warning threshold exceeded
 
@@ -413,7 +433,7 @@ def sauvegarder_rapport(anomalies: list, analyse: str, etat: dict, score: float,
 
 | Name                 | VMID   | Node   | CPU   | RAM   | Status  |
 |----------------------|--------|--------|-------|-------|---------|
-{vms_rows or "| No VMs               | —      | —      | —     | —     | —       |\n"}
+{vms_affichees}
 
 ---
 
