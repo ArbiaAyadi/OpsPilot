@@ -35,7 +35,34 @@ COPY frontend/package*.json ./
 RUN npm ci
 
 COPY frontend/ ./
-RUN npm run build
+
+# <- CORRIGE (echec reel : "/build/dist: not found" alors que npm run build
+# reussissait) : le chemin de sortie etait code en dur sur "dist/", la
+# valeur par defaut de Vite. Mais vite.config.js peut definir un outDir
+# different (build/, ../static/, ...) -- et ce Dockerfile n'a aucune
+# raison de dependre d'un detail de configuration du frontend.
+#
+# On localise donc la sortie par son CONTENU plutot que par son chemin :
+# le repertoire produit contient forcement un index.html. Il est ensuite
+# copie vers /sortie, emplacement fixe connu de l'etape suivante.
+#
+# Le chemin trouve est affiche dans les logs du build : utile pour
+# comprendre ce qui a ete produit, sans avoir a deviner. Et le message
+# d'erreur explicite evite un echec cryptique deux etapes plus loin,
+# comme celui rencontre.
+RUN npm run build \
+ && CHEMIN=$(find /build -maxdepth 4 -name index.html \
+        -not -path "*/node_modules/*" -not -path "/build/index.html" \
+        2>/dev/null | head -1) \
+ && if [ -z "$CHEMIN" ]; then \
+        echo "ERREUR: npm run build n'a produit aucun index.html dans /build" >&2; \
+        echo "Contenu de /build :" >&2; ls -la /build >&2; \
+        exit 1; \
+    fi \
+ && REPERTOIRE=$(dirname "$CHEMIN") \
+ && echo "Frontend compile trouve dans : $REPERTOIRE" \
+ && mkdir -p /sortie && cp -r "$REPERTOIRE"/. /sortie/ \
+ && echo "Fichiers copies :" && ls /sortie
 
 # --------------------------------------------------------------------------
 # ÉTAPE 2 -- Image finale Python
@@ -82,7 +109,7 @@ COPY agent/ ./agent/
 COPY *.py ./
 
 # Frontend compilé, récupéré depuis l'étape 1 -- sans Node ni node_modules
-COPY --from=frontend /build/dist ./frontend/dist
+COPY --from=frontend /sortie ./frontend/dist
 
 # Répertoires que l'application écrit à l'exécution. Créés ici avec les
 # bons droits : sans cela, l'utilisateur non privilégié ci-dessous ne
