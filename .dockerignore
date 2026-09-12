@@ -1,0 +1,68 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# Fichiers exclus du contexte de build Docker
+# ══════════════════════════════════════════════════════════════════════════════
+# Ce fichier a deux effets, tous deux importants.
+#
+# SÉCURITÉ : sans lui, "docker build ." envoie TOUT le répertoire au démon
+# Docker, y compris le .env. Même si le Dockerfile ne le copie pas, il se
+# retrouve dans le contexte de build -- et un COPY . . accidentel
+# l'embarquerait dans l'image, où il resterait lisible par quiconque
+# récupère cette image.
+#
+# VITESSE : node_modules et venv représentent plusieurs centaines de Mo
+# transférés au démon à chaque build, pour rien.
+
+# ── Secrets — la raison première de ce fichier ────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# ── Git ───────────────────────────────────────────────────────────────────
+.git
+.gitignore
+.github
+
+# ── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+venv/
+env/
+.venv/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# ── Node — reconstruit dans l'étape 1, jamais transféré ───────────────────
+frontend/node_modules/
+frontend/dist/
+node_modules/
+
+# ── Données générées à l'exécution ────────────────────────────────────────
+rapports/
+conversations.json
+llm_memoire.json
+*.db
+*.sqlite
+*.pt
+*.h5
+*.keras
+*.pkl
+
+# ── Tests — non nécessaires dans une image de production ──────────────────
+tests/
+pytest.ini
+
+# ── IDE et divers ─────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+README.md
+docs/

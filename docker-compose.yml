@@ -1,0 +1,162 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# OpsPilot — Orchestration locale
+# ══════════════════════════════════════════════════════════════════════════════
+# Les PROFILS sont la clé de ce fichier. Un service sans profil démarre
+# toujours ; un service avec profil ne démarre que si on le demande
+# explicitement. Cela permet de DÉCLARER une architecture complète tout en
+# n'exécutant que ce dont on a besoin -- indispensable ici, où la mémoire
+# disponible est la contrainte principale.
+#
+#   docker compose up                          -> app + base seulement
+#   docker compose --profile onprem up         -> + Ollama (modèle sur site)
+#   docker compose --profile observability up  -> + Grafana
+#
+# Les profils onprem et observability sont donc documentés et déployables
+# chez un client, sans jamais peser sur la machine de développement.
+
+services:
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Application — l'agent OpsPilot
+  # ────────────────────────────────────────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: opspilot:latest
+    container_name: opspilot-app
+    restart: unless-stopped
+
+    ports:
+      - "8088:8088"
+
+    # env_file plutôt que des variables en dur : les secrets restent dans
+    # .env, qui n'est ni dans le dépôt Git ni dans l'image Docker. C'est
+    # la seule façon correcte de les fournir -- une variable écrite ici
+    # serait committée avec ce fichier.
+    env_file:
+      - .env
+
+    environment:
+      # DB_HOST surchargé : dans un réseau Docker, les services se joignent
+      # par leur NOM, pas par IP. L'adresse 192.168.138.133 du .env vaut
+      # pour une exécution hors conteneur ; ici c'est "db".
+      DB_HOST: db
+      DB_PORT: "5432"
+
+    volumes:
+      # Rapports générés : montés en volume pour survivre à la
+      # reconstruction du conteneur. Sans cela, chaque mise à jour de
+      # l'image effacerait l'historique des incidents.
+      - ./rapports:/app/rapports
+      # Certificats TLS : montés en LECTURE SEULE depuis l'hôte, jamais
+      # embarqués dans l'image. Une clé privée dans une image se retrouve
+      # dans le registre, puis sur chaque machine qui la récupère.
+      - ./certs:/app/certs:ro
+      # Polices du générateur PDF (DejaVu). En lecture seule également.
+      - ./fonts:/app/fonts:ro
+
+    depends_on:
+      db:
+        # service_healthy et non simplement "started" : PostgreSQL met
+        # quelques secondes à accepter les connexions après le démarrage
+        # du processus. Sans cette condition, l'application démarre trop
+        # tôt et bascule en mode mémoire dégradé.
+        condition: service_healthy
+
+    networks:
+      - opspilot
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Base de données
+  # ────────────────────────────────────────────────────────────────────────
+  db:
+    image: postgres:15-alpine
+    container_name: opspilot-db
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: ${DB_NAME:-opspilot}
+      POSTGRES_USER: ${DB_USER:-opspilot}
+      # Aucune valeur par défaut pour le mot de passe : la syntaxe :? fait
+      # échouer le démarrage avec un message explicite s'il est absent.
+      # Un mot de passe par défaut dans un fichier versionné est
+      # exactement le défaut qui a été corrigé dans database.py.
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD doit etre defini dans .env}
+
+    volumes:
+      - db-data:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-opspilot} -d ${DB_NAME:-opspilot}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+    networks:
+      - opspilot
+
+    # Port NON exposé à l'hôte volontairement : la base n'est joignable
+    # que depuis le réseau Docker interne. L'exposer serait une surface
+    # d'attaque inutile. Pour un accès ponctuel en débogage :
+    #   docker compose exec db psql -U opspilot -d opspilot
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Ollama — modèle auto-hébergé (profil onprem)
+  # ────────────────────────────────────────────────────────────────────────
+  # Ne démarre QUE sur demande explicite. Destiné au déploiement chez un
+  # client où aucune donnée d'infrastructure ne doit sortir du réseau :
+  # noms de nœuds, adresses IP, configuration des VMs et points faibles
+  # constituent une cartographie du système d'information, que beaucoup
+  # d'équipes sécurité refusent de voir transiter vers un tiers.
+  #
+  # Non démarré en développement : un modèle 8B demande 5 à 6 Go de RAM.
+  ollama:
+    image: ollama/ollama:latest
+    container_name: opspilot-ollama
+    profiles: [onprem]
+    restart: unless-stopped
+    volumes:
+      - ollama-models:/root/.ollama
+    networks:
+      - opspilot
+    # Après le premier démarrage, télécharger un modèle :
+    #   docker compose exec ollama ollama pull qwen3:8b
+    # Puis dans .env :
+    #   LLM_FALLBACK_PROVIDERS=ollama
+    #   LLM_OLLAMA_URL=http://ollama:11434/v1
+    #   LLM_OLLAMA_MODELS=qwen3:8b
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Grafana — tableaux de bord (profil observability)
+  # ────────────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: opspilot-grafana
+    profiles: [observability]
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      # Provisionnement automatique : sources de données et tableaux de
+      # bord décrits en fichiers versionnés plutôt que configurés à la
+      # main dans l'interface. C'est le principe dashboards-as-code -- un
+      # tableau de bord perdu se recrée par un redéploiement, pas de
+      # mémoire.
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    networks:
+      - opspilot
+
+volumes:
+  db-data:
+  ollama-models:
+  grafana-data:
+
+networks:
+  opspilot:
+    driver: bridge

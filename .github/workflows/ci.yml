@@ -10,6 +10,7 @@
 #   qualite  — analyse statique (ruff)
 #   secrets  — recherche d'identifiants dans le code ET dans l'historique
 #   deps     — vulnérabilités connues des dépendances (Trivy)
+#   image    — construction de l'image Docker + scan de l'image produite
 #
 # Le parallélisme est délibéré : un échec de lint ne doit pas masquer un
 # échec de test, et inversement. On veut TOUS les problèmes en un seul
@@ -196,4 +197,74 @@ jobs:
           # dans une dépendance sans correctif disponible — bloquer le
           # pipeline ne la corrigerait pas, mais empêcherait tout le reste
           # d'avancer. Le rapport reste visible dans les logs.
+          exit-code: '0'
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Image Docker — construction et analyse
+  # ────────────────────────────────────────────────────────────────────────
+  # Construite ICI et non sur le poste de développement. Deux raisons.
+  #
+  # Pratique : Docker Desktop exige WSL2, donc Hyper-V, qui entre en
+  # conflit avec VMware Workstation — sur lequel repose toute
+  # l'infrastructure Proxmox de ce projet. Activer l'un casserait l'autre.
+  #
+  # Méthodologique : une image construite en CI est reproductible, alors
+  # qu'une image construite localement dépend de l'état de la machine du
+  # développeur. C'est la pratique attendue en production.
+  #
+  # L'image n'est PAS publiée : on vérifie qu'elle se construit et qu'elle
+  # est saine. La publication vers un registre viendra avec le déploiement.
+  image:
+    name: Image Docker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Préparer Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Construire l'image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: opspilot:ci
+          # Cache partagé entre exécutions : sans lui, chaque build
+          # réinstalle PyTorch et toutes les dépendances Python depuis
+          # zéro — plusieurs minutes à chaque push.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Vérifier que le conteneur démarre
+        run: |
+          # On ne teste pas l'application complète (elle exige PostgreSQL
+          # et Proxmox), seulement que l'image est exécutable et que
+          # Python peut importer les modules. Un ImportError ici
+          # signalerait une dépendance absente de l'image.
+          docker run --rm --entrypoint python opspilot:ci -c \
+            "import fastapi, psycopg2, paramiko, numpy, sklearn, torch; print('Imports OK')"
+
+      - name: Vérifier que l'image ne tourne pas en root
+        run: |
+          # Un conteneur en root est le premier point relevé par un audit
+          # de sécurité : en cas d'évasion, l'attaquant serait root sur
+          # l'hôte. Ce contrôle garantit que la directive USER du
+          # Dockerfile n'a pas été perdue lors d'une modification.
+          UTILISATEUR=$(docker run --rm --entrypoint id opspilot:ci -un)
+          echo "L'image s'execute en tant que : $UTILISATEUR"
+          if [ "$UTILISATEUR" = "root" ]; then
+            echo "::error::L'image s'execute en root — la directive USER du Dockerfile a disparu"
+            exit 1
+          fi
+
+      - name: Trivy — analyse de l'image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: opspilot:ci
+          severity: CRITICAL,HIGH
+          format: table
+          # Informatif, comme pour l'analyse des dépendances : une CVE
+          # d'une image de base sans correctif disponible ne doit pas
+          # bloquer tout le pipeline. Le rapport reste consultable.
           exit-code: '0'
