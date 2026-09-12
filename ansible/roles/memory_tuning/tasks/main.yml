@@ -98,3 +98,18 @@
       pages partagees par KSM={{ memory_tuning_ksm_pages.stdout | default('indisponible') }}
   # Une verification affichee vaut mieux qu'une confiance implicite :
   # le playbook prouve ce qu'il a fait plutot que de l'affirmer.
+  #
+  # not ansible_check_mode : en mode --check, les deux taches de releve
+  # ci-dessus sont sautees (Ansible n'execute aucune commande), donc
+  # leurs variables sont vides. Sans cette condition, le playbook
+  # affichait "swappiness=, pages partagees par KSM=" -- un message vide
+  # qui n'apprend rien et laisse croire a un probleme. Mieux vaut ne
+  # rien afficher que d'afficher du vide.
+  when: not ansible_check_mode
+
+- name: Rappeler que le mode simulation ne releve aucune valeur
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} : mode simulation (--check) -- les valeurs
+      effectives ne sont pas relevees. Relancer sans --check pour les voir.
+  when: ansible_check_mode

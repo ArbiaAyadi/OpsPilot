@@ -57,6 +57,16 @@
   loop: "{{ monitoring_exporters_verification.results }}"
   loop_control:
     label: "{{ item.item.key }}"
+  # not ansible_check_mode : en --check, la tache de verification est
+  # sautee, donc item.status n'existe pas et default(0) le remplace par
+  # 0 -- le playbook annoncait alors "NE REPOND PAS" pour un exportateur
+  # qui n'a simplement pas ete interroge.
+  #
+  # C'est exactement le type de faux signal que ce projet combat par
+  # ailleurs : annoncer une panne qu'on n'a pas constatee detruit la
+  # confiance dans toutes les autres alertes. Un outil ne doit jamais
+  # affirmer plus que ce qu'il a verifie.
+  when: not ansible_check_mode
 
 - name: Signaler les exportateurs injoignables
   ansible.builtin.debug:
