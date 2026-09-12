@@ -1,0 +1,46 @@
+---
+# ---------------------------------------------------------------------------
+# Role : proxmox_repos
+# ---------------------------------------------------------------------------
+# Desactive les depots Proxmox "enterprise", qui exigent un abonnement
+# payant. Sans abonnement, ils renvoient 401 et font ECHOUER tout
+# "apt update" -- donc toute installation ou mise a jour sur le noeud.
+#
+# Cas rencontre en conditions reelles sur ce cluster : Ansible lui-meme
+# n'a pas pu s'installer avant que ce point soit corrige a la main. Ce
+# role automatise la correction : elle s'applique a tous les noeuds de
+# l'inventaire en une commande, et a tout noeud ajoute plus tard.
+
+- name: Rechercher les fichiers declarant un depot enterprise
+  ansible.builtin.find:
+    paths:
+      - /etc/apt/sources.list.d
+    patterns:
+      - "*.list"
+      - "*.sources"
+    contains: ".*enterprise\\.proxmox\\.com.*"
+  register: proxmox_repos_depots
+
+- name: Desactiver les depots enterprise trouves
+  # Renomme plutot que supprime : le fichier reste recuperable si un
+  # abonnement est souscrit plus tard. Supprimer une configuration qu'on
+  # ne peut pas recreer serait destructif sans necessite.
+  ansible.builtin.command:
+    cmd: "mv {{ item.path }} {{ item.path }}.disabled"
+    # creates rend la tache IDEMPOTENTE : sans lui, la commande
+    # s'executerait a chaque passage et serait signalee "changed" meme
+    # sans rien a faire -- on ne pourrait plus distinguer une execution
+    # qui modifie vraiment quelque chose d'une execution a vide.
+    creates: "{{ item.path }}.disabled"
+  loop: "{{ proxmox_repos_depots.files }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+  notify: Mettre a jour le cache apt
+
+- name: Verifier que apt update fonctionne
+  ansible.builtin.apt:
+    update_cache: true
+  changed_when: false
+  # Sans cette verification, une erreur de depot ne se manifesterait que
+  # plus tard, au moment d'installer un paquet -- avec un message qui
+  # n'indiquerait pas la vraie cause.

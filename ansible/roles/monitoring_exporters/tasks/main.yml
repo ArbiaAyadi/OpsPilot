@@ -1,0 +1,72 @@
+---
+# ---------------------------------------------------------------------------
+# Role : monitoring_exporters
+# ---------------------------------------------------------------------------
+# Garantit que les exportateurs Prometheus sont installes ET ACTIVES AU
+# DEMARRAGE.
+#
+# Le "et active au demarrage" est le coeur de ce role. Sur ce cluster,
+# postgres_exporter et process-exporter tournaient bien -- jusqu'au
+# redemarrage d'une VM, apres lequel ils ne repartaient pas. Prometheus
+# cessait alors de collecter, et l'agent en concluait "PostgreSQL is
+# DOWN" alors que la base fonctionnait parfaitement : une fausse alerte
+# CRITIQUE causee par une sonde muette.
+#
+# Un service demarre a la main est un service qui disparait au prochain
+# reboot. C'est precisement le genre de defaut qu'Ansible elimine.
+
+- name: Installer les exportateurs
+  ansible.builtin.apt:
+    name: "{{ exportateurs_requis }}"
+    state: present
+  register: monitoring_exporters_installation
+
+- name: Activer et demarrer chaque exportateur
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: true      # <- au demarrage du systeme
+    state: started     # <- maintenant
+  loop: "{{ exportateurs_requis }}"
+  # Un exportateur absent du systeme ne doit pas faire echouer le
+  # playbook pour les autres : chaque noeud peut avoir une composition
+  # differente.
+  failed_when: false
+  register: monitoring_exporters_activation
+
+- name: Verifier que chaque exportateur repond reellement
+  # "active" selon systemd ne prouve pas que le port repond : un service
+  # peut demarrer puis echouer a ouvrir sa socket. Cas rencontre sur ce
+  # cluster -- systemctl annoncait "active (running)" pendant que
+  # Prometheus recevait "connection refused". On interroge donc le port.
+  ansible.builtin.uri:
+    url: "http://localhost:{{ item.value }}/metrics"
+    method: GET
+    timeout: 5
+  loop: "{{ ports_exportateurs | dict2items }}"
+  loop_control:
+    label: "{{ item.key }} (port {{ item.value }})"
+  register: monitoring_exporters_verification
+  failed_when: false
+  changed_when: false
+
+- name: Resumer l'etat des exportateurs
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.item.key }} (port {{ item.item.value }}) :
+      {{ 'repond' if item.status | default(0) == 200 else 'NE REPOND PAS' }}
+  loop: "{{ monitoring_exporters_verification.results }}"
+  loop_control:
+    label: "{{ item.item.key }}"
+
+- name: Signaler les exportateurs injoignables
+  ansible.builtin.debug:
+    msg: >-
+      ATTENTION : {{ monitoring_exporters_verification.results
+                     | selectattr('status', 'defined')
+                     | rejectattr('status', 'equalto', 200)
+                     | map(attribute='item.key') | list | join(', ') }}
+      ne repondent pas -- verifier avec : journalctl -u <service> -n 30
+  when: >-
+    monitoring_exporters_verification.results
+    | selectattr('status', 'defined')
+    | rejectattr('status', 'equalto', 200) | list | length > 0

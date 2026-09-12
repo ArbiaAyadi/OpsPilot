@@ -1,0 +1,11 @@
+---
+- name: Appliquer les reglages sysctl
+  # --system relit TOUS les fichiers de /etc/sysctl.d : plus robuste que
+  # de recharger un seul fichier, et coherent avec ce que fait le systeme
+  # au demarrage.
+  ansible.builtin.command:
+    cmd: sysctl --system
+  # sysctl --system relit la configuration : il n'y a rien a "changer" au
+  # sens d'Ansible. Sans changed_when: false, chaque execution serait
+  # signalee comme une modification, ce qui masquerait les vraies.
+  changed_when: false

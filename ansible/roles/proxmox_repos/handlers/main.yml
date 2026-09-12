@@ -1,0 +1,7 @@
+---
+# Un handler ne s'execute QUE si une tache l'a notifie, et une seule fois
+# meme si plusieurs taches le notifient. C'est ce qui evite de relancer
+# "apt update" apres chaque fichier desactive.
+- name: Mettre a jour le cache apt
+  ansible.builtin.apt:
+    update_cache: true

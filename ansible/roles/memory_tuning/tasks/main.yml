@@ -1,0 +1,100 @@
+---
+# ---------------------------------------------------------------------------
+# Role : memory_tuning
+# ---------------------------------------------------------------------------
+# Applique les deux reglages memoire que l'agent OpsPilot recommande le
+# plus souvent sur ce cluster, et qui etaient jusqu'ici appliques a la
+# main, noeud par noeud, apres chaque redemarrage.
+#
+# vm.swappiness : Debian le fixe a 60, valeur adaptee a un serveur
+# disposant de memoire confortable. Sur un noeud sous pression, elle
+# provoque un va-et-vient disque couteux -- mesure sur ce cluster :
+# jusqu'a 538 ms de latence en ecriture. A 10, le noyau prefere garder
+# les pages en RAM.
+#
+# KSM : deduplique les pages memoire identiques entre VMs. Sur un
+# hyperviseur faisant tourner plusieurs invites similaires, le gain est
+# reel et sans interruption de service.
+
+# NOTE : le module ansible.posix.sysctl ferait cela en une tache, mais
+# il appartient a une COLLECTION externe (ansible.posix), absente
+# d'ansible-core. L'utiliser imposerait un "ansible-galaxy collection
+# install" prealable sur chaque machine de controle -- une dependance
+# supplementaire pour un reglage que deux modules du coeur couvrent
+# parfaitement. On reste donc sur ansible.builtin, disponible partout.
+
+- name: Ecrire vm.swappiness de facon persistante
+  ansible.builtin.copy:
+    # Un fichier dedie dans sysctl.d plutot que /etc/sysctl.conf : il
+    # survit aux mises a jour du systeme, qui peuvent remplacer
+    # sysctl.conf. C'est la convention Debian actuelle.
+    dest: /etc/sysctl.d/99-opspilot.conf
+    content: |
+      # Gere par Ansible (role memory_tuning) - ne pas editer a la main
+      vm.swappiness = {{ swappiness_cible }}
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Appliquer les reglages sysctl
+
+- name: Appliquer vm.swappiness immediatement
+  # Sans cette tache, la valeur ne prendrait effet qu'au prochain
+  # redemarrage -- le playbook annoncerait un reglage qui n'est pas
+  # encore actif.
+  ansible.builtin.command:
+    cmd: "sysctl -w vm.swappiness={{ swappiness_cible }}"
+  changed_when: false
+
+- name: Activer KSM immediatement
+  ansible.builtin.copy:
+    content: "1\n"
+    dest: /sys/kernel/mm/ksm/run
+    # /sys est un systeme de fichiers virtuel : ni proprietaire ni
+    # permissions a definir, et unsafe_writes est necessaire car une
+    # ecriture atomique (fichier temporaire puis renommage) y est
+    # impossible.
+    unsafe_writes: true
+    # mode explicite meme sur /sys : ansible-lint le signale a juste
+    # titre comme une imprudence generale. La valeur correspond a celle
+    # que le noyau impose de toute facon sur ce fichier virtuel.
+    mode: "0644"
+  # Un noyau sans support KSM ferait echouer le playbook entier pour un
+  # reglage optionnel. On signale sans bloquer.
+  failed_when: false
+  changed_when: false
+
+- name: Installer ksmtuned pour rendre KSM persistant
+  ansible.builtin.apt:
+    name: ksmtuned
+    state: present
+  # Sans ksmtuned, l'ecriture ci-dessus est perdue au redemarrage du
+  # noeud -- exactement le probleme rencontre avec les exportateurs :
+  # un reglage applique a la main ne survit pas a un reboot.
+  register: memory_tuning_ksmtuned_install
+
+- name: Activer ksmtuned au demarrage
+  ansible.builtin.systemd_service:
+    name: ksmtuned
+    enabled: true
+    state: started
+  when: memory_tuning_ksmtuned_install is succeeded
+
+- name: Relever la valeur effective de swappiness
+  ansible.builtin.command: cat /proc/sys/vm/swappiness
+  register: memory_tuning_swappiness_effectif
+  changed_when: false
+
+- name: Relever le nombre de pages partagees par KSM
+  ansible.builtin.command: cat /sys/kernel/mm/ksm/pages_sharing
+  register: memory_tuning_ksm_pages
+  changed_when: false
+  failed_when: false
+
+- name: Afficher l'etat memoire apres reglage
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} :
+      swappiness={{ memory_tuning_swappiness_effectif.stdout }},
+      pages partagees par KSM={{ memory_tuning_ksm_pages.stdout | default('indisponible') }}
+  # Une verification affichee vaut mieux qu'une confiance implicite :
+  # le playbook prouve ce qu'il a fait plutot que de l'affirmer.

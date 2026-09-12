@@ -1,0 +1,70 @@
+---
+# ---------------------------------------------------------------------------
+# OpsPilot - Configuration des noeuds Proxmox
+# ---------------------------------------------------------------------------
+# Rend reproductible ce qui etait jusqu'ici applique a la main, noeud par
+# noeud, apres chaque redemarrage.
+#
+#   ansible-playbook site.yml                  applique tout
+#   ansible-playbook site.yml --check           simule sans rien modifier
+#   ansible-playbook site.yml --tags tuning     un seul aspect
+#   ansible-playbook site.yml --limit pve2      un seul noeud
+#
+# IDEMPOTENCE : relancer ce playbook est sans danger. Une seconde
+# execution doit afficher "changed=0" -- rien a faire, tout est deja
+# conforme. C'est la propriete fondamentale d'Ansible : le playbook
+# decrit l'ETAT VOULU, pas une suite d'actions. Il ne modifie que
+# l'ecart entre cet etat et la realite.
+
+- name: Configurer les noeuds Proxmox pour OpsPilot
+  hosts: proxmox_nodes
+  become: false        # deja root via ansible_user
+  gather_facts: true
+
+  vars:
+    # Valeurs regroupees ici plutot que dispersees dans les roles :
+    # un seul endroit a modifier, et elles sont surchargeables en ligne
+    # de commande (-e "swappiness_cible=20") sans editer le code.
+    swappiness_cible: 10
+
+    # Exportateurs attendus sur un NOEUD Proxmox. Les VMs invitees ont une
+    # composition differente (postgres_exporter sur celle qui heberge la
+    # base) -- d'ou des groupes distincts dans l'inventaire plutot qu'une
+    # liste unique appliquee partout.
+    exportateurs_requis:
+      - prometheus-node-exporter
+
+    ports_exportateurs:
+      prometheus-node-exporter: 9100
+
+  pre_tasks:
+    - name: Afficher l'etat memoire avant intervention
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} ({{ ansible_default_ipv4.address }}) :
+          {{ ansible_memory_mb.real.total }} Mo au total,
+          {{ ansible_memory_mb.real.free }} Mo libres,
+          {{ ansible_memory_mb.swap.used }} Mo de swap utilises
+      # Un point de comparaison avant/apres, releve automatiquement.
+      # Sans lui, impossible de dire si le playbook a servi a quelque chose.
+
+  roles:
+    # L'ordre compte : les depots doivent fonctionner avant toute
+    # installation de paquet, sinon les deux roles suivants echouent.
+    - role: proxmox_repos
+      tags: [repos]
+
+    - role: memory_tuning
+      tags: [tuning, memoire]
+
+    - role: monitoring_exporters
+      tags: [exporters, monitoring]
+
+  post_tasks:
+    - name: Afficher l'etat memoire apres intervention
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} : configuration appliquee.
+          Verifier l'effet sur la page Infrastructure d'OpsPilot -
+          les reglages memoire mettent quelques minutes a se traduire
+          dans les metriques.
