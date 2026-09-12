@@ -63,21 +63,53 @@
   failed_when: false
   changed_when: false
 
-- name: Installer ksmtuned pour rendre KSM persistant
-  ansible.builtin.apt:
-    name: ksmtuned
-    state: present
-  # Sans ksmtuned, l'ecriture ci-dessus est perdue au redemarrage du
-  # noeud -- exactement le probleme rencontre avec les exportateurs :
-  # un reglage applique a la main ne survit pas a un reboot.
-  register: memory_tuning_ksmtuned_install
+# <- CORRIGE (echec reel) : la version precedente installait le paquet
+# Debian "ksmtuned", ce qui echouait avec :
+#   "trying to overwrite /etc/ksmtuned.conf, which is also in package
+#    ksm-control-daemon (1.5-1)"
+#
+# Proxmox fournit DEJA cette fonctionnalite via son propre paquet
+# ksm-control-daemon. Les deux se disputent le meme fichier de
+# configuration, et dpkg refuse -- a juste titre.
+#
+# Pire : ksmtuned tirait au passage mesa, libgl1 et des bibliotheques
+# graphiques sur un hyperviseur sans ecran. Installer 10 Mo de pilotes
+# OpenGL pour regler la memoire aurait ete absurde.
+#
+# On teste donc la CAPACITE (le service ksmtuned existe-t-il ?) plutot
+# que le NOM DU PAQUET. C'est plus robuste : le playbook fonctionne sur
+# Proxmox comme sur un Debian standard, sans savoir lequel fournit quoi.
 
-- name: Activer ksmtuned au demarrage
+- name: Relever les services connus du systeme
+  # service_facts plutot qu'un appel a systemctl : ansible-lint signale
+  # a juste titre qu'un module dedie existe. Il est aussi plus portable
+  # (il gere systemd, sysvinit, etc.) et remplit ansible_facts.services,
+  # reutilisable par les taches suivantes sans nouvel appel.
+  ansible.builtin.service_facts:
+
+- name: Installer un regulateur KSM si aucun n'est present
+  ansible.builtin.apt:
+    name: ksm-control-daemon
+    state: present
+    # install_recommends: false -- sans cela, apt tire les dependances
+    # "recommandees", dont les bibliotheques graphiques constatees lors
+    # de l'echec precedent : 10 Mo de pilotes OpenGL sur un hyperviseur
+    # sans ecran.
+    install_recommends: false
+  when: "'ksmtuned.service' not in ansible_facts.services"
+  register: memory_tuning_ksm_install
+  failed_when: false
+
+- name: Activer la regulation KSM au demarrage
   ansible.builtin.systemd_service:
     name: ksmtuned
     enabled: true
     state: started
-  when: memory_tuning_ksmtuned_install is succeeded
+  # Sans cette activation, l'ecriture directe dans /sys plus haut est
+  # perdue au redemarrage du noeud -- exactement le probleme rencontre
+  # avec les exportateurs : un reglage applique a la main ne survit pas
+  # a un reboot.
+  failed_when: false
 
 - name: Relever la valeur effective de swappiness
   ansible.builtin.command: cat /proc/sys/vm/swappiness
