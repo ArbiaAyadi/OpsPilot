@@ -45,6 +45,9 @@ coverage.xml
 # --- Node : reconstruit dans l'etape 1, jamais transfere ---
 frontend/node_modules/
 frontend/dist/
+# dist/ (racine) volontairement NON exclu : le Dockerfile le produit dans
+# l etape 1, mais l exclure empecherait un build local de fonctionner si
+# le frontend a deja ete compile sur la machine.
 node_modules/
 
 # --- Donnees generees a l'execution ---

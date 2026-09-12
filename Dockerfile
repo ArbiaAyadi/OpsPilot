@@ -36,33 +36,26 @@ RUN npm ci
 
 COPY frontend/ ./
 
-# <- CORRIGE (echec reel : "/build/dist: not found" alors que npm run build
-# reussissait) : le chemin de sortie etait code en dur sur "dist/", la
-# valeur par defaut de Vite. Mais vite.config.js peut definir un outDir
-# different (build/, ../static/, ...) -- et ce Dockerfile n'a aucune
-# raison de dependre d'un detail de configuration du frontend.
+# Sortie du build : vite.config.js definit outDir: '../dist', donc Vite
+# ecrit un niveau AU-DESSUS du repertoire de travail. Avec WORKDIR /build,
+# la sortie va dans /dist -- pas dans /build/dist.
 #
-# On localise donc la sortie par son CONTENU plutot que par son chemin :
-# le repertoire produit contient forcement un index.html. Il est ensuite
-# copie vers /sortie, emplacement fixe connu de l'etape suivante.
+# C'est une configuration volontaire du projet : FastAPI sert les fichiers
+# statiques depuis un dossier a la racine, pas depuis frontend/. Le
+# Dockerfile doit donc suivre cette convention plutot que supposer
+# l'emplacement par defaut de Vite.
 #
-# Le chemin trouve est affiche dans les logs du build : utile pour
-# comprendre ce qui a ete produit, sans avoir a deviner. Et le message
-# d'erreur explicite evite un echec cryptique deux etapes plus loin,
-# comme celui rencontre.
+# La verification explicite ci-dessous evite un echec cryptique deux
+# etapes plus loin ("/build/dist: not found" au moment du COPY), qui
+# n'indiquait ni la cause ni l'emplacement reel.
 RUN npm run build \
- && CHEMIN=$(find /build -maxdepth 4 -name index.html \
-        -not -path "*/node_modules/*" -not -path "/build/index.html" \
-        2>/dev/null | head -1) \
- && if [ -z "$CHEMIN" ]; then \
-        echo "ERREUR: npm run build n'a produit aucun index.html dans /build" >&2; \
-        echo "Contenu de /build :" >&2; ls -la /build >&2; \
+ && if [ ! -f /dist/index.html ]; then \
+        echo "ERREUR: index.html absent de /dist apres npm run build" >&2; \
+        echo "Verifier build.outDir dans frontend/vite.config.js" >&2; \
+        ls -la / /build 2>/dev/null >&2; \
         exit 1; \
     fi \
- && REPERTOIRE=$(dirname "$CHEMIN") \
- && echo "Frontend compile trouve dans : $REPERTOIRE" \
- && mkdir -p /sortie && cp -r "$REPERTOIRE"/. /sortie/ \
- && echo "Fichiers copies :" && ls /sortie
+ && echo "Frontend compile :" && ls /dist
 
 # --------------------------------------------------------------------------
 # ÉTAPE 2 -- Image finale Python
@@ -108,8 +101,17 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY agent/ ./agent/
 COPY *.py ./
 
-# Frontend compilé, récupéré depuis l'étape 1 -- sans Node ni node_modules
-COPY --from=frontend /sortie ./frontend/dist
+# Frontend compile, recupere depuis l'etape 1 -- sans Node ni node_modules.
+#
+# Destination "./dist" et non "./frontend/dist" : agent/config.py definit
+# DIST_DIR = BASE_DIR / "dist", et agent/main.py y monte /assets et sert
+# index.html. Copier ailleurs produirait une image ou le backend demarre
+# normalement mais renvoie 404 sur toute l'interface -- une panne
+# silencieuse, bien plus penible a diagnostiquer qu'un echec de build.
+#
+# C'est coherent avec outDir: '../dist' du vite.config.js : le frontend
+# compile vit a la racine du projet, pas sous frontend/.
+COPY --from=frontend /dist ./dist
 
 # Répertoires que l'application écrit à l'exécution. Créés ici avec les
 # bons droits : sans cela, l'utilisateur non privilégié ci-dessous ne
