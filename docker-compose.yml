@@ -1,6 +1,6 @@
-# ══════════════════════════════════════════════════════════════════════════════
-# OpsPilot — Orchestration locale
-# ══════════════════════════════════════════════════════════════════════════════
+# ------------------------------------------------------------------------------
+# OpsPilot -- Orchestration locale
+# ------------------------------------------------------------------------------
 # Les PROFILS sont la clé de ce fichier. Un service sans profil démarre
 # toujours ; un service avec profil ne démarre que si on le demande
 # explicitement. Cela permet de DÉCLARER une architecture complète tout en
@@ -16,9 +16,9 @@
 
 services:
 
-  # ────────────────────────────────────────────────────────────────────────
-  # Application — l'agent OpsPilot
-  # ────────────────────────────────────────────────────────────────────────
+  # ------------------------------------------------------------------------
+  # Application -- l'agent OpsPilot
+  # ------------------------------------------------------------------------
   app:
     build:
       context: .
@@ -67,9 +67,9 @@ services:
     networks:
       - opspilot
 
-  # ────────────────────────────────────────────────────────────────────────
+  # ------------------------------------------------------------------------
   # Base de données
-  # ────────────────────────────────────────────────────────────────────────
+  # ------------------------------------------------------------------------
   db:
     image: postgres:15-alpine
     container_name: opspilot-db
@@ -102,9 +102,9 @@ services:
     # d'attaque inutile. Pour un accès ponctuel en débogage :
     #   docker compose exec db psql -U opspilot -d opspilot
 
-  # ────────────────────────────────────────────────────────────────────────
-  # Ollama — modèle auto-hébergé (profil onprem)
-  # ────────────────────────────────────────────────────────────────────────
+  # ------------------------------------------------------------------------
+  # Ollama -- modèle auto-hébergé (profil onprem)
+  # ------------------------------------------------------------------------
   # Ne démarre QUE sur demande explicite. Destiné au déploiement chez un
   # client où aucune donnée d'infrastructure ne doit sortir du réseau :
   # noms de nœuds, adresses IP, configuration des VMs et points faibles
@@ -128,9 +128,9 @@ services:
     #   LLM_OLLAMA_URL=http://ollama:11434/v1
     #   LLM_OLLAMA_MODELS=qwen3:8b
 
-  # ────────────────────────────────────────────────────────────────────────
-  # Grafana — tableaux de bord (profil observability)
-  # ────────────────────────────────────────────────────────────────────────
+  # ------------------------------------------------------------------------
+  # Grafana -- tableaux de bord (profil observability)
+  # ------------------------------------------------------------------------
   grafana:
     image: grafana/grafana-oss:latest
     container_name: opspilot-grafana

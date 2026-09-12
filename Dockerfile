@@ -1,6 +1,6 @@
-# ══════════════════════════════════════════════════════════════════════════════
-# OpsPilot — Image de production
-# ══════════════════════════════════════════════════════════════════════════════
+# ------------------------------------------------------------------------------
+# OpsPilot -- Image de production
+# ------------------------------------------------------------------------------
 # Construction en DEUX ÉTAPES (multi-stage). L'intérêt n'est pas cosmétique :
 # l'étape 1 a besoin de Node.js et des ~200 Mo de node_modules pour compiler
 # le frontend React, mais l'image finale n'a besoin QUE du résultat compilé.
@@ -13,9 +13,9 @@
 # Exécution    : voir docker-compose.yml (les secrets et certificats sont
 #                montés depuis l'extérieur, jamais dans l'image)
 
-# ──────────────────────────────────────────────────────────────────────────
-# ÉTAPE 1 — Compilation du frontend React
-# ──────────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------
+# ÉTAPE 1 -- Compilation du frontend React
+# --------------------------------------------------------------------------
 FROM node:20-alpine AS frontend
 
 WORKDIR /build
@@ -37,9 +37,9 @@ RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
-# ──────────────────────────────────────────────────────────────────────────
-# ÉTAPE 2 — Image finale Python
-# ──────────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------
+# ÉTAPE 2 -- Image finale Python
+# --------------------------------------------------------------------------
 # slim plutôt qu'alpine pour Python : les paquets scientifiques (numpy,
 # scikit-learn, torch) publient des binaires précompilés pour glibc, pas
 # pour la musl d'alpine. Sur alpine, pip devrait tout recompiler depuis
@@ -89,7 +89,7 @@ COPY --from=frontend /build/dist ./frontend/dist
 # pourrait pas y écrire, et la génération de rapports échouerait.
 RUN mkdir -p rapports fonts
 
-# ── Utilisateur non privilégié ─────────────────────────────────────────
+# -- Utilisateur non privilégié -----------------------------------------
 # Par défaut, un conteneur s'exécute en root. Si une faille permettait
 # une évasion du conteneur, l'attaquant serait root sur l'hôte. Un
 # utilisateur dédié sans privilèges réduit fortement cette conséquence --

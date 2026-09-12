@@ -1,16 +1,16 @@
-# ══════════════════════════════════════════════════════════════════════════════
-# OpsPilot — Intégration continue
-# ══════════════════════════════════════════════════════════════════════════════
+# ------------------------------------------------------------------------------
+# OpsPilot -- Intégration continue
+# ------------------------------------------------------------------------------
 # S'exécute sur les serveurs GitHub à chaque push et chaque pull request.
-# Aucune ressource consommée sur le poste de développement — point important
+# Aucune ressource consommée sur le poste de développement -- point important
 # ici, où la mémoire disponible est la contrainte principale.
 #
 # Quatre travaux indépendants, exécutés EN PARALLÈLE :
-#   tests    — les 235 tests, contre un vrai PostgreSQL éphémère
-#   qualite  — analyse statique (ruff)
-#   secrets  — recherche d'identifiants dans le code ET dans l'historique
-#   deps     — vulnérabilités connues des dépendances (Trivy)
-#   image    — construction de l'image Docker + scan de l'image produite
+#   tests    -- les 235 tests, contre un vrai PostgreSQL éphémère
+#   qualite  -- analyse statique (ruff)
+#   secrets  -- recherche d'identifiants dans le code ET dans l'historique
+#   deps     -- vulnérabilités connues des dépendances (Trivy)
+#   image    -- construction de l'image Docker + scan de l'image produite
 #
 # Le parallélisme est délibéré : un échec de lint ne doit pas masquer un
 # échec de test, et inversement. On veut TOUS les problèmes en un seul
@@ -28,9 +28,9 @@ on:
 
 jobs:
 
-  # ────────────────────────────────────────────────────────────────────────
-  # Tests — avec un VRAI PostgreSQL, pas le repli mémoire
-  # ────────────────────────────────────────────────────────────────────────
+  # ------------------------------------------------------------------------
+  # Tests -- avec un VRAI PostgreSQL, pas le repli mémoire
+  # ------------------------------------------------------------------------
   # Point important : en local, les tests s'exécutent souvent sans base
   # accessible et empruntent alors le repli mémoire de database.py. Les
   # vrais chemins SQL (INSERT, UPDATE, la requête de déduplication
@@ -45,7 +45,7 @@ jobs:
       fail-fast: false
       matrix:
         # 3.12 est la version de développement. 3.11 vérifie qu'aucune
-        # syntaxe trop récente ne s'est glissée dans le code — utile pour
+        # syntaxe trop récente ne s'est glissée dans le code -- utile pour
         # un déploiement client sur une distribution plus ancienne.
         python-version: ['3.11', '3.12']
 
@@ -86,7 +86,7 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            echo "::warning::requirements.txt absent — installation de la liste minimale"
+            echo "::warning::requirements.txt absent -- installation de la liste minimale"
             pip install fastapi uvicorn psycopg2-binary requests python-dotenv \
                         bcrypt paramiko fpdf2 numpy scikit-learn
           fi
@@ -123,9 +123,9 @@ jobs:
           path: coverage.xml
           retention-days: 14
 
-  # ────────────────────────────────────────────────────────────────────────
+  # ------------------------------------------------------------------------
   # Qualité du code
-  # ────────────────────────────────────────────────────────────────────────
+  # ------------------------------------------------------------------------
   qualite:
     name: Qualité du code
     runs-on: ubuntu-latest
@@ -142,7 +142,7 @@ jobs:
 
       # Deux passes délibérément séparées.
       # La première BLOQUE : erreurs de syntaxe, noms non définis, imports
-      # cassés — des défauts qui font planter en production.
+      # cassés -- des défauts qui font planter en production.
       # La seconde INFORME : style, imports inutilisés, lignes trop longues.
       # Un projet existant a toujours des écarts de style ; les traiter
       # comme bloquants rendrait le pipeline rouge en permanence, et un
@@ -153,13 +153,13 @@ jobs:
       - name: Style et bonnes pratiques (informatif)
         run: ruff check . --statistics || true
 
-  # ────────────────────────────────────────────────────────────────────────
-  # Recherche de secrets — code ET historique
-  # ────────────────────────────────────────────────────────────────────────
+  # ------------------------------------------------------------------------
+  # Recherche de secrets -- code ET historique
+  # ------------------------------------------------------------------------
   # Ce projet manipule un mot de passe root Proxmox, un secret de jeton API
   # et des clés de fournisseurs LLM. Un secret committé par inadvertance
   # reste dans l'historique Git de façon permanente, même après suppression
-  # du fichier — d'où fetch-depth: 0, qui récupère TOUT l'historique et non
+  # du fichier -- d'où fetch-depth: 0, qui récupère TOUT l'historique et non
   # le dernier commit seulement.
   secrets:
     name: Recherche de secrets
@@ -174,16 +174,16 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # ────────────────────────────────────────────────────────────────────────
+  # ------------------------------------------------------------------------
   # Vulnérabilités des dépendances
-  # ────────────────────────────────────────────────────────────────────────
+  # ------------------------------------------------------------------------
   deps:
     name: Vulnérabilités des dépendances
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Trivy — analyse du système de fichiers
+      - name: Trivy -- analyse du système de fichiers
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: fs
@@ -194,18 +194,18 @@ jobs:
           severity: CRITICAL,HIGH
           format: table
           # exit-code 0 : informe sans bloquer. Une CVE peut apparaître
-          # dans une dépendance sans correctif disponible — bloquer le
+          # dans une dépendance sans correctif disponible -- bloquer le
           # pipeline ne la corrigerait pas, mais empêcherait tout le reste
           # d'avancer. Le rapport reste visible dans les logs.
           exit-code: '0'
 
-  # ────────────────────────────────────────────────────────────────────────
-  # Image Docker — construction et analyse
-  # ────────────────────────────────────────────────────────────────────────
+  # ------------------------------------------------------------------------
+  # Image Docker -- construction et analyse
+  # ------------------------------------------------------------------------
   # Construite ICI et non sur le poste de développement. Deux raisons.
   #
   # Pratique : Docker Desktop exige WSL2, donc Hyper-V, qui entre en
-  # conflit avec VMware Workstation — sur lequel repose toute
+  # conflit avec VMware Workstation -- sur lequel repose toute
   # l'infrastructure Proxmox de ce projet. Activer l'un casserait l'autre.
   #
   # Méthodologique : une image construite en CI est reproductible, alors
@@ -232,7 +232,7 @@ jobs:
           tags: opspilot:ci
           # Cache partagé entre exécutions : sans lui, chaque build
           # réinstalle PyTorch et toutes les dépendances Python depuis
-          # zéro — plusieurs minutes à chaque push.
+          # zéro -- plusieurs minutes à chaque push.
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -254,11 +254,11 @@ jobs:
           UTILISATEUR=$(docker run --rm --entrypoint id opspilot:ci -un)
           echo "L'image s'execute en tant que : $UTILISATEUR"
           if [ "$UTILISATEUR" = "root" ]; then
-            echo "::error::L'image s'execute en root — la directive USER du Dockerfile a disparu"
+            echo "::error::L'image s'execute en root -- la directive USER du Dockerfile a disparu"
             exit 1
           fi
 
-      - name: Trivy — analyse de l'image
+      - name: Trivy -- analyse de l'image
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: opspilot:ci

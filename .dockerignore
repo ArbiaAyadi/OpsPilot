@@ -1,18 +1,23 @@
-# ══════════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
 # Fichiers exclus du contexte de build Docker
-# ══════════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
 # Ce fichier a deux effets, tous deux importants.
 #
-# SÉCURITÉ : sans lui, "docker build ." envoie TOUT le répertoire au démon
-# Docker, y compris le .env. Même si le Dockerfile ne le copie pas, il se
+# SECURITE : sans lui, "docker build ." envoie TOUT le repertoire au demon
+# Docker, y compris le .env. Meme si le Dockerfile ne le copie pas, il se
 # retrouve dans le contexte de build -- et un COPY . . accidentel
-# l'embarquerait dans l'image, où il resterait lisible par quiconque
-# récupère cette image.
+# l'embarquerait dans l'image, ou il resterait lisible par quiconque
+# recupere cette image.
 #
-# VITESSE : node_modules et venv représentent plusieurs centaines de Mo
-# transférés au démon à chaque build, pour rien.
+# VITESSE : node_modules et venv representent plusieurs centaines de Mo
+# transferes au demon a chaque build, pour rien.
+#
+# NOTE : ce fichier volontairement en ASCII pur. Une premiere version
+# utilisait des caracteres de decoration Unicode, qui s'affichaient mal
+# sur un terminal Windows configure en encodage local. Un fichier de
+# configuration n'a rien a gagner a contenir des caracteres speciaux.
 
-# ── Secrets — la raison première de ce fichier ────────────────────────────
+# --- Secrets : la raison premiere de ce fichier ---
 .env
 .env.*
 !.env.example
@@ -20,12 +25,12 @@
 *.key
 secrets/
 
-# ── Git ───────────────────────────────────────────────────────────────────
+# --- Git ---
 .git
 .gitignore
 .github
 
-# ── Python ────────────────────────────────────────────────────────────────
+# --- Python ---
 __pycache__/
 *.py[cod]
 venv/
@@ -37,12 +42,12 @@ env/
 htmlcov/
 coverage.xml
 
-# ── Node — reconstruit dans l'étape 1, jamais transféré ───────────────────
+# --- Node : reconstruit dans l'etape 1, jamais transfere ---
 frontend/node_modules/
 frontend/dist/
 node_modules/
 
-# ── Données générées à l'exécution ────────────────────────────────────────
+# --- Donnees generees a l'execution ---
 rapports/
 conversations.json
 llm_memoire.json
@@ -53,11 +58,11 @@ llm_memoire.json
 *.keras
 *.pkl
 
-# ── Tests — non nécessaires dans une image de production ──────────────────
+# --- Tests : non necessaires dans une image de production ---
 tests/
 pytest.ini
 
-# ── IDE et divers ─────────────────────────────────────────────────────────
+# --- IDE et divers ---
 .vscode/
 .idea/
 .DS_Store
