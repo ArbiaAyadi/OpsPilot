@@ -91,6 +91,7 @@
   ansible.builtin.apt:
     name: ksm-control-daemon
     state: present
+    lock_timeout: 120
     # install_recommends: false -- sans cela, apt tire les dependances
     # "recommandees", dont les bibliotheques graphiques constatees lors
     # de l'echec precedent : 10 Mo de pilotes OpenGL sur un hyperviseur

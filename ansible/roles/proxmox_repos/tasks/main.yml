@@ -11,6 +11,40 @@
 # role automatise la correction : elle s'applique a tous les noeuds de
 # l'inventaire en une commande, et a tout noeud ajoute plus tard.
 
+# <- AJOUT (constate en conditions reelles) : une installation de paquet
+# interrompue laisse dpkg dans un etat "half-configured". Toute operation
+# apt ulterieure echoue alors avec "10 not fully installed or removed",
+# y compris celles qui n'ont aucun rapport avec le paquet fautif.
+#
+# Un playbook qui suppose un systeme sain echouera sur chaque noeud
+# concerne, sans jamais indiquer qu'il faut d'abord reparer. On verifie
+# donc, et on repare si necessaire -- c'est precisement le role d'une
+# automatisation de configuration : ramener la machine a un etat connu,
+# quel que soit son etat de depart.
+
+- name: Verifier l'integrite de la base dpkg
+  ansible.builtin.command:
+    cmd: dpkg --audit
+  register: proxmox_repos_dpkg_audit
+  changed_when: false
+  failed_when: false
+
+- name: Reparer les paquets partiellement installes
+  ansible.builtin.command:
+    cmd: dpkg --configure -a
+  when: proxmox_repos_dpkg_audit.stdout | length > 0
+  changed_when: proxmox_repos_dpkg_audit.stdout | length > 0
+
+- name: Completer les dependances manquantes
+  # force_apt_get + state: fixed est l'equivalent natif de
+  # "apt-get -f install" -- ansible-lint signale a juste titre qu'un
+  # module dedie existe. Il gere aussi le verrou et les codes de retour
+  # mieux qu'un appel direct.
+  ansible.builtin.apt:
+    state: fixed
+    lock_timeout: 120
+  when: proxmox_repos_dpkg_audit.stdout | length > 0
+
 - name: Rechercher les fichiers declarant un depot enterprise
   ansible.builtin.find:
     paths:
@@ -40,6 +74,14 @@
 - name: Verifier que apt update fonctionne
   ansible.builtin.apt:
     update_cache: true
+    # lock_timeout : un autre processus (apt automatique, une session
+    # administrateur ouverte ailleurs) peut detenir le verrou apt au
+    # moment ou le playbook s'execute. Constate en reel :
+    # "Could not get lock /var/lib/apt/lists/lock, held by process 16920".
+    # Sans attente, le playbook echoue sur une situation parfaitement
+    # transitoire. 120 secondes suffisent largement a un apt update
+    # concurrent.
+    lock_timeout: 120
   changed_when: false
   # Sans cette verification, une erreur de depot ne se manifesterait que
   # plus tard, au moment d'installer un paquet -- avec un message qui

@@ -19,6 +19,7 @@
   ansible.builtin.apt:
     name: "{{ exportateurs_requis }}"
     state: present
+    lock_timeout: 120
   register: monitoring_exporters_installation
 
 - name: Activer et demarrer chaque exportateur
