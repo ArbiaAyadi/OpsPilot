@@ -1,0 +1,50 @@
+---
+# ---------------------------------------------------------------------------
+# ConfigMap : configuration NON sensible
+# ---------------------------------------------------------------------------
+# La separation ConfigMap / Secret n'est pas cosmetique. Un ConfigMap est
+# lisible en clair par quiconque a le droit "get configmaps" sur le
+# namespace ; un Secret peut etre chiffre au repos, restreint par RBAC,
+# et fourni par un gestionnaire externe (Vault, External Secrets).
+#
+# Regle simple appliquee ici : si la fuite de la valeur n'a aucune
+# consequence, c'est un ConfigMap. Sinon, c'est un Secret.
+#
+# Toutes ces valeurs viennent du .env du projet -- celles qui n'y sont
+# PAS sensibles. Voir 02-secret.yaml pour les autres.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opspilot-config
+  namespace: opspilot
+  labels:
+    app.kubernetes.io/name: opspilot
+    app.kubernetes.io/component: backend
+data:
+  # --- Reseau ---
+  HOST: "0.0.0.0"
+  PORT: "8088"
+
+  # --- Base de donnees ---
+  # DB_HOST vaut "opspilot-db" : dans un cluster, les services se
+  # joignent par leur NOM DNS, pas par IP. L'adresse 192.168.138.133 du
+  # .env vaut pour une execution hors cluster ; ici kube-dns resout
+  # "opspilot-db" vers l'IP du Service, quelle que soit la machine ou le
+  # pod PostgreSQL s'execute reellement.
+  DB_HOST: "opspilot-db"
+  DB_PORT: "5432"
+  DB_NAME: "opspilot"
+  DB_USER: "opspilot"
+
+  # --- Surveillance ---
+  PROMETHEUS_URL: "http://prometheus:9090"
+  COOLDOWN_RAPPORT_S: "1200"
+  INTERVALLE_MIN_REANALYSE_LLM_S: "3600"
+  INTERVALLE_MAX_REANALYSE_LLM_S: "14400"
+
+  # --- Budget LLM ---
+  GROQ_TOKENS_QUOTIDIENS_LIMITE: "200000"
+  REGLES_MAX_TOKENS: "5000"
+
+  # --- Recherche documentaire ---
+  WEB_SEARCH_CACHE_TTL_S: "2592000"

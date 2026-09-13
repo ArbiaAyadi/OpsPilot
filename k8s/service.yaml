@@ -1,0 +1,44 @@
+---
+# ---------------------------------------------------------------------------
+# Service : point d'acces stable a l'application
+# ---------------------------------------------------------------------------
+# Les pods sont ephemeres : leur IP change a chaque recreation. Un Service
+# fournit une IP et un nom DNS STABLES, et repartit le trafic sur les pods
+# correspondant a son selecteur.
+#
+# C'est ce qui permet a la ConfigMap d'ecrire DB_HOST: "opspilot-db" : ce
+# nom resoudra toujours vers la base, quel que soit le pod qui l'heberge
+# a un instant donne.
+apiVersion: v1
+kind: Service
+metadata:
+  name: opspilot-app
+  namespace: opspilot
+  labels:
+    app.kubernetes.io/name: opspilot
+    app.kubernetes.io/component: backend
+spec:
+  # ClusterIP : accessible uniquement DEPUIS le cluster. C'est le defaut,
+  # et le bon choix : exposer directement un Service en NodePort ou
+  # LoadBalancer court-circuite l'Ingress, donc le TLS, la limitation de
+  # debit et le routage par nom de domaine.
+  #
+  # L'exposition vers l'exterieur se fait par un Ingress (groupe 3).
+  type: ClusterIP
+
+  selector:
+    # Ce selecteur doit correspondre AUX LABELS DES PODS (template), pas
+    # a ceux du Deployment. Confusion frequente : un Service qui pointe
+    # vers les labels du Deployment ne trouve aucun pod et renvoie des
+    # erreurs de connexion, sans message explicite.
+    app.kubernetes.io/name: opspilot
+    app.kubernetes.io/component: backend
+
+  ports:
+    - name: http
+      port: 8088          # port du Service
+      targetPort: http    # port du conteneur, designe par son NOM
+      protocol: TCP
+      # targetPort par NOM et non par numero : si le port du conteneur
+      # change dans le Deployment, ce fichier n'a pas besoin d'etre
+      # modifie. Une seule source de verite.

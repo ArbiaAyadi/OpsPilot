@@ -1,0 +1,32 @@
+---
+# ---------------------------------------------------------------------------
+# Namespace : cloisonnement logique
+# ---------------------------------------------------------------------------
+# Un namespace isole les ressources d'une application des autres. Sur un
+# cluster partage, c'est ce qui permet a plusieurs equipes de deployer
+# sans se marcher dessus : les noms d'objets (Service "db", ConfigMap
+# "config") sont uniques PAR NAMESPACE, pas globalement.
+#
+# C'est aussi le perimetre sur lequel s'appliquent les quotas de
+# ressources, les NetworkPolicy et les regles RBAC -- sans namespace
+# dedie, ces trois mecanismes n'ont aucune granularite.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: opspilot
+  labels:
+    # Labels recommandes par Kubernetes (app.kubernetes.io/*). Ce ne sont
+    # pas des decorations : les outils de l'ecosysteme (Helm, Argo, Lens,
+    # kubectl) s'en servent pour regrouper et afficher les ressources
+    # d'une meme application. Les omettre revient a livrer des objets
+    # anonymes que personne ne peut correler.
+    app.kubernetes.io/name: opspilot
+    app.kubernetes.io/part-of: opspilot
+    # Applique le Pod Security Standard "restricted" a tout le namespace :
+    # pas de conteneur privilegie, pas d'escalade de privileges, systeme
+    # de fichiers racine en lecture seule encourage. C'est le niveau le
+    # plus strict, et le defaut attendu en production depuis que les
+    # PodSecurityPolicy ont ete retirees (Kubernetes 1.25).
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

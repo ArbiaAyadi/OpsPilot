@@ -1,0 +1,227 @@
+---
+# ---------------------------------------------------------------------------
+# Deployment : l'application OpsPilot
+# ---------------------------------------------------------------------------
+# Un Deployment gere des repliques SANS ETAT : chacune est interchangeable,
+# peut etre detruite et recreee n'importe ou. C'est le bon choix ici --
+# l'agent OpsPilot ne stocke rien localement, tout va en base.
+#
+# PostgreSQL, lui, sera un StatefulSet (groupe 2) : il a une identite et
+# un stockage qui doivent le suivre.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opspilot-app
+  namespace: opspilot
+  labels:
+    app.kubernetes.io/name: opspilot
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: opspilot
+spec:
+  # Une seule replique pour l'instant. Le HorizontalPodAutoscaler du
+  # groupe 3 prendra le relais -- et quand un HPA gere une ressource,
+  # ce champ ne doit plus etre modifie a la main, sinon les deux se
+  # contredisent a chaque cycle.
+  replicas: 1
+
+  # Historique de revisions conserve. Par defaut Kubernetes en garde 10,
+  # ce qui encombre etcd pour rien. 3 suffit largement a revenir en
+  # arriere apres un deploiement rate (kubectl rollout undo).
+  revisionHistoryLimit: 3
+
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: opspilot
+      app.kubernetes.io/component: backend
+
+  strategy:
+    # RollingUpdate : les nouveaux pods demarrent AVANT que les anciens
+    # ne soient arretes. Avec maxUnavailable: 0, le service n'est jamais
+    # degrade pendant une mise a jour -- au prix d'une replique
+    # supplementaire temporaire (maxSurge: 1).
+    #
+    # L'alternative, Recreate, arrete tout puis redemarre : plus simple,
+    # mais interruption garantie. Inacceptable pour un outil de
+    # supervision, qui doit precisement fonctionner quand le reste va mal.
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: opspilot
+        app.kubernetes.io/component: backend
+        app.kubernetes.io/part-of: opspilot
+      annotations:
+        # Indique a Prometheus de collecter les metriques de ce pod.
+        # L'application expose deja /api/status ; un endpoint /metrics
+        # au format Prometheus serait l'etape suivante.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8088"
+        prometheus.io/path: "/api/status"
+
+    spec:
+      # ServiceAccount dedie (defini dans le groupe 4, avec son RBAC).
+      # Sans cette ligne, le pod utilise le compte "default" du
+      # namespace, dont les droits sont partages par TOUS les pods qui
+      # n'en declarent pas -- l'inverse du moindre privilege.
+      serviceAccountName: opspilot
+
+      # automountServiceAccountToken: false -- l'application n'appelle
+      # pas l'API Kubernetes. Monter son jeton dans le conteneur ne
+      # servirait qu'a offrir un point de depart a un attaquant ayant
+      # obtenu l'execution de code.
+      automountServiceAccountToken: false
+
+      # --- Contexte de securite au niveau du POD ---
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001        # meme uid que dans le Dockerfile
+        runAsGroup: 10001
+        fsGroup: 10001          # proprietaire des volumes montes
+        seccompProfile:
+          # RuntimeDefault : filtre les appels systeme dangereux via le
+          # profil seccomp du runtime. Exige par le Pod Security
+          # Standard "restricted" applique au namespace.
+          type: RuntimeDefault
+
+      containers:
+        - name: opspilot
+          image: ghcr.io/arbiaayadi/opspilot:latest
+          # IfNotPresent et non Always : evite de retelecharger l'image a
+          # chaque redemarrage de pod. Avec un tag immuable (une version,
+          # pas "latest"), c'est le bon reglage. "latest" reste ici pour
+          # la lisibilite de l'exemple -- en production, un tag de
+          # version explicite est indispensable, sinon deux pods de la
+          # meme application peuvent tourner avec des images differentes.
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 8088
+              protocol: TCP
+
+          # --- Configuration : les deux sources, clairement separees ---
+          envFrom:
+            - configMapRef:
+                name: opspilot-config
+            - secretRef:
+                name: opspilot-secrets
+
+          # --- Limites de ressources ---
+          # requests : ce que le pod est GARANTI d'obtenir. C'est sur
+          #   cette valeur que l'ordonnanceur choisit un noeud.
+          # limits : le plafond. Depasser la limite memoire fait tuer le
+          #   conteneur (OOMKilled) ; depasser la limite CPU le ralentit
+          #   seulement (throttling).
+          #
+          # Sans ces valeurs, un pod peut consommer toute la memoire du
+          # noeud et faire tomber ses voisins -- exactement le probleme
+          # de saturation observe sur ce cluster Proxmox, mais a
+          # l'echelle du conteneur.
+          #
+          # Le rapport requests/limits choisi ici (2x) laisse de la marge
+          # pour les pics sans reserver inutilement.
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"       # 250 milliCPU = un quart de coeur
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"      # un coeur complet
+
+          # --- Contexte de securite au niveau du CONTENEUR ---
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              # Retire TOUTES les capacites Linux. Une application web
+              # n'a besoin d'aucune d'entre elles : ni de modifier le
+              # reseau, ni de changer d'utilisateur, ni de monter des
+              # systemes de fichiers.
+              drop:
+                - ALL
+
+          # --- Les TROIS sondes, et pourquoi chacune existe ---
+          #
+          # startupProbe : "le demarrage est-il termine ?" Tant qu'elle
+          #   echoue, les deux autres sont SUSPENDUES. Sans elle, une
+          #   application lente a demarrer (chargement du modele LSTM,
+          #   connexion a Proxmox) serait tuee par la liveness avant
+          #   d'avoir fini -- et redemarrerait en boucle indefiniment.
+          #   failureThreshold x periodSeconds = 30 x 5 = 150 secondes
+          #   de tolerance au demarrage.
+          startupProbe:
+            httpGet:
+              path: /api/status
+              port: http
+              scheme: HTTPS
+            periodSeconds: 5
+            failureThreshold: 30
+            timeoutSeconds: 3
+
+          # readinessProbe : "peut-il recevoir du trafic MAINTENANT ?"
+          #   Un echec retire le pod du Service -- il ne recoit plus de
+          #   requetes, mais n'est PAS redemarre. C'est la sonde a
+          #   utiliser pour une dependance temporairement indisponible
+          #   (base injoignable) : inutile de tuer un pod sain parce que
+          #   PostgreSQL redemarre.
+          readinessProbe:
+            httpGet:
+              path: /api/status
+              port: http
+              scheme: HTTPS
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 3
+
+          # livenessProbe : "est-il irrecuperable ?" Un echec DETRUIT et
+          #   recree le pod. A reserver aux blocages dont l'application
+          #   ne peut pas sortir seule (interblocage, boucle infinie).
+          #   Seuils volontairement plus larges que la readiness : un
+          #   redemarrage est une action lourde, il ne doit pas se
+          #   declencher sur un ralentissement passager.
+          livenessProbe:
+            httpGet:
+              path: /api/status
+              port: http
+              scheme: HTTPS
+            periodSeconds: 20
+            failureThreshold: 3
+            timeoutSeconds: 5
+
+          # --- Volumes en ecriture ---
+          # readOnlyRootFilesystem: true interdit toute ecriture dans le
+          # conteneur. Les rares repertoires que l'application ecrit
+          # doivent donc etre montes explicitement -- ce qui rend visible,
+          # dans ce fichier, exactement ou l'application ecrit. C'est un
+          # benefice de lisibilite autant que de securite.
+          volumeMounts:
+            - name: rapports
+              mountPath: /app/rapports
+            - name: cache
+              mountPath: /app/.cache
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        # emptyDir : volume ephemere, detruit avec le pod. Convient au
+        # cache et a /tmp. Les rapports meriteraient un
+        # PersistentVolumeClaim pour survivre a un redemarrage -- voir le
+        # groupe 2, ou la question du stockage persistant est traitee.
+        - name: rapports
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: cache
+          emptyDir:
+            sizeLimit: 256Mi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 128Mi
+
+      # Delai laisse au pod pour se terminer proprement avant d'etre tue.
+      # 30s est le defaut ; suffisant ici pour qu'un cycle de
+      # surveillance en cours se termine et ferme ses connexions.
+      terminationGracePeriodSeconds: 30
