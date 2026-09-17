@@ -1,0 +1,58 @@
+---
+# ---------------------------------------------------------------------------
+# ServiceAccount + RBAC : le principe du moindre privilege
+# ---------------------------------------------------------------------------
+# Chaque pod s'execute sous un ServiceAccount. Sans declaration, c'est le
+# compte "default" du namespace -- partage par TOUS les pods qui n'en
+# declarent pas. Un compte partage rend impossible toute restriction
+# ciblee : donner un droit a un pod le donne a tous les autres.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: opspilot
+  namespace: opspilot
+  labels:
+    app.kubernetes.io/name: opspilot
+# automountServiceAccountToken au niveau du COMPTE, en plus du pod :
+# defense en profondeur. Meme si un futur manifeste oublie de le
+# desactiver cote pod, le jeton ne sera pas monte.
+automountServiceAccountToken: false
+---
+# Role : droits LIMITES A UN NAMESPACE.
+# On utilise un Role et non un ClusterRole parce que l'application n'a
+# aucune raison de voir les autres namespaces. Un ClusterRole donnerait
+# des droits sur tout le cluster -- surdimensionne et dangereux.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: opspilot
+  namespace: opspilot
+rules:
+  # Lecture seule des ConfigMaps et Secrets de son propre namespace.
+  # L'application ne les lit pas via l'API (elles sont injectees en
+  # variables d'environnement), mais ce droit permet un rechargement a
+  # chaud de configuration si la fonctionnalite est ajoutee plus tard.
+  #
+  # AUCUN droit d'ecriture, AUCUN droit sur les pods, AUCUN droit de
+  # suppression. Un attaquant ayant obtenu l'execution de code dans ce
+  # pod ne peut donc pas creer d'autres pods ni exfiltrer les secrets
+  # d'un autre namespace.
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets"]
+    verbs: ["get", "list", "watch"]
+---
+# RoleBinding : relie le compte au role. Sans cette liaison, le Role
+# existe mais ne s'applique a personne -- erreur silencieuse classique.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: opspilot
+  namespace: opspilot
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: opspilot
+subjects:
+  - kind: ServiceAccount
+    name: opspilot
+    namespace: opspilot

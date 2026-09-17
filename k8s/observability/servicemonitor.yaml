@@ -1,0 +1,54 @@
+---
+# ---------------------------------------------------------------------------
+# ServiceMonitor : collecte des metriques par l'operateur Prometheus
+# ---------------------------------------------------------------------------
+# Les annotations "prometheus.io/scrape" du Deployment sont l'ANCIENNE
+# methode : elles supposent un Prometheus configure pour decouvrir les
+# pods par annotation. Cela fonctionne, mais rien n'est declare -- on ne
+# peut pas savoir, en lisant le depot, quelles metriques sont collectees
+# ni a quelle frequence.
+#
+# Le ServiceMonitor est la methode moderne, apportee par l'operateur
+# Prometheus (kube-prometheus-stack). La configuration de collecte
+# devient un OBJET KUBERNETES versionne, au meme titre que le
+# Deployment : revu en revision de code, applique par GitOps, supprime
+# avec l'application.
+#
+# PREREQUIS : l'operateur Prometheus installe dans le cluster. Sans lui,
+# ce manifeste est accepte par l'API mais ignore -- personne ne le lit.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: opspilot
+  namespace: opspilot
+  labels:
+    app.kubernetes.io/name: opspilot
+    # Ce label est ce qui rattache le ServiceMonitor a une instance
+    # Prometheus precise. Sa valeur depend de l'installation -- avec
+    # kube-prometheus-stack, c'est le nom de la release Helm.
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: opspilot
+      app.kubernetes.io/component: backend
+  namespaceSelector:
+    matchNames:
+      - opspilot
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      scheme: http
+      # NOTE : /metrics n'existe pas encore dans l'application. Le point
+      # d'acces actuel, /api/status, renvoie du JSON -- Prometheus attend
+      # son propre format texte. L'etape suivante serait d'exposer les
+      # metriques via prometheus_client :
+      #
+      #   from prometheus_client import Counter, Gauge, make_asgi_app
+      #   app.mount("/metrics", make_asgi_app())
+      #
+      # Ce manifeste declare donc l'INTENTION de collecte. C'est
+      # deliberement documente : mieux vaut un contrat explicite qu'un
+      # endpoint qu'on croit collecte et qui ne l'est pas.

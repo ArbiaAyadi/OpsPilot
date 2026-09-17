@@ -268,3 +268,134 @@ jobs:
           # d'une image de base sans correctif disponible ne doit pas
           # bloquer tout le pipeline. Le rapport reste consultable.
           exit-code: '0'
+
+  # ------------------------------------------------------------------------
+  # Manifestes Kubernetes -- validation et bonnes pratiques
+  # ------------------------------------------------------------------------
+  # Sans ce travail, une erreur dans un manifeste n'est decouverte qu'au
+  # moment du deploiement -- sur le cluster, avec des ressources deja
+  # modifiees. Le valider en CI la revele au commit, avant tout impact.
+  #
+  # Trois outils, trois roles distincts :
+  #   kustomize  -- les overlays s'assemblent-ils ?
+  #   kubeconform -- les manifestes respectent-ils le schema de l'API ?
+  #   kube-score  -- respectent-ils les bonnes pratiques ?
+  #
+  # Le premier attrape une reference cassee, le deuxieme un champ invalide,
+  # le troisieme une sonde absente ou un conteneur en root. Aucun ne
+  # remplace les deux autres.
+  kubernetes:
+    name: Manifestes Kubernetes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer les outils de validation
+        run: |
+          curl -sL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz" | tar xz kustomize
+          curl -sL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz | tar xz kubeconform
+          curl -sL https://github.com/zegl/kube-score/releases/download/v1.20.0/kube-score_1.20.0_linux_amd64.tar.gz | tar xz kube-score
+          sudo mv kustomize kubeconform kube-score /usr/local/bin/
+
+      - name: Assembler chaque environnement
+        run: |
+          for env in base overlays/minikube overlays/dev overlays/prod; do
+            echo "::group::$env"
+            kustomize build "k8s/$env" > "/tmp/$(basename $env).yaml"
+            echo "  $(grep -c '^kind:' /tmp/$(basename $env).yaml) ressources"
+            echo "::endgroup::"
+          done
+
+      - name: Valider contre le schema de l'API Kubernetes
+        run: |
+          # -strict : signale les champs INCONNUS. Sans cette option, une
+          # faute de frappe ("readinesProbe") passe inapercue -- Kubernetes
+          # ignore silencieusement ce qu'il ne connait pas, et la sonde
+          # n'existe tout simplement pas.
+          for f in /tmp/*.yaml; do
+            echo "::group::$(basename $f)"
+            kubeconform -summary -strict -kubernetes-version 1.31.0 \
+              -ignore-missing-schemas "$f"
+            echo "::endgroup::"
+          done
+
+      - name: Verifier les bonnes pratiques
+        run: |
+          # Informatif volontairement (|| true) : kube-score signale des
+          # points legitimement discutables (image sans digest, absence
+          # de NetworkPolicy sur certains objets). Les rendre bloquants
+          # rendrait le pipeline rouge en permanence -- et un pipeline
+          # toujours rouge n'est plus lu.
+          kube-score score /tmp/prod.yaml --output-format ci || true
+
+      - name: Controles specifiques a ce projet
+        run: |
+          # Trois regles que kube-score ne verifie pas, et qui viennent
+          # de defauts reellement rencontres sur ce projet.
+          echec=0
+
+          # 1. Aucun Secret avec une valeur reelle dans le depot.
+          #    Un Secret n'est qu'encode en base64, pas chiffre : le
+          #    committer rempli equivaut a committer un mot de passe.
+          if grep -rE '^\s+[A-Z_]+:\s+"[^"]+"' k8s/base/secret.yaml 2>/dev/null | grep -v ': ""'; then
+            echo "::error::secret.yaml contient une valeur non vide"
+            echec=1
+          fi
+
+          # 2. Aucune image en :latest dans l'overlay de production.
+          #    Deux pods de la meme application pourraient tourner avec
+          #    des images differentes selon leur date de creation.
+          if grep -E 'image:.*:latest' /tmp/prod.yaml; then
+            echo "::error::image en :latest dans l'overlay de production"
+            echec=1
+          fi
+
+          # 3. Tout conteneur doit declarer des limites.
+          #    Sans elles, un pod peut consommer toute la memoire du
+          #    noeud et faire tomber ses voisins -- constate en reel sur
+          #    ce projet, ou le control plane est tombe a 9 Mo libres.
+          python3 - <<'PY'
+          import yaml, sys
+          manquants = []
+          for d in yaml.safe_load_all(open('/tmp/prod.yaml')):
+              if not d or d.get('kind') not in ('Deployment', 'StatefulSet'):
+                  continue
+              spec = d['spec']['template']['spec']
+              for c in spec.get('initContainers', []) + spec['containers']:
+                  if 'limits' not in c.get('resources', {}):
+                      manquants.append(f"{d['metadata']['name']}/{c['name']}")
+          if manquants:
+              print(f"::error::conteneurs sans limits : {', '.join(manquants)}")
+              sys.exit(1)
+          print("Tous les conteneurs declarent des limites")
+          PY
+
+          exit $echec
+
+  # ------------------------------------------------------------------------
+  # Chart Helm
+  # ------------------------------------------------------------------------
+  helm:
+    name: Chart Helm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      - name: helm lint
+        run: helm lint ./helm/opspilot
+
+      - name: Rendre le chart et le valider
+        run: |
+          curl -sL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz | tar xz kubeconform
+          sudo mv kubeconform /usr/local/bin/
+          # Un gabarit Helm n'est pas du YAML valide tant qu'il n'est pas
+          # RENDU -- d'ou cette etape, inutile avec Kustomize dont les
+          # fichiers de base sont directement validables.
+          helm template opspilot ./helm/opspilot \
+            | kubeconform -summary -strict -kubernetes-version 1.31.0 -ignore-missing-schemas -
+          helm template opspilot ./helm/opspilot -f ./helm/opspilot/values-minikube.yaml \
+            | kubeconform -summary -strict -kubernetes-version 1.31.0 -ignore-missing-schemas -

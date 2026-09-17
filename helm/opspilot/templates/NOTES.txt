@@ -1,0 +1,43 @@
+{{/* NOTES.txt s'affiche APRES helm install. C'est la premiere chose que
+     lit l'utilisateur -- l'endroit pour dire quoi faire ensuite, et
+     surtout pour l'avertir d'une configuration dangereuse. */}}
+OpsPilot {{ .Chart.AppVersion }} est installe dans le namespace {{ .Release.Namespace }}.
+
+Suivre le demarrage :
+  kubectl get pods -n {{ .Release.Namespace }} -w
+
+{{- if .Values.ingress.enabled }}
+
+Acces :
+{{- range .Values.ingress.hosts }}
+  http{{ if $.Values.ingress.tls }}s{{ end }}://{{ .host }}
+{{- end }}
+{{- else if eq .Values.service.type "NodePort" }}
+
+Acces (NodePort) :
+  minikube service {{ include "opspilot.fullname" . }} -n {{ .Release.Namespace }} --url
+{{- else }}
+
+Acces (redirection de port) :
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "opspilot.fullname" . }} 8088:{{ .Values.service.port }}
+  puis https://localhost:8088
+{{- end }}
+
+{{- if and .Values.secrets.create (not .Values.secrets.data.DB_PASSWORD) }}
+
+  ATTENTION : DB_PASSWORD est vide. PostgreSQL refusera de demarrer.
+  Reinstaller avec :
+    helm upgrade {{ .Release.Name }} <chart> --set secrets.data.DB_PASSWORD='...'
+  En production, preferer un Secret externe :
+    --set secrets.create=false --set secrets.existingSecret=mon-secret
+{{- end }}
+
+{{- if and .Values.autoscaling.enabled (not .Values.podDisruptionBudget.enabled) }}
+
+  Note : autoscaling actif sans PodDisruptionBudget. Une vidange de
+  noeud peut evacuer toutes les repliques simultanement.
+{{- end }}
+
+Diagnostic :
+  kubectl describe pod -n {{ .Release.Namespace }} -l app.kubernetes.io/instance={{ .Release.Name }}
+  kubectl logs -n {{ .Release.Namespace }} -l app.kubernetes.io/component=backend -f

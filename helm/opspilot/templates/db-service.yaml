@@ -1,0 +1,40 @@
+{{- if .Values.postgresql.enabled }}
+{{- /* Service HEADLESS : clusterIP None. Pas d'IP virtuelle, pas de
+       repartition -- le DNS renvoie l'adresse de CHAQUE pod,
+       individuellement adressable. C'est ce qui rend possible la
+       configuration d'une replication. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "opspilot.db.fullname" . }}-headless
+  labels:
+    {{- include "opspilot.labels" . | nindent 4 }}
+    app.kubernetes.io/component: database
+spec:
+  clusterIP: None
+  selector:
+    {{- include "opspilot.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: database
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+{{- /* Service normal : celui que l'application utilise (DB_HOST). */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "opspilot.db.fullname" . }}
+  labels:
+    {{- include "opspilot.labels" . | nindent 4 }}
+    app.kubernetes.io/component: database
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "opspilot.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: database
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+{{- end }}

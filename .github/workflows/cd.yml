@@ -1,0 +1,214 @@
+# ---------------------------------------------------------------------------
+# OpsPilot - Livraison continue
+# ---------------------------------------------------------------------------
+# Le pipeline ci.yml VALIDE (tests, qualite, securite) mais ne LIVRE rien :
+# il construit l'image avec push: false, puis la jette. Or les manifestes
+# Kubernetes, le chart Helm et l'Application ArgoCD referencent tous
+# ghcr.io/arbiaayadi/opspilot -- une image qui n'existait dans aucun
+# registre.
+#
+# Consequence concrete : "kubectl apply" sur un vrai cluster echouerait en
+# ImagePullBackOff. Toute la chaine de deploiement pointait vers le vide.
+#
+# Ce pipeline ferme la boucle. Il publie sur GHCR (GitHub Container
+# Registry), gratuit et integre au depot -- pas de compte tiers, pas
+# d'identifiant a gerer : GITHUB_TOKEN suffit.
+#
+# Il ajoute aussi deux elements de securite de la chaine
+# d'approvisionnement, devenus des attentes standard depuis les attaques
+# par dependance compromise :
+#   SBOM      -- l'inventaire exact de ce que contient l'image
+#   signature -- la preuve cryptographique de son origine
+name: CD
+
+on:
+  push:
+    # Uniquement sur les etiquettes de version. Publier a chaque commit
+    # remplirait le registre d'images intermediaires sans valeur, et
+    # rendrait impossible de savoir laquelle est deployable.
+    tags:
+      - 'v*.*.*'
+  # Publication manuelle possible, utile pour une demonstration.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Etiquette de l'image (ex: demo)"
+        required: true
+        default: 'demo'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  publier:
+    name: Construire et publier l'image
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      # packages: write -- autorise l'ecriture dans GHCR avec le
+      # GITHUB_TOKEN automatique. Aucun secret a configurer.
+      packages: write
+      # id-token: write -- necessaire a la signature SANS CLE (keyless)
+      # par cosign. GitHub emet un jeton OIDC qui prouve l'identite du
+      # workflow ; cosign l'echange contre un certificat ephemere.
+      # Aucune cle privee a stocker, donc aucune cle a faire fuiter.
+      id-token: write
+      # attestations: write -- publie la provenance de l'image : quel
+      # depot, quel commit, quel workflow l'a produite.
+      attestations: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Preparer Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: S'authentifier aupres de GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Calculer les etiquettes et metadonnees
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Plusieurs etiquettes pour une meme image, chacune avec un role :
+          #   v1.2.3  -- version exacte, immuable, celle a deployer
+          #   1.2     -- suit les correctifs de la serie 1.2
+          #   1       -- suit la serie majeure
+          #   sha-... -- tracabilite absolue vers le commit
+          #   latest  -- commodite, JAMAIS pour la production : deux pods
+          #              crees a des moments differents pourraient tourner
+          #              avec des images differentes.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+          labels: |
+            org.opencontainers.image.title=OpsPilot
+            org.opencontainers.image.description=Supervision d'infrastructure Proxmox assistee par IA
+            org.opencontainers.image.vendor=Arbia Ayadi
+
+      - name: Construire et pousser
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # provenance et sbom au niveau du build : Buildx attache
+          # directement ces metadonnees a l'image dans le registre.
+          provenance: true
+          sbom: true
+
+      - name: Installer cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Signer l'image
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          # Signature SANS CLE. Le modele classique exige de stocker une
+          # cle privee -- qui doit etre protegee, tournee, et qui peut
+          # fuiter. Ici, cosign obtient un certificat EPHEMERE (10
+          # minutes) depuis l'identite OIDC du workflow, et enregistre la
+          # signature dans Rekor, un journal public infalsifiable.
+          #
+          # Verification par quiconque, sans cle partagee :
+          #   cosign verify ghcr.io/arbiaayadi/opspilot:v1.0.0 \
+          #     --certificate-identity-regexp='https://github.com/ArbiaAyadi/OpsPilot/.*' \
+          #     --certificate-oidc-issuer=https://token.actions.githubusercontent.com
+          #
+          # Ce que cela prouve : cette image a bien ete construite par CE
+          # depot, par CE workflow. Une image substituee dans le registre
+          # echouerait la verification.
+          cosign sign --yes "${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
+        # continue-on-error : la signature est un renforcement, pas un
+        # prerequis. Si Sigstore est indisponible, l'image reste publiee.
+        continue-on-error: true
+
+      - name: Generer le SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - name: Analyser l'image publiee
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          severity: CRITICAL,HIGH
+          format: sarif
+          output: trivy.sarif
+          exit-code: '0'
+
+      - name: Publier le rapport dans l'onglet Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+        continue-on-error: true
+
+      - name: Joindre le SBOM a la release
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.spdx.json
+          retention-days: 90
+
+  # ------------------------------------------------------------------------
+  # Chart Helm -- publie comme artefact OCI
+  # ------------------------------------------------------------------------
+  # Depuis Helm 3.8, un chart se publie dans un registre de conteneurs au
+  # meme titre qu'une image. Plus besoin d'heberger un depot de charts
+  # separe : le client installe directement depuis GHCR.
+  #
+  #   helm install opspilot oci://ghcr.io/arbiaayadi/charts/opspilot --version 1.0.0
+  chart:
+    name: Publier le chart Helm
+    runs-on: ubuntu-latest
+    needs: publier
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      - name: S'authentifier aupres de GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Aligner la version du chart sur l'etiquette Git
+        run: |
+          # Sans cette synchronisation, le chart garderait la version
+          # ecrite dans Chart.yaml quelle que soit l'etiquette poussee --
+          # on ne saurait plus quelle version du chart correspond a
+          # quelle version de l'application.
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          if [ "$GITHUB_REF" = "$VERSION" ]; then VERSION="0.0.0-dev"; fi
+          sed -i "s/^version:.*/version: ${VERSION}/" helm/opspilot/Chart.yaml
+          sed -i "s/^appVersion:.*/appVersion: \"${VERSION}\"/" helm/opspilot/Chart.yaml
+          echo "Chart en version ${VERSION}"
+
+      - name: Empaqueter et publier
+        run: |
+          helm package helm/opspilot --destination /tmp
+          helm push /tmp/opspilot-*.tgz oci://ghcr.io/${{ github.repository_owner }}/charts

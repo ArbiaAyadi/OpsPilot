@@ -1,0 +1,57 @@
+---
+# ---------------------------------------------------------------------------
+# Ingress : exposition HTTP vers l'exterieur
+# ---------------------------------------------------------------------------
+# Un Service de type ClusterIP n'est joignable que depuis le cluster.
+# L'Ingress est la porte d'entree : il route selon le nom de domaine et
+# le chemin, termine le TLS, et centralise ces preoccupations au lieu de
+# les dupliquer dans chaque application.
+#
+# PREREQUIS : un controleur Ingress installe (ingress-nginx, Traefik).
+# L'objet Ingress seul ne fait RIEN -- c'est une declaration d'intention
+# que le controleur lit et applique. Sans controleur, l'objet existe et
+# reste sans effet.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: opspilot
+  namespace: opspilot
+  labels:
+    app.kubernetes.io/name: opspilot
+  annotations:
+    # L'application sert en HTTPS avec un certificat auto-signe : le
+    # controleur doit parler HTTPS vers le backend, et ne pas verifier
+    # ce certificat.
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    nginx.ingress.kubernetes.io/proxy-ssl-verify: "off"
+    # WebSocket : l'interface OpsPilot recoit l'etat du cluster en temps
+    # reel par /ws. Sans ces delais allonges, nginx coupe la connexion
+    # au bout de 60 secondes par defaut -- le tableau de bord se
+    # reconnecterait en boucle.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # Redirection HTTP vers HTTPS
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # Limitation de debit : protection elementaire contre un abus.
+    nginx.ingress.kubernetes.io/limit-rps: "50"
+    # cert-manager : emet et renouvelle automatiquement le certificat
+    # Let's Encrypt. Sans lui, il faudrait creer le Secret TLS a la main
+    # et le renouveler tous les 90 jours.
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - opspilot.example.com
+      secretName: opspilot-tls   # cree par cert-manager
+  rules:
+    - host: opspilot.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: opspilot-app
+                port:
+                  name: http

@@ -1,0 +1,66 @@
+---
+# ---------------------------------------------------------------------------
+# Kustomization de BASE
+# ---------------------------------------------------------------------------
+# Kustomize applique des transformations a des manifestes YAML SANS
+# langage de modele. C'est sa difference fondamentale avec Helm : Helm
+# genere du YAML depuis des gabarits Go ; Kustomize part de YAML valide
+# et le PATCHE.
+#
+# Consequence pratique : les fichiers de base restent lisibles et
+# validables tels quels (kubeconform les accepte), alors qu'un gabarit
+# Helm non rendu n'est pas du YAML valide.
+#
+# Kustomize est integre a kubectl depuis la 1.14 : "kubectl apply -k"
+# fonctionne sans rien installer.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: opspilot
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  # <- RETIRE (defaut constate en conditions reelles) : secret.yaml
+  # contient des valeurs VIDES, volontairement -- un Secret rempli ne
+  # doit jamais etre versionne.
+  #
+  # Mais l'inclure ici le rendait actif : "kubectl apply -k" l'appliquait
+  # PAR-DESSUS le Secret cree a la main, ecrasant les vraies valeurs par
+  # des chaines vides. PostgreSQL echouait alors avec :
+  #   "Database is uninitialized and superuser password is not specified"
+  #
+  # Un fichier de documentation ne doit pas etre un fichier applique. Il
+  # reste dans le depot comme CONTRAT (quelles cles l'application lit),
+  # mais la creation se fait explicitement :
+  #
+  #   kubectl create secret generic opspilot-secrets -n opspilot \
+  #     --from-literal=DB_PASSWORD='...' --from-literal=GROQ_API_KEY='...'
+  #
+  # C'est aussi la pratique correcte en production : le Secret vient d'un
+  # coffre (Vault, External Secrets) ou de Sealed Secrets, jamais d'un
+  # manifeste versionne.
+  # - secret.yaml
+  - rbac.yaml
+  - deployment.yaml
+  - service.yaml
+  - db-statefulset.yaml
+  - db-service.yaml
+  - hpa.yaml
+  - pdb.yaml
+  - networkpolicy.yaml
+  - ingress.yaml
+  # <- AJOUTS : gouvernance des ressources et ordre d'eviction.
+  # resourcequota borne la consommation TOTALE du namespace ; les
+  # requests/limits d'un pod ne protegent que les pods entre eux.
+  - resourcequota.yaml
+  # priorityclass est de portee CLUSTER (pas namespace) -- sa creation
+  # exige des droits d'administrateur du cluster.
+  - priorityclass.yaml
+
+# Labels appliques a TOUTES les ressources, sans avoir a les repeter
+# dans chaque fichier. Une seule source de verite pour la version.
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/managed-by: kustomize

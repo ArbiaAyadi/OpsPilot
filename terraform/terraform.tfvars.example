@@ -1,0 +1,10 @@
+# Copier en terraform.tfvars et completer.
+# terraform.tfvars est exclu par .gitignore : il contient des secrets.
+
+proxmox_endpoint     = "https://192.168.138.100:8006/"
+proxmox_token_id     = "root@pam!opspilot"
+proxmox_token_secret = "REMPLACER"
+
+ssh_user       = "root"
+ssh_password   = "REMPLACER"
+ssh_public_key = "ssh-ed25519 AAAA... arbia@poste"

@@ -1,0 +1,78 @@
+---
+# ---------------------------------------------------------------------------
+# Dependabot - mises a jour automatiques des dependances
+# ---------------------------------------------------------------------------
+# Complement indispensable de Trivy. Les deux se repartissent le travail :
+#
+#   Trivy DETECTE les vulnerabilites connues dans ce qui est installe.
+#   Dependabot PROPOSE la correction, sous forme de pull request.
+#
+# Sans Dependabot, un rapport Trivy signale une CVE... et reste un
+# rapport. Quelqu'un doit lire, chercher la version corrigee, tester.
+# En pratique, personne ne le fait -- et les dependances vieillissent.
+version: 2
+
+updates:
+  # --- Dependances Python ---
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependances, python]
+    commit-message:
+      prefix: "deps"
+    # Regroupe les correctifs mineurs en UNE pull request. Sans
+    # regroupement, dix dependances a mettre a jour produisent dix PR --
+    # volume ingerable, donc ignore.
+    groups:
+      python-mineur:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    # Les versions MAJEURES restent separees : elles peuvent casser la
+    # compatibilite et meritent une revue individuelle.
+
+  # --- Images Docker ---
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    labels: [dependances, docker]
+    commit-message:
+      prefix: "deps"
+    # Ignore les versions majeures des images de base : passer de
+    # python:3.12 a python:3.13, ou de postgres:15 a postgres:16, exige
+    # une migration reflechie. PostgreSQL en particulier ne lit pas un
+    # repertoire de donnees cree par une version superieure.
+    ignore:
+      - dependency-name: "python"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "postgres"
+        update-types: ["version-update:semver-major"]
+
+  # --- Actions GitHub ---
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    labels: [dependances, ci]
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # --- Dependances du frontend ---
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly
+    labels: [dependances, frontend]
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "deps"
+    groups:
+      npm-mineur:
+        patterns: ["*"]
+        update-types: [minor, patch]

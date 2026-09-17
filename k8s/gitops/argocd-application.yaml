@@ -1,0 +1,81 @@
+---
+# ---------------------------------------------------------------------------
+# ArgoCD Application : deploiement GitOps
+# ---------------------------------------------------------------------------
+# Le GitOps inverse le sens du deploiement. Sans lui, on POUSSE depuis un
+# poste ou un pipeline : "kubectl apply". Avec lui, un controleur dans le
+# cluster TIRE depuis Git et maintient la correspondance en continu.
+#
+# Trois consequences concretes :
+#
+#   Git devient la source de verite. Une modification faite a la main dans
+#   le cluster (kubectl edit) est DETECTEE comme une derive, et annulee si
+#   selfHeal est actif. Plus de "qui a change ca et quand ?".
+#
+#   Plus aucun identifiant de cluster hors du cluster. Le pipeline CI n'a
+#   pas besoin d'un kubeconfig de production -- il pousse sur Git, c'est
+#   tout. Cela supprime la fuite de secret la plus courante en CI/CD.
+#
+#   Le retour arriere est un "git revert". L'historique de deploiement
+#   EST l'historique Git.
+#
+# C'est le standard de deploiement Kubernetes aujourd'hui, et ce que
+# cherche un recruteur qui evalue un profil DevOps.
+#
+# PREREQUIS : ArgoCD installe dans le cluster.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: opspilot
+  namespace: argocd
+  finalizers:
+    # Sans ce finalizer, supprimer l'Application laisse les ressources
+    # deployees orphelines dans le cluster -- plus rien ne les gere, et
+    # elles continuent de consommer des ressources.
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+
+  source:
+    repoURL: https://github.com/ArbiaAyadi/OpsPilot.git
+    targetRevision: main
+    # Chemin de l'overlay. ArgoCD detecte Kustomize automatiquement a la
+    # presence d'un kustomization.yaml -- rien a declarer.
+    path: k8s/overlays/prod
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: opspilot
+
+  syncPolicy:
+    automated:
+      # prune : supprime du cluster ce qui a ete retire de Git. Sans cela,
+      # un manifeste supprime du depot resterait deploye indefiniment --
+      # derive silencieuse entre ce qu'on lit et ce qui tourne.
+      prune: true
+      # selfHeal : annule toute modification faite directement dans le
+      # cluster. C'est ce qui rend Git reellement faisant autorite.
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      # ServerSideApply : necessaire pour les manifestes volumineux et
+      # pour les CRD. Evite l'erreur "metadata.annotations: Too long"
+      # sur l'annotation last-applied-configuration.
+      - ServerSideApply=true
+
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m
+
+  # Champs ignores lors de la comparaison. Sans cette exception, ArgoCD
+  # verrait le nombre de repliques ajuste par le HPA comme une derive et
+  # le ramenerait a la valeur du depot -- les deux se combattraient en
+  # boucle. C'est un piege classique du GitOps avec autoscaling.
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas

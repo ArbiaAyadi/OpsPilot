@@ -1,0 +1,18 @@
+---
+# Charge automatiquement tout tableau de bord JSON depuis un repertoire.
+apiVersion: 1
+
+providers:
+  - name: opspilot
+    orgId: 1
+    folder: OpsPilot
+    type: file
+    disableDeletion: false
+    # allowUiUpdates: false -- un tableau modifie dans l'interface serait
+    # ecrase au prochain demarrage. C'est delibere : le depot fait
+    # autorite. Pour modifier, on exporte le JSON et on le committe.
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

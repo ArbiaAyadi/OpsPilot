@@ -1,0 +1,89 @@
+---
+# ---------------------------------------------------------------------------
+# Overlay DEV
+# ---------------------------------------------------------------------------
+# Un overlay ne DUPLIQUE pas la base : il la reference et applique des
+# patches. C'est ce qui evite la derive entre environnements -- un
+# correctif dans la base se propage automatiquement a dev et prod.
+#
+# L'alternative (copier les manifestes par environnement) garantit qu'au
+# bout de quelques mois, dev et prod auront divergé sans que personne ne
+# sache exactement en quoi.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: opspilot-dev
+
+resources:
+  - ../../base
+
+# Prefixe sur tous les noms : permet de deployer dev et prod sur le MEME
+# cluster sans collision de noms.
+namePrefix: dev-
+
+labels:
+  - includeSelectors: false
+    pairs:
+      environment: dev
+
+# Patches strategiques : on ne decrit QUE ce qui change.
+patches:
+  # Ressources reduites en dev -- pas besoin de dimensionner pour la
+  # production sur un environnement de test.
+  - target:
+      kind: Deployment
+      name: opspilot-app
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: 256Mi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: 512Mi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/cpu
+        value: 100m
+
+  # Volume reduit pour la base
+  - target:
+      kind: StatefulSet
+      name: opspilot-db
+    patch: |-
+      - op: replace
+        path: /spec/volumeClaimTemplates/0/spec/resources/requests/storage
+        value: 2Gi
+
+  # Domaine de developpement
+  - target:
+      kind: Ingress
+      name: opspilot
+    patch: |-
+      - op: replace
+        path: /spec/rules/0/host
+        value: opspilot-dev.example.com
+      - op: replace
+        path: /spec/tls/0/hosts/0
+        value: opspilot-dev.example.com
+
+# Ressources RETIREES en dev, via le marqueur $patch: delete.
+# Le HPA n'a pas de sens sur un environnement sans charge reelle ; le PDB
+# bloquerait les operations de maintenance, frequentes en dev.
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: opspilot-app
+    patch: |-
+      $patch: delete
+      apiVersion: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+      metadata:
+        name: opspilot-app
+
+  - target:
+      kind: PodDisruptionBudget
+      name: opspilot-app
+    patch: |-
+      $patch: delete
+      apiVersion: policy/v1
+      kind: PodDisruptionBudget
+      metadata:
+        name: opspilot-app

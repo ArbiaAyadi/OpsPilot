@@ -1,0 +1,13 @@
+# Fichier d'etat : contient TOUTES les valeurs, y compris les secrets, en
+# clair. Le committer expose les mots de passe aussi surement qu'un .env.
+*.tfstate
+*.tfstate.*
+.terraform/
+
+# Variables reelles
+terraform.tfvars
+*.auto.tfvars
+!*.tfvars.example
+
+# Plans enregistres : contiennent aussi des valeurs sensibles
+*.tfplan

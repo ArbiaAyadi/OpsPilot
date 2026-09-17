@@ -69,6 +69,35 @@ spec:
       # n'en declarent pas -- l'inverse du moindre privilege.
       serviceAccountName: opspilot
 
+      # <- AJOUT : classe de priorite. Determine QUI EST EVINCE quand un
+      # noeud sature. L'application est sans etat : elle redemarre en
+      # quelques secondes sans perte, donc elle part avant la base.
+      # Voir priorityclass.yaml pour le raisonnement complet.
+      priorityClassName: opspilot-app
+
+      # <- AJOUT : repartition des repliques sur les noeuds.
+      # Sans cette contrainte, l'ordonnanceur peut placer les trois
+      # repliques sur LE MEME noeud -- la redondance devient alors une
+      # illusion : la panne de ce noeud emporte tout.
+      #
+      # topologySpreadConstraints remplace podAntiAffinity depuis
+      # Kubernetes 1.19 : plus expressif (on regle l'ecart tolere) et
+      # moins couteux a evaluer pour l'ordonnanceur.
+      #
+      # ScheduleAnyway et non DoNotSchedule : sur un cluster mono-noeud
+      # (minikube), DoNotSchedule laisserait les repliques 2 et 3 en
+      # Pending indefiniment. ScheduleAnyway repartit quand c'est
+      # possible, place quand meme sinon -- une preference, pas une
+      # exigence.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: opspilot
+              app.kubernetes.io/component: backend
+
       # automountServiceAccountToken: false -- l'application n'appelle
       # pas l'API Kubernetes. Monter son jeton dans le conteneur ne
       # servirait qu'a offrir un point de depart a un attaquant ayant
@@ -86,6 +115,52 @@ spec:
           # profil seccomp du runtime. Exige par le Pod Security
           # Standard "restricted" applique au namespace.
           type: RuntimeDefault
+
+      # <- AJOUT : conteneur d'initialisation. S'execute AVANT le
+      # conteneur principal et doit se terminer avec succes pour que
+      # celui-ci demarre.
+      #
+      # Sans lui, l'application demarre pendant que PostgreSQL initialise
+      # encore son repertoire de donnees. Elle echoue a se connecter,
+      # bascule en mode memoire degrade, et n'y revient jamais -- le
+      # repli n'est evalue qu'au demarrage. Symptome trompeur : la base
+      # fonctionne, mais l'application ne la voit pas.
+      #
+      # 60 tentatives x 2s = 2 minutes d'attente maximum. Au-dela, le pod
+      # echoue franchement plutot que de demarrer dans un etat degrade
+      # silencieux -- un echec visible vaut mieux qu'un demi-fonctionnement.
+      initContainers:
+        - name: attendre-base
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              echo "Attente de PostgreSQL sur $DB_HOST:$DB_PORT..."
+              for i in $(seq 1 60); do
+                if nc -z "$DB_HOST" "$DB_PORT" 2>/dev/null; then
+                  echo "PostgreSQL repond apres $((i*2))s"
+                  exit 0
+                fi
+                sleep 2
+              done
+              echo "PostgreSQL injoignable apres 120s" >&2
+              exit 1
+          envFrom:
+            - configMapRef:
+                name: opspilot-config
+          resources:
+            requests:
+              memory: 16Mi
+              cpu: 10m
+            limits:
+              memory: 32Mi
+              cpu: 50m
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
 
       containers:
         - name: opspilot

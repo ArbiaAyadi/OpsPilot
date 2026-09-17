@@ -1,0 +1,206 @@
+# ---------------------------------------------------------------------------
+# Valeurs par defaut du chart OpsPilot
+# ---------------------------------------------------------------------------
+# Ce fichier est le CONTRAT du chart : tout ce qu'un utilisateur peut
+# parametrer sans lire les gabarits. C'est le seul fichier qu'un client
+# devrait avoir a modifier.
+#
+# Surcharge :
+#   helm install opspilot ./helm/opspilot -f mes-valeurs.yaml
+#   helm install opspilot ./helm/opspilot --set replicaCount=3
+
+# --- Image ---
+image:
+  repository: ghcr.io/arbiaayadi/opspilot
+  # tag vide = utilise appVersion du Chart.yaml. Evite la desynchronisation
+  # entre la version declaree et celle reellement deployee.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# Surcharge des noms generes. Utile quand on installe deux fois le meme
+# chart sur un cluster (deux environnements, deux clients).
+nameOverride: ""
+fullnameOverride: ""
+
+# --- Application ---
+replicaCount: 1
+
+# Contexte de securite au niveau du POD.
+# runAsUser 10001 correspond a l'utilisateur cree dans le Dockerfile.
+# Les modifier ici sans modifier l'image produirait un conteneur incapable
+# d'ecrire dans ses volumes.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+# Contexte au niveau du CONTENEUR
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+resources:
+  requests:
+    memory: 512Mi
+    cpu: 100m
+  limits:
+    memory: 1Gi
+    cpu: 1000m
+
+# --- Sondes ---
+# Exposees comme valeurs parce qu'elles dependent du materiel : un
+# cluster lent a besoin de seuils plus larges. Les figer dans le gabarit
+# obligerait a modifier le chart pour un simple ajustement.
+probes:
+  startup:
+    enabled: true
+    periodSeconds: 5
+    failureThreshold: 30   # 30 x 5s = 150s de tolerance au demarrage
+  readiness:
+    enabled: true
+    periodSeconds: 10
+    failureThreshold: 3
+  liveness:
+    enabled: true
+    periodSeconds: 20
+    failureThreshold: 3
+
+# --- Service ---
+service:
+  type: ClusterIP
+  port: 8088
+  # nodePort n'a d'effet que si type vaut NodePort
+  nodePort: null
+
+# --- Ingress ---
+ingress:
+  enabled: false
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    nginx.ingress.kubernetes.io/proxy-ssl-verify: "off"
+    # WebSocket : le tableau de bord recoit l'etat du cluster en continu.
+    # Sans ces delais, nginx coupe la connexion au bout de 60s.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+  hosts:
+    - host: opspilot.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# --- Mise a l'echelle automatique ---
+# PREREQUIS : metrics-server installe dans le cluster. Sans lui, le HPA
+# affiche "unknown" et ne fait rien -- silencieusement.
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+# --- Budget d'interruption ---
+# ATTENTION : avec replicaCount a 1, minAvailable a 1 BLOQUE toute
+# vidange de noeud. Laisse desactive tant qu'il n'y a qu'une replique.
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+
+# --- Isolation reseau ---
+# PREREQUIS : un CNI qui les applique (Calico, Cilium). Flannel les
+# IGNORE silencieusement -- les objets existent sans effet.
+networkPolicy:
+  enabled: false
+
+# --- Base de donnees ---
+postgresql:
+  enabled: true
+  image:
+    repository: postgres
+    # Version EXPLICITE, jamais latest : PostgreSQL 15 ne lit pas un
+    # repertoire de donnees cree par la 16 sans migration. Avec latest,
+    # un redemarrage apres une nouvelle publication rendrait la base
+    # illisible.
+    tag: "15-alpine"
+  # 999 est l'uid postgres dans l'image officielle. fsGroup lui donne la
+  # propriete du volume -- sans quoi PostgreSQL refuse de demarrer avec
+  # "data directory has wrong ownership".
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 999
+    runAsGroup: 999
+    fsGroup: 999
+  resources:
+    requests:
+      memory: 256Mi
+      cpu: 100m
+    limits:
+      memory: 512Mi
+      cpu: 500m
+  persistence:
+    enabled: true
+    size: 5Gi
+    # storageClass vide = classe par defaut du cluster. La coder en dur
+    # rendrait le chart dependant d'un fournisseur precis.
+    storageClass: ""
+
+# --- Configuration applicative (ConfigMap) ---
+config:
+  HOST: "0.0.0.0"
+  PORT: "8088"
+  DB_PORT: "5432"
+  DB_NAME: "opspilot"
+  DB_USER: "opspilot"
+  PROMETHEUS_URL: "http://prometheus:9090"
+  COOLDOWN_RAPPORT_S: "1200"
+  INTERVALLE_MIN_REANALYSE_LLM_S: "3600"
+  INTERVALLE_MAX_REANALYSE_LLM_S: "14400"
+  GROQ_TOKENS_QUOTIDIENS_LIMITE: "200000"
+  REGLES_MAX_TOKENS: "5000"
+  WEB_SEARCH_CACHE_TTL_S: "2592000"
+
+# --- Secrets ---
+# create: true genere un Secret depuis les valeurs ci-dessous. A RESERVER
+# au developpement : passer un mot de passe en --set le laisse dans
+# l'historique du shell ET dans les revisions Helm, lisibles par
+# quiconque a le droit "get secrets".
+#
+# En production : create: false et existingSecret pointant vers un Secret
+# gere par External Secrets Operator ou Sealed Secrets.
+secrets:
+  create: true
+  existingSecret: ""
+  data:
+    DB_PASSWORD: ""
+    GROQ_API_KEY: ""
+    PROXMOX_TOKEN_SECRET: ""
+    SSH_PASSWORD: ""
+    SIGNUP_INVITE_CODE: ""
+    TAVILY_API_KEY: ""
+    SMTP_PASSWORD: ""
+
+# --- Compte de service et RBAC ---
+serviceAccount:
+  create: true
+  name: ""
+  # L'application n'appelle pas l'API Kubernetes : monter son jeton ne
+  # ferait qu'offrir un point de depart a un attaquant.
+  automountServiceAccountToken: false
+
+rbac:
+  create: true
+
+# --- Placement des pods ---
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}

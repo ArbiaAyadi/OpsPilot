@@ -1,0 +1,17 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+{{- /* ATTENTION : avec replicaCount a 1, minAvailable a 1 BLOQUE toute
+       vidange de noeud. C'est voulu -- l'administrateur doit constater
+       consciemment qu'il provoque une interruption. */}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "opspilot.fullname" . }}
+  labels:
+    {{- include "opspilot.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "opspilot.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: backend
+{{- end }}

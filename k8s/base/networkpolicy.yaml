@@ -1,0 +1,142 @@
+---
+# ---------------------------------------------------------------------------
+# NetworkPolicy : isolation reseau entre pods
+# ---------------------------------------------------------------------------
+# Par defaut, dans Kubernetes, TOUS les pods peuvent se parler --
+# y compris entre namespaces. Un pod compromis dans une application sans
+# rapport peut donc atteindre ta base de donnees.
+#
+# PREREQUIS : le plugin reseau (CNI) doit supporter les NetworkPolicy.
+# Calico, Cilium et Weave les appliquent ; Flannel seul les IGNORE
+# silencieusement -- le manifeste existe, rien n'est filtre. C'est un
+# piege frequent : croire qu'on est protege alors que la politique n'est
+# pas appliquee.
+#
+# Premiere regle : TOUT REFUSER. On part du principe que rien n'est
+# autorise, puis on ouvre explicitement ce qui est necessaire.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: refuser-tout-par-defaut
+  namespace: opspilot
+spec:
+  # podSelector vide = s'applique a TOUS les pods du namespace
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  # Ni "ingress" ni "egress" declares = tout est refuse dans les deux
+  # sens. Les regles suivantes ouvriront ce qui est necessaire.
+---
+# L'application peut joindre la base -- et elle seule.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: app-vers-base
+  namespace: opspilot
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: database
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: backend
+      ports:
+        - protocol: TCP
+          port: 5432
+      # Consequence concrete : un pod d'un autre namespace, ou un pod de
+      # ce namespace qui n'est pas l'application, ne peut PAS se
+      # connecter a PostgreSQL. Meme en connaissant le mot de passe.
+---
+# L'application peut recevoir du trafic de l'Ingress.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ingress-vers-app
+  namespace: opspilot
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: backend
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              # Le namespace du controleur Ingress doit porter ce label.
+              # Sur ingress-nginx installe par Helm, il l'a par defaut.
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8088
+---
+# Sorties autorisees pour l'application.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sorties-app
+  namespace: opspilot
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: backend
+  policyTypes:
+    - Egress
+  egress:
+    # DNS -- indispensable. Oublier cette regle est l'erreur la plus
+    # frequente : l'application ne resout plus aucun nom, y compris
+    # "opspilot-db", et echoue avec des erreurs de connexion
+    # incomprehensibles alors que la politique semble correcte.
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # La base
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: database
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Sorties externes : API Groq, Proxmox, Prometheus, SSH vers les
+    # noeuds. On ne peut pas restreindre par nom de domaine avec une
+    # NetworkPolicy standard (elle ne comprend que des IP), d'ou ce
+    # filtrage par PORT plutot que par destination.
+    #
+    # Une politique par domaine exigerait Cilium et ses CiliumNetworkPolicy.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              # Exclut les plages privees : l'application ne doit pas
+              # pouvoir scanner le reseau interne du cluster ou de
+              # l'entreprise. Seul l'Internet public reste joignable.
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443      # API Groq, Mistral, Tavily
+    # Reseau local : Proxmox (8006), Prometheus (9090), SSH (22)
+    - to:
+        - ipBlock:
+            cidr: 192.168.138.0/24
+      ports:
+        - protocol: TCP
+          port: 8006
+        - protocol: TCP
+          port: 9090
+        - protocol: TCP
+          port: 22

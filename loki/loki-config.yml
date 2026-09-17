@@ -1,0 +1,67 @@
+---
+# ---------------------------------------------------------------------------
+# Loki -- agregation de logs
+# ---------------------------------------------------------------------------
+# Pourquoi Loki et non Elasticsearch : Elasticsearch INDEXE le contenu de
+# chaque ligne de log, ce qui exige 2 Go de RAM au minimum et beaucoup de
+# disque. Loki n'indexe que les ETIQUETTES (service, niveau, hote) et
+# stocke le texte compresse tel quel.
+#
+# Consequence : quelques centaines de Mo suffisent, contre plusieurs Go.
+# La contrepartie est qu'une recherche plein texte est plus lente -- on
+# filtre d'abord par etiquette, puis on cherche dans le sous-ensemble.
+# Pour de la supervision, c'est le bon compromis.
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  # Limite la verbosite : Loki qui journalise abondamment ses propres
+  # operations remplit le disque qu'il est cense surveiller.
+  log_level: warn
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  # Retention de 7 jours : au-dela, les logs sont supprimes. Sur une
+  # infrastructure contrainte, une retention illimitee finit toujours par
+  # saturer le disque -- et c'est le genre de panne qui survient la nuit.
+  retention_period: 168h
+  # Rejette les logs trop anciens : evite qu'un agent mal synchronise
+  # n'injecte des donnees incoherentes dans l'historique.
+  reject_old_samples: true
+  reject_old_samples_max_age: 24h
+  ingestion_rate_mb: 4
+  ingestion_burst_size_mb: 6
+
+compactor:
+  working_directory: /loki/compactor
+  # Sans delete_request_store et retention_enabled, la retention
+  # configuree plus haut est IGNOREE -- piege classique : on croit la
+  # retention active, le disque se remplit quand meme.
+  delete_request_store: filesystem
+  retention_enabled: true
+  compaction_interval: 10m
+
+analytics:
+  reporting_enabled: false

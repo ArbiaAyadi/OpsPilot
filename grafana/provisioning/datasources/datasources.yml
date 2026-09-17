@@ -1,0 +1,61 @@
+---
+# ---------------------------------------------------------------------------
+# Sources de donnees Grafana -- provisionnees, non configurees a la main
+# ---------------------------------------------------------------------------
+# Une source ajoutee via l'interface web n'existe que dans la base interne
+# de Grafana. Si le conteneur est recree sans volume, elle disparait ; et
+# rien ne permet de savoir, en lisant un depot, a quoi Grafana est
+# connecte.
+#
+# Le provisionnement rend la configuration DECLARATIVE : elle est lue au
+# demarrage depuis ces fichiers. Consequence pratique -- un Grafana
+# redeployé de zero retrouve ses sources et ses tableaux de bord sans
+# aucune intervention.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    # Dans docker-compose, "prometheus" est le nom du service. Dans
+    # Kubernetes, ce serait le nom du Service. Jamais une IP : elle change.
+    url: http://192.168.138.137:9090
+    isDefault: true
+    jsonData:
+      # timeInterval doit correspondre au scrape_interval de Prometheus.
+      # Plus bas, Grafana interpole des points qui n'existent pas et
+      # affiche des courbes trompeuses ; plus haut, il masque des pics
+      # reels.
+      timeInterval: 15s
+      httpMethod: POST
+    editable: false
+    # editable: false -- empeche la modification depuis l'interface.
+    # Volontaire : une source modifiee a la main divergerait de ce
+    # fichier sans trace. Toute evolution passe par le depot.
+
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: false
+    jsonData:
+      maxLines: 1000
+      # Corrélation logs -> traces. Sans tracing distribue ici, mais la
+      # structure est en place si OpenTelemetry est ajoute plus tard.
+      derivedFields: []
+
+  - name: PostgreSQL
+    type: postgres
+    url: 192.168.138.133:5432
+    user: opspilot
+    database: opspilot
+    secureJsonData:
+      # Lu depuis une variable d'environnement, jamais ecrit ici.
+      password: ${GF_DATASOURCE_PG_PASSWORD}
+    jsonData:
+      sslmode: disable
+      postgresVersion: 1500
+    editable: false
+    # Interroger directement la base d'OpsPilot permet des tableaux de
+    # bord sur les DONNEES METIER -- nombre de recommandations par jour,
+    # taux d'acceptation des actions -- que Prometheus ne peut pas fournir.

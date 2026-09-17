@@ -1,0 +1,47 @@
+# ---------------------------------------------------------------------------
+# Valeurs pour un cluster minikube local
+# ---------------------------------------------------------------------------
+#   helm install opspilot ./helm/opspilot -n opspilot --create-namespace \
+#     -f ./helm/opspilot/values-minikube.yaml \
+#     --set secrets.data.DB_PASSWORD='...' \
+#     --set secrets.data.GROQ_API_KEY='...'
+
+image:
+  repository: opspilot
+  tag: local
+  # Never : l'image est construite DANS minikube (minikube image build),
+  # elle n'existe dans aucun registre. Sans cela : ImagePullBackOff.
+  pullPolicy: Never
+
+resources:
+  requests:
+    memory: 256Mi
+    cpu: 50m
+  limits:
+    memory: 640Mi
+    cpu: 500m
+
+service:
+  type: NodePort
+  nodePort: 30088
+
+# Desactives : exigent des prerequis absents d'un minikube par defaut.
+ingress:
+  enabled: false
+autoscaling:
+  enabled: false        # exige metrics-server
+podDisruptionBudget:
+  enabled: false        # bloquerait la vidange du noeud unique
+networkPolicy:
+  enabled: false        # le CNI par defaut ne les applique pas
+
+postgresql:
+  resources:
+    requests:
+      memory: 128Mi
+      cpu: 50m
+    limits:
+      memory: 320Mi
+      cpu: 250m
+  persistence:
+    size: 1Gi

@@ -1,0 +1,104 @@
+{{- if .Values.postgresql.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "opspilot.db.fullname" . }}
+  labels:
+    {{- include "opspilot.labels" . | nindent 4 }}
+    app.kubernetes.io/component: database
+spec:
+  serviceName: {{ include "opspilot.db.fullname" . }}-headless
+  {{- /* Une seule replique, volontairement. PostgreSQL en haute
+         disponibilite exige un operateur dedie (CloudNativePG) qui gere
+         l'election du primaire. replicas: 3 ici donnerait trois bases
+         independantes aux donnees divergentes, pas une base repliquee. */}}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "opspilot.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: database
+  template:
+    metadata:
+      labels:
+        {{- include "opspilot.labels" . | nindent 8 }}
+        app.kubernetes.io/component: database
+    spec:
+      serviceAccountName: {{ include "opspilot.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.postgresql.securityContext | nindent 8 }}
+      containers:
+        - name: postgres
+          image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: {{ .Values.config.DB_NAME | quote }}
+            - name: POSTGRES_USER
+              value: {{ .Values.config.DB_USER | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "opspilot.secretName" . }}
+                  key: DB_PASSWORD
+            {{- /* PGDATA en SOUS-REPERTOIRE : un volume persistant
+                   contient souvent lost+found, et PostgreSQL refuse
+                   d'initialiser un repertoire non vide. Sans ce detail,
+                   le tout premier demarrage echoue. */}}
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          resources:
+            {{- toYaml .Values.postgresql.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          {{- /* pg_isready et non une requete HTTP : c'est l'outil
+                 officiel, qui repond seulement quand la base accepte
+                 reellement des connexions. Verifier le PROCESSUS ne
+                 prouve rien. */}}
+          startupProbe:
+            exec:
+              command: ["pg_isready", "-U", {{ .Values.config.DB_USER | quote }}]
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", {{ .Values.config.DB_USER | quote }}]
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", {{ .Values.config.DB_USER | quote }}]
+            periodSeconds: 30
+            failureThreshold: 3
+          volumeMounts:
+            - name: donnees
+              mountPath: /var/lib/postgresql/data
+      terminationGracePeriodSeconds: 60
+      {{- if not .Values.postgresql.persistence.enabled }}
+      volumes:
+        - name: donnees
+          emptyDir: {}
+      {{- end }}
+  {{- if .Values.postgresql.persistence.enabled }}
+  {{- /* volumeClaimTemplates est PROPRE au StatefulSet : un PVC par
+         replique, lie a elle et qui la suit. Ces PVC SURVIVENT a la
+         suppression du StatefulSet -- supprimer un objet ne doit jamais
+         detruire des donnees. */}}
+  volumeClaimTemplates:
+    - metadata:
+        name: donnees
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.postgresql.persistence.storageClass }}
+        storageClassName: {{ .Values.postgresql.persistence.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.postgresql.persistence.size }}
+  {{- end }}
+{{- end }}

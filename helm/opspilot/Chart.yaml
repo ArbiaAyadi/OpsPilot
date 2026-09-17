@@ -1,0 +1,44 @@
+---
+# ---------------------------------------------------------------------------
+# Chart Helm - OpsPilot
+# ---------------------------------------------------------------------------
+# Helm et Kustomize repondent au meme besoin par deux voies opposees, et
+# ce projet fournit les deux volontairement :
+#
+#   Kustomize PATCHE du YAML valide. Les fichiers de base restent
+#   lisibles et validables tels quels (kubeconform les accepte).
+#   Ideal quand on maitrise les manifestes et qu'on veut des variantes.
+#
+#   Helm GENERE du YAML depuis des gabarits Go. Plus puissant (boucles,
+#   conditions, fonctions), mais un gabarit non rendu n'est pas du YAML
+#   valide. Ideal pour DISTRIBUER une application a des tiers qui la
+#   parametreront sans lire les manifestes.
+#
+# Pour OpsPilot destine a une societe, Helm est le bon format de
+# livraison : le client installe avec ses propres valeurs sans toucher
+# aux gabarits.
+apiVersion: v2
+name: opspilot
+description: Supervision d'infrastructure Proxmox VE assistee par IA
+type: application
+
+# version : version du CHART (structure des manifestes)
+# appVersion : version de l'APPLICATION empaquetee
+# Les deux evoluent independamment -- corriger une sonde change la
+# version du chart, pas celle de l'application.
+version: 1.0.0
+appVersion: "1.0.0"
+
+keywords:
+  - proxmox
+  - monitoring
+  - observability
+  - aiops
+
+maintainers:
+  - name: Arbia Ayadi
+
+# Version minimale de Kubernetes. Helm refuse l'installation sur un
+# cluster plus ancien -- utile car autoscaling/v2 et policy/v1 n'existent
+# pas avant la 1.21.
+kubeVersion: ">=1.21.0-0"

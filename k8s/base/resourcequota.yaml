@@ -1,0 +1,86 @@
+---
+# ---------------------------------------------------------------------------
+# ResourceQuota : plafond de consommation du namespace
+# ---------------------------------------------------------------------------
+# Les requests/limits d'un Deployment protegent les pods LES UNS DES
+# AUTRES. Le ResourceQuota protege le CLUSTER de l'ensemble du namespace.
+#
+# La difference est celle qu'on a vecue sur ce cluster : l'application et
+# PostgreSQL respectaient chacune leurs limites, mais leur SOMME a
+# etouffe le control plane -- 9 Mo disponibles sur 2.4 Go, API server
+# injoignable. Aucune limite individuelle ne pouvait l'empecher.
+#
+# Avec ce quota, Kubernetes REFUSE la creation d'un pod qui ferait
+# depasser le total. Un refus explicite au deploiement vaut infiniment
+# mieux qu'un cluster qui devient lentement inutilisable.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: opspilot
+  namespace: opspilot
+  labels:
+    app.kubernetes.io/name: opspilot
+spec:
+  hard:
+    # Somme des requests de TOUS les pods du namespace
+    requests.cpu: "2"
+    requests.memory: 2Gi
+    # Somme des limits -- volontairement superieure aux requests : les
+    # pods peuvent depasser ponctuellement leur reservation, mais le
+    # total reste borne.
+    limits.cpu: "4"
+    limits.memory: 4Gi
+
+    # Bornes par TYPE d'objet. Empeche une boucle de creation (un
+    # controleur mal configure, un script errone) de saturer etcd.
+    pods: "20"
+    services: "10"
+    # NodePort est limite a 2 : chaque NodePort consomme un port sur
+    # TOUS les noeuds du cluster. C'est une ressource rare et partagee,
+    # pas un detail de configuration.
+    services.nodeports: "2"
+    persistentvolumeclaims: "5"
+    secrets: "10"
+    configmaps: "10"
+---
+# ---------------------------------------------------------------------------
+# LimitRange : valeurs par defaut et bornes par conteneur
+# ---------------------------------------------------------------------------
+# Complement indispensable du ResourceQuota. Sans LimitRange, un pod SANS
+# requests declarees est accepte -- et le quota ne peut pas le comptabiliser
+# puisqu'il ne demande officiellement rien. Le plafond devient poreux.
+#
+# Le LimitRange impose des valeurs par defaut a tout conteneur qui n'en
+# declare pas, et interdit les valeurs aberrantes dans les deux sens :
+# trop grandes (un pod qui monopolise un noeud) comme trop petites (un pod
+# etrangle qui redemarre en boucle sans qu'on comprenne pourquoi).
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: opspilot
+  namespace: opspilot
+  labels:
+    app.kubernetes.io/name: opspilot
+spec:
+  limits:
+    - type: Container
+      # Applique si le conteneur ne declare pas de limits
+      default:
+        cpu: 500m
+        memory: 512Mi
+      # Applique si le conteneur ne declare pas de requests
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      # Bornes absolues -- un manifeste hors de ces bornes est REFUSE
+      max:
+        cpu: "2"
+        memory: 2Gi
+      min:
+        cpu: 10m
+        memory: 64Mi
+    - type: PersistentVolumeClaim
+      max:
+        storage: 20Gi
+      min:
+        storage: 1Gi

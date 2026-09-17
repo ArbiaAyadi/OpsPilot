@@ -1,0 +1,249 @@
+---
+# ---------------------------------------------------------------------------
+# StatefulSet : PostgreSQL
+# ---------------------------------------------------------------------------
+# POURQUOI UN StatefulSet ET NON UN Deployment ?
+#
+# C'est la question la plus posee sur Kubernetes, et elle porte sur une
+# vraie difference de nature, pas sur une preference.
+#
+# Un Deployment gere des repliques INTERCHANGEABLES. Kubernetes peut en
+# detruire une et la recreer ailleurs sans consequence : elles n'ont ni
+# nom stable, ni stockage propre, ni ordre. C'est exactement ce qu'il
+# faut pour l'agent OpsPilot, qui ne stocke rien localement.
+#
+# Une base de donnees n'a AUCUNE de ces proprietes :
+#
+#   - Son stockage la suit. Si le pod est recree sur un autre noeud, il
+#     doit retrouver SES donnees, pas un volume vide. Un Deployment avec
+#     un PVC partage ferait ecrire plusieurs repliques dans le meme
+#     volume -- corruption garantie.
+#
+#   - Son identite compte. En replication, un noeud est primaire et les
+#     autres secondaires. "opspilot-db-0" doit rester "opspilot-db-0"
+#     apres un redemarrage, sinon la topologie de replication est
+#     perdue.
+#
+#   - L'ordre compte. Les repliques demarrent 0, puis 1, puis 2, et
+#     s'arretent dans l'ordre inverse. Un secondaire ne doit pas demarrer
+#     avant son primaire.
+#
+# Le StatefulSet fournit ces trois garanties. Le Deployment, aucune.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: opspilot-db
+  namespace: opspilot
+  labels:
+    app.kubernetes.io/name: opspilot
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: opspilot
+spec:
+  # serviceName pointe vers le Service HEADLESS (voir db-service.yaml).
+  # C'est lui qui donne a chaque replique son nom DNS individuel :
+  #   opspilot-db-0.opspilot-db-headless.opspilot.svc.cluster.local
+  # Sans cette ligne, les repliques n'ont pas d'adresse stable et la
+  # replication devient impossible a configurer.
+  serviceName: opspilot-db-headless
+
+  # Une seule replique : PostgreSQL en haute disponibilite demande un
+  # operateur dedie (CloudNativePG, Zalando postgres-operator) qui gere
+  # l'election du primaire, la replication et les bascules. Declarer
+  # replicas: 3 ici ne donnerait pas une base repliquee -- juste trois
+  # bases independantes avec des donnees divergentes.
+  #
+  # Mieux vaut une replique assumee qu'une fausse haute disponibilite.
+  replicas: 1
+
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: opspilot
+      app.kubernetes.io/component: database
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: opspilot
+        app.kubernetes.io/component: database
+        app.kubernetes.io/part-of: opspilot
+    spec:
+      # Compte de service dedie, sans jeton monte : PostgreSQL n'appelle
+      # jamais l'API Kubernetes.
+      serviceAccountName: opspilot
+      automountServiceAccountToken: false
+
+      # <- AJOUT : priorite ELEVEE. La base est evincee en DERNIER quand
+      # un noeud sature -- une eviction interrompt les transactions en
+      # cours et impose une recuperation par le journal WAL au
+      # redemarrage. Voir priorityclass.yaml.
+      priorityClassName: opspilot-database
+
+      securityContext:
+        runAsNonRoot: true
+        # 999 est l'uid de l'utilisateur postgres dans l'image officielle.
+        # fsGroup: 999 donne a cet utilisateur la propriete du volume
+        # monte -- sans quoi PostgreSQL refuse de demarrer avec
+        # "data directory has wrong ownership", une erreur tres
+        # frequente en premier deploiement.
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: postgres
+          # Version EXPLICITE, jamais "latest". Une base de donnees ne
+          # doit pas changer de version majeure lors d'un simple
+          # redemarrage de pod : PostgreSQL 15 ne lit pas un repertoire
+          # de donnees cree par la 16 sans migration explicite. Avec
+          # "latest", un redemarrage apres une nouvelle publication
+          # rendrait la base illisible.
+          image: postgres:15-alpine
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: opspilot-config
+                  key: DB_NAME
+            - name: POSTGRES_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: opspilot-config
+                  key: DB_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: opspilot-secrets
+                  key: DB_PASSWORD
+            # PGDATA dans un SOUS-REPERTOIRE du volume monte, et non a sa
+            # racine. Raison : un volume persistant contient souvent un
+            # repertoire "lost+found" (systemes ext4), et PostgreSQL
+            # refuse d'initialiser un repertoire non vide. Le
+            # sous-repertoire evite ce blocage -- probleme classique qui
+            # fait echouer le tout premier demarrage.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            # readOnlyRootFilesystem NON active ici, contrairement a
+            # l'application : PostgreSQL ecrit dans /var/run/postgresql
+            # (socket unix) et /tmp au demarrage. L'activer exigerait de
+            # monter ces chemins en emptyDir -- faisable, mais qui ajoute
+            # de la complexite pour un gain marginal sur une image
+            # officielle bien maintenue. Choix assume, pas oubli.
+
+          # --- Sondes adaptees a une base de donnees ---
+          # pg_isready et non une requete HTTP : c'est l'outil officiel
+          # PostgreSQL, qui repond "accepting connections" uniquement
+          # quand la base accepte reellement des connexions.
+          #
+          # Souvenir du diagnostic mene sur ce projet : "systemctl status
+          # postgresql" annoncait active alors que la base ne repondait
+          # pas. Verifier le PROCESSUS ne prouve rien ; verifier le
+          # SERVICE, si.
+          startupProbe:
+            exec:
+              command: ["pg_isready", "-U", "opspilot", "-d", "opspilot"]
+            periodSeconds: 5
+            failureThreshold: 24    # jusqu'a 2 minutes pour initialiser
+            timeoutSeconds: 3
+
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "opspilot", "-d", "opspilot"]
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 3
+
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "opspilot", "-d", "opspilot"]
+            periodSeconds: 30
+            failureThreshold: 3
+            timeoutSeconds: 5
+            # Seuils tres larges volontairement. Redemarrer une base de
+            # donnees est une action LOURDE : connexions coupees,
+            # transactions interrompues, recuperation au demarrage. Une
+            # liveness trop sensible sur une base sous charge produit des
+            # redemarrages en cascade qui aggravent le probleme au lieu
+            # de le resoudre.
+
+          volumeMounts:
+            - name: donnees
+              mountPath: /var/lib/postgresql/data
+            # <- AJOUT (avertissement constate : "chmod
+            # /var/run/postgresql: Operation not permitted") : PostgreSQL
+            # tente d'ajuster les droits de son repertoire de socket au
+            # demarrage. Avec runAsUser: 999 et un repertoire appartenant
+            # a root dans l'image, le chmod echoue.
+            #
+            # Ce n'etait pas fatal ici -- l'erreur bloquante etait le mot
+            # de passe vide -- mais l'avertissement pollue les logs et
+            # masquerait un vrai probleme. Un emptyDir monte a cet
+            # endroit appartient a fsGroup (999), donc PostgreSQL y a
+            # tous les droits.
+            - name: run
+              mountPath: /var/run/postgresql
+
+      # 60 secondes pour s'arreter proprement : PostgreSQL doit terminer
+      # les transactions en cours et ecrire un point de controle. Le
+      # tuer avant produit une recuperation au demarrage suivant --
+      # sans perte de donnees grace au journal WAL, mais avec un
+      # redemarrage plus long.
+      volumes:
+        - name: run
+          emptyDir: {}
+
+      terminationGracePeriodSeconds: 60
+
+  # --- Stockage persistant ---
+  # volumeClaimTemplates est PROPRE au StatefulSet : Kubernetes cree un
+  # PersistentVolumeClaim distinct PAR REPLIQUE, nomme
+  # "donnees-opspilot-db-0". Ce volume est lie a cette replique precise
+  # et la suit si elle est recreee ailleurs.
+  #
+  # Point important : ces PVC SURVIVENT a la suppression du StatefulSet.
+  # C'est voulu -- supprimer un objet Kubernetes ne doit jamais detruire
+  # des donnees. Leur suppression est un geste explicite :
+  #   kubectl delete pvc donnees-opspilot-db-0 -n opspilot
+  volumeClaimTemplates:
+    - metadata:
+        name: donnees
+        labels:
+          app.kubernetes.io/name: opspilot
+          app.kubernetes.io/component: database
+      spec:
+        # ReadWriteOnce : montable en lecture-ecriture par un seul noeud.
+        # C'est le mode correct pour une base : deux instances ecrivant
+        # dans le meme volume corrompraient les donnees.
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 5Gi
+        # storageClassName volontairement absent : la classe par defaut
+        # du cluster est utilisee. La coder en dur ("gp3", "longhorn",
+        # "local-path") rendrait ce manifeste dependant d'un
+        # fournisseur precis -- il ne se deploierait plus ailleurs sans
+        # modification. Les overlays Kustomize (groupe 4) sont l'endroit
+        # ou surcharger cette valeur par environnement.

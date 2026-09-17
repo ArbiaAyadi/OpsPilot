@@ -141,6 +141,9 @@ services:
     environment:
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
       GF_USERS_ALLOW_SIGN_UP: "false"
+      # Mot de passe de la source PostgreSQL, lu depuis .env -- jamais
+      # ecrit dans le fichier de provisionnement.
+      GF_DATASOURCE_PG_PASSWORD: ${DB_PASSWORD:-}
     volumes:
       - grafana-data:/var/lib/grafana
       # Provisionnement automatique : sources de données et tableaux de
@@ -149,6 +152,60 @@ services:
       # tableau de bord perdu se recrée par un redéploiement, pas de
       # mémoire.
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      # <- AJOUT : tableaux de bord charges depuis des fichiers JSON
+      # versionnes. Un tableau cree dans l'interface n'existe que dans la
+      # base interne de Grafana : perdu si le conteneur est recree, et
+      # invisible dans le depot. En fichier, il se relit, se compare en
+      # revision de code, et se redeploie a l'identique.
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - opspilot
+
+  # ------------------------------------------------------------------------
+  # Loki -- agregation de logs (profil observability)
+  # ------------------------------------------------------------------------
+  # Choisi plutot qu'Elasticsearch pour une raison de dimensionnement :
+  # Elasticsearch indexe le CONTENU de chaque ligne et exige 2 Go de RAM
+  # minimum. Loki n'indexe que les ETIQUETTES et stocke le texte
+  # compresse -- quelques centaines de Mo suffisent.
+  #
+  # Sur une infrastructure contrainte, ce n'est pas un compromis : c'est
+  # la difference entre une pile de logs qui tourne et une qui ne demarre
+  # pas.
+  loki:
+    image: grafana/loki:3.3.2
+    container_name: opspilot-loki
+    profiles: [observability]
+    restart: unless-stopped
+    command: -config.file=/etc/loki/loki-config.yml
+    volumes:
+      - ./loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki-data:/loki
+    networks:
+      - opspilot
+    # Port non expose a l'hote : Loki n'est interroge que par Grafana,
+    # depuis le reseau Docker interne.
+
+  # ------------------------------------------------------------------------
+  # Promtail -- collecte des logs vers Loki
+  # ------------------------------------------------------------------------
+  promtail:
+    image: grafana/promtail:3.3.2
+    container_name: opspilot-promtail
+    profiles: [observability]
+    restart: unless-stopped
+    command: -config.file=/etc/promtail/promtail-config.yml
+    volumes:
+      - ./loki/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      # Socket Docker en LECTURE SEULE : permet a Promtail de decouvrir
+      # les conteneurs et lire leurs logs. Un acces en ecriture
+      # equivaudrait a donner le controle total de l'hote -- on peut
+      # creer un conteneur privilegie par cette socket.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/log:/var/log:ro
+      - ./rapports:/var/log/opspilot:ro
+    depends_on:
+      - loki
     networks:
       - opspilot
 
@@ -156,6 +213,7 @@ volumes:
   db-data:
   ollama-models:
   grafana-data:
+  loki-data:
 
 networks:
   opspilot:

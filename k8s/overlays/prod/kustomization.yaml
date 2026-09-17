@@ -1,0 +1,76 @@
+---
+# ---------------------------------------------------------------------------
+# Overlay PRODUCTION
+# ---------------------------------------------------------------------------
+# Meme base que dev, reglages differents. Toute la valeur de Kustomize
+# est la : une seule definition de l'application, plusieurs profils de
+# deploiement, aucune duplication.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: opspilot
+
+resources:
+  - ../../base
+
+labels:
+  - includeSelectors: false
+    pairs:
+      environment: production
+
+# Le tag d'image est fixe ICI, pas dans la base. En production, "latest"
+# est proscrit : deux pods de la meme application pourraient tourner avec
+# des images differentes selon leur date de creation, rendant tout
+# diagnostic impossible.
+images:
+  - name: ghcr.io/arbiaayadi/opspilot
+    newTag: v1.0.0
+
+patches:
+  # Trois repliques au minimum : le HPA montera si necessaire, mais on ne
+  # depend jamais d'un pod unique en production.
+  - target:
+      kind: Deployment
+      name: opspilot-app
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 3
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: 1Gi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: 2Gi
+
+  # HPA plus large en production
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: opspilot-app
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 3
+      - op: replace
+        path: /spec/maxReplicas
+        value: 10
+
+  # PDB renforce : avec 3 repliques minimum, exiger 2 disponibles
+  # garantit qu'une vidange de noeud ne laisse jamais l'application sur
+  # un seul pod.
+  - target:
+      kind: PodDisruptionBudget
+      name: opspilot-app
+    patch: |-
+      - op: replace
+        path: /spec/minAvailable
+        value: 2
+
+  # Volume de production
+  - target:
+      kind: StatefulSet
+      name: opspilot-db
+    patch: |-
+      - op: replace
+        path: /spec/volumeClaimTemplates/0/spec/resources/requests/storage
+        value: 50Gi

@@ -1,0 +1,197 @@
+---
+# ---------------------------------------------------------------------------
+# Overlay MINIKUBE - cluster local reel
+# ---------------------------------------------------------------------------
+# Meme base que dev et prod. Les differences tiennent a trois contraintes
+# propres a un cluster local mono-noeud, et chacune est un vrai
+# enseignement sur ce qu'un cluster fournit ou non.
+#
+# 1. L'IMAGE N'EST DANS AUCUN REGISTRE. La CI construit l'image mais ne
+#    la publie pas. minikube ne peut donc pas la telecharger. On la
+#    construit DANS minikube (voir le guide) et on force
+#    imagePullPolicy: Never -- sinon Kubernetes tenterait un
+#    telechargement et echouerait en ImagePullBackOff, alors que l'image
+#    est deja presente localement.
+#
+# 2. PAS DE cert-manager NI DE DOMAINE PUBLIC. L'Ingress de production
+#    reference letsencrypt-prod et opspilot.example.com : inapplicables
+#    ici. On passe par un Service NodePort, joignable directement.
+#
+# 3. RESSOURCES REDUITES. Un cluster de 3 Go doit heberger le control
+#    plane (~700 Mo) en plus des pods. Les valeurs de production
+#    laisseraient les pods en Pending faute de place -- l'ordonnanceur
+#    refuse de placer un pod dont les requests depassent l'alloca-
+#    table du noeud.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: opspilot
+
+resources:
+  - ../../base
+
+labels:
+  - includeSelectors: false
+    pairs:
+      environment: minikube
+
+# Image locale, construite dans minikube
+images:
+  - name: ghcr.io/arbiaayadi/opspilot
+    newName: opspilot
+    newTag: local
+
+patches:
+  # --- Application : ressources minimales ---
+  - target:
+      kind: Deployment
+      name: opspilot-app
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: 256Mi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: 640Mi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/cpu
+        value: 50m
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/cpu
+        value: 500m
+      # Never : l'image vient du cache local de minikube, pas d'un
+      # registre. Sans cela : ImagePullBackOff.
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Never
+      # <- CORRIGE (echec reel) : les sondes de la base interrogeaient en
+      # HTTPS, alors que l'application sert en HTTP dans le conteneur.
+      # Message obtenu : "http: server gave HTTP response to HTTPS client".
+      #
+      # Raison : agent/main.py active HTTPS uniquement si SSL_CERTFILE et
+      # SSL_KEYFILE pointent vers des fichiers existants. En conteneur,
+      # ces certificats ne sont pas montes -- ils doivent venir de
+      # l'exterieur, jamais etre embarques dans une image. L'application
+      # retombe donc sur HTTP, ce qui est le comportement correct.
+      #
+      # En production, l'Ingress termine le TLS et parle HTTP au backend :
+      # c'est le schema habituel, le chiffrement s'arrete a la porte du
+      # cluster. Les sondes doivent suivre ce que l'application sert
+      # REELLEMENT, pas ce qu'on aimerait qu'elle serve.
+      - op: replace
+        path: /spec/template/spec/containers/0/startupProbe/httpGet/scheme
+        value: HTTP
+      - op: replace
+        path: /spec/template/spec/containers/0/readinessProbe/httpGet/scheme
+        value: HTTP
+      - op: replace
+        path: /spec/template/spec/containers/0/livenessProbe/httpGet/scheme
+        value: HTTP
+      # <- CORRIGE (cause reelle du CrashLoopBackOff) : les sondes
+      # interrogeaient /api/status, qui exige une authentification. Les
+      # logs le montraient sans ambiguite :
+      #   "GET /api/status HTTP/1.1" 401 Unauthorized
+      #
+      # Une sonde Kubernetes ne considere comme succes que les codes 2xx
+      # et 3xx. Un 401 est un echec -- le pod etait donc tue en boucle
+      # alors que l'application fonctionnait parfaitement : elle
+      # demarrait, chargeait le moteur ML, lancait la surveillance, et
+      # repondait aux requetes.
+      #
+      # REGLE GENERALE : une sonde de sante ne doit JAMAIS viser un point
+      # d'acces authentifie. Kubernetes n'a pas de session, pas de cookie,
+      # pas de jeton -- il fait une requete anonyme. La bonne pratique est
+      # un endpoint /healthz public, qui ne revele aucune donnee sensible
+      # et repond 200 tant que le processus vit.
+      #
+      # Ici on vise "/", qui sert l'interface React sans authentification
+      # (sinon la page de connexion elle-meme serait inaccessible). C'est
+      # une verification valable : le serveur repond, donc il vit.
+      - op: replace
+        path: /spec/template/spec/containers/0/startupProbe/httpGet/path
+        value: /
+      - op: replace
+        path: /spec/template/spec/containers/0/readinessProbe/httpGet/path
+        value: /
+      - op: replace
+        path: /spec/template/spec/containers/0/livenessProbe/httpGet/path
+        value: /
+
+  # --- Base de donnees : volume et ressources reduits ---
+  - target:
+      kind: StatefulSet
+      name: opspilot-db
+    patch: |-
+      - op: replace
+        path: /spec/volumeClaimTemplates/0/spec/resources/requests/storage
+        value: 1Gi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: 128Mi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: 320Mi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/cpu
+        value: 50m
+
+  # --- Service en NodePort ---
+  # Rend l'application joignable depuis l'hote sans Ingress ni
+  # LoadBalancer. minikube expose alors le port sur l'IP de sa VM.
+  - target:
+      kind: Service
+      name: opspilot-app
+    patch: |-
+      - op: replace
+        path: /spec/type
+        value: NodePort
+      - op: add
+        path: /spec/ports/0/nodePort
+        value: 30088
+
+  # --- Ressources RETIREES ---
+  # HPA : exige metrics-server. Il est disponible en extension minikube
+  # (minikube addons enable metrics-server) -- le guide explique comment
+  # l'activer pour le demontrer. Retire par defaut pour que le
+  # deploiement fonctionne sans prerequis.
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: opspilot-app
+    patch: |-
+      $patch: delete
+      apiVersion: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+      metadata:
+        name: opspilot-app
+
+  # Ingress : exige un controleur et cert-manager. Remplace par le
+  # NodePort ci-dessus.
+  - target:
+      kind: Ingress
+      name: opspilot
+    patch: |-
+      $patch: delete
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: opspilot
+
+  # PDB de l'application : avec une seule replique, minAvailable: 1
+  # bloquerait toute operation de maintenance sur le noeud unique.
+  - target:
+      kind: PodDisruptionBudget
+      name: opspilot-app
+    patch: |-
+      $patch: delete
+      apiVersion: policy/v1
+      kind: PodDisruptionBudget
+      metadata:
+        name: opspilot-app
+
+# NOTE sur les NetworkPolicy : elles sont CONSERVEES, mais le CNI par
+# defaut de minikube ne les applique PAS. Elles existent donc sans
+# effet -- exactement le piege signale dans networkpolicy.yaml.
+# Pour les faire appliquer reellement :
+#   minikube start --cni=calico
+# C'est une demonstration interessante : montrer qu'un manifeste
+# accepte par l'API n'est pas forcement un manifeste APPLIQUE.

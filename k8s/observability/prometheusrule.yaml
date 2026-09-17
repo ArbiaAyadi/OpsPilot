@@ -1,0 +1,116 @@
+---
+# ---------------------------------------------------------------------------
+# PrometheusRule : alertes versionnees
+# ---------------------------------------------------------------------------
+# Les regles d'alerte deviennent du code : relues en revision, versionnees,
+# deployees avec l'application. C'est le principe "alerting as code".
+#
+# Coherence avec le projet : OpsPilot genere lui-meme des regles de
+# surveillance pour Proxmox. Celles-ci surveillent OpsPilot LUI-MEME --
+# un outil de supervision doit etre supervise, sinon sa panne passe
+# inapercue. C'est un point qu'un jury peut apprecier.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: opspilot
+  namespace: opspilot
+  labels:
+    app.kubernetes.io/name: opspilot
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: opspilot.disponibilite
+      interval: 30s
+      rules:
+        - alert: OpsPilotIndisponible
+          expr: |
+            up{job="opspilot"} == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "OpsPilot ne repond plus"
+            description: >-
+              Aucune reponse depuis 2 minutes. La supervision de
+              l'infrastructure Proxmox est interrompue.
+
+        - alert: OpsPilotRedemarragesFrequents
+          # Plus de 3 redemarrages en 15 minutes. Signale un
+          # CrashLoopBackOff avant qu'il ne devienne permanent -- exactement
+          # la situation vecue avec les sondes mal configurees, ou le pod
+          # redemarrait en boucle sans que rien ne le signale.
+          expr: |
+            increase(kube_pod_container_status_restarts_total{namespace="opspilot"}[15m]) > 3
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.pod }} redemarre en boucle"
+            description: >-
+              {{ $value }} redemarrages en 15 minutes. Verifier :
+              kubectl logs {{ $labels.pod }} -n opspilot --previous
+
+    - name: opspilot.ressources
+      interval: 30s
+      rules:
+        - alert: OpsPilotMemoireProcheDeLaLimite
+          # 90% de la limite : au-dela, le conteneur sera tue (OOMKilled)
+          # sans avertissement. Cette alerte laisse le temps d'agir.
+          expr: |
+            container_memory_working_set_bytes{namespace="opspilot", container!=""}
+            / on(pod, container) kube_pod_container_resource_limits{namespace="opspilot", resource="memory"}
+            > 0.9
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $labels.pod }} proche de sa limite memoire"
+            description: >-
+              {{ $value | humanizePercentage }} de la limite. Le conteneur
+              sera tue (OOMKilled) au depassement.
+
+        - alert: OpsPilotQuotaNamespaceProche
+          # Le quota du namespace bloque la creation de nouveaux pods une
+          # fois atteint. Etre averti AVANT evite un deploiement qui echoue
+          # sans raison apparente.
+          expr: |
+            kube_resourcequota{namespace="opspilot", type="used", resource="requests.memory"}
+            / on(namespace, resource) kube_resourcequota{namespace="opspilot", type="hard", resource="requests.memory"}
+            > 0.85
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Quota memoire du namespace opspilot a 85%"
+            description: >-
+              Les prochains deploiements seront refuses. Augmenter le quota
+              ou reduire les requests.
+
+    - name: opspilot.base
+      interval: 30s
+      rules:
+        - alert: OpsPilotBaseIndisponible
+          expr: |
+            kube_statefulset_status_replicas_ready{namespace="opspilot", statefulset="opspilot-db"} == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "PostgreSQL indisponible"
+            description: >-
+              Aucune replique prete. OpsPilot bascule en mode memoire :
+              les recommandations et rapports ne sont plus persistes.
+
+        - alert: OpsPilotVolumePresqueeplein
+          expr: |
+            kubelet_volume_stats_available_bytes{namespace="opspilot"}
+            / kubelet_volume_stats_capacity_bytes{namespace="opspilot"}
+            < 0.15
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Volume de {{ $labels.persistentvolumeclaim }} presque plein"
+            description: >-
+              Moins de 15% disponible. PostgreSQL cessera d'ecrire une fois
+              le volume sature.

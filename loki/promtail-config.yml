@@ -1,0 +1,73 @@
+---
+# ---------------------------------------------------------------------------
+# Promtail -- collecte et envoi des logs vers Loki
+# ---------------------------------------------------------------------------
+# Promtail lit les fichiers de log, leur attache des ETIQUETTES, et les
+# envoie a Loki. Les etiquettes sont le coeur du systeme : ce sont elles
+# qui seront indexees, donc les seules sur lesquelles on peut filtrer
+# rapidement.
+#
+# REGLE IMPORTANTE : peu d'etiquettes, et a faible cardinalite. Chaque
+# combinaison unique cree un flux distinct dans Loki. Mettre un
+# identifiant de requete ou un horodatage en etiquette produit des
+# millions de flux et fait s'effondrer les performances -- l'erreur la
+# plus courante avec Loki.
+server:
+  http_listen_port: 9080
+  log_level: warn
+
+positions:
+  # Memorise ou en est la lecture de chaque fichier. Sans ce fichier,
+  # Promtail relirait tout depuis le debut a chaque redemarrage.
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  # --- Logs des conteneurs Docker ---
+  - job_name: conteneurs
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 15s
+    relabel_configs:
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/(.*)'
+        target_label: 'conteneur'
+      - source_labels: ['__meta_docker_container_log_stream']
+        target_label: 'flux'
+
+  # --- Logs systeme des noeuds ---
+  - job_name: systeme
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: systeme
+          hote: "${HOSTNAME}"
+          __path__: /var/log/{syslog,messages,daemon.log}
+
+  # --- Logs applicatifs OpsPilot ---
+  - job_name: opspilot
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: opspilot
+          __path__: /var/log/opspilot/*.log
+    pipeline_stages:
+      # Extrait le composant depuis le format de log du projet :
+      #   [Monitoring] 8 anomalie(s) -- slots: 29
+      #   [DB] PostgreSQL connecte
+      #   [AI Rules] Generation echouee
+      - regex:
+          expression: '^\[(?P<composant>[^\]]+)\]\s+(?P<message>.*)$'
+      - labels:
+          # composant est a faible cardinalite (une dizaine de valeurs) --
+          # c'est ce qui en fait une bonne etiquette.
+          composant:
+      # Detecte le niveau depuis le contenu, pour filtrer sur les erreurs
+      # sans avoir a les chercher dans le texte.
+      - match:
+          selector: '{job="opspilot"} |~ "(?i)(erreur|error|echec|failed)"'
+          stages:
+            - static_labels:
+                niveau: erreur

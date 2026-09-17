@@ -1,0 +1,67 @@
+---
+# ---------------------------------------------------------------------------
+# Service HEADLESS : adressage individuel des repliques
+# ---------------------------------------------------------------------------
+# Un Service normal fournit UNE IP virtuelle qui repartit le trafic sur
+# les pods correspondants. Pratique pour un serveur applicatif, inadapte
+# a une base de donnees repliquee : on ne veut pas "une replique au
+# hasard", on veut "le primaire" ou "le secondaire numero 2".
+#
+# clusterIP: None cree un Service HEADLESS : pas d'IP virtuelle, pas de
+# repartition. A la place, le DNS renvoie directement l'adresse de
+# CHAQUE pod, individuellement adressable :
+#
+#   opspilot-db-0.opspilot-db-headless.opspilot.svc.cluster.local
+#
+# C'est ce qui rend possible la configuration d'une replication : chaque
+# instance sait joindre les autres par un nom qui ne change jamais.
+apiVersion: v1
+kind: Service
+metadata:
+  name: opspilot-db-headless
+  namespace: opspilot
+  labels:
+    app.kubernetes.io/name: opspilot
+    app.kubernetes.io/component: database
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: opspilot
+    app.kubernetes.io/component: database
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      protocol: TCP
+---
+# ---------------------------------------------------------------------------
+# Service normal : point d'acces applicatif
+# ---------------------------------------------------------------------------
+# Celui-ci est classique, et c'est lui que l'application utilise. La
+# ConfigMap ecrit DB_HOST: "opspilot-db" -- ce nom resout vers ce
+# Service, qui dirige vers la replique disponible.
+#
+# Deux Services pour la meme base, avec deux usages distincts :
+#   - opspilot-db          : "donne-moi la base" (applicatif)
+#   - opspilot-db-headless : "donne-moi la replique 0" (replication)
+#
+# Separer les deux evite qu'un changement de topologie de replication
+# n'oblige a modifier la configuration de l'application.
+apiVersion: v1
+kind: Service
+metadata:
+  name: opspilot-db
+  namespace: opspilot
+  labels:
+    app.kubernetes.io/name: opspilot
+    app.kubernetes.io/component: database
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: opspilot
+    app.kubernetes.io/component: database
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      protocol: TCP

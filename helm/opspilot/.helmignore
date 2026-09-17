@@ -1,0 +1,6 @@
+# Fichiers exclus du paquet .tgz produit par helm package
+.git/
+.gitignore
+*.tmp
+*.bak
+.DS_Store

@@ -1,0 +1,43 @@
+---
+# ---------------------------------------------------------------------------
+# PriorityClass : qui survit quand le noeud manque de ressources
+# ---------------------------------------------------------------------------
+# Quand un noeud sature, le kubelet EVINCE des pods pour se sauver. Sans
+# priorite declaree, il choisit selon un ordre par defaut qui ne connait
+# rien de ton application -- il peut tuer la base de donnees et garder un
+# pod secondaire.
+#
+# On a vu ce mecanisme a l'oeuvre sur ce cluster : quand la memoire est
+# tombee a 9 Mo, c'est l'API server qui a cesse de repondre. Une
+# PriorityClass ne l'aurait pas empeche (les composants systeme ont deja
+# leur propre priorite elevee), mais elle determine l'ordre d'eviction
+# des pods applicatifs -- et c'est la que le choix compte.
+#
+# Regle appliquee ici : la BASE avant l'APPLICATION. Une application sans
+# base ne sert a rien, mais elle redemarre en quelques secondes. Une base
+# evincee interrompt les transactions en cours et impose une recuperation
+# au demarrage suivant.
+#
+# NOTE : les PriorityClass sont des objets de PORTEE CLUSTER, pas de
+# namespace. Les creer exige des droits d'administrateur du cluster --
+# c'est voulu : la priorite est une ressource partagee, une equipe ne
+# doit pas pouvoir se declarer prioritaire sur les autres.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: opspilot-database
+value: 100000
+globalDefault: false
+description: >-
+  Base de donnees OpsPilot. Evincee en DERNIER : une eviction interrompt
+  les transactions en cours et impose une recuperation au redemarrage.
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: opspilot-app
+value: 10000
+globalDefault: false
+description: >-
+  Application OpsPilot. Evincee AVANT la base : elle est sans etat et
+  redemarre en quelques secondes sans perte.

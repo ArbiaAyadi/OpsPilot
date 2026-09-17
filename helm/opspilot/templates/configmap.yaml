@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "opspilot.fullname" . }}-config
+  labels:
+    {{- include "opspilot.labels" . | nindent 4 }}
+data:
+  {{- /* DB_HOST calcule, non expose dans values : il DOIT correspondre au
+         nom du Service PostgreSQL genere. Le laisser parametrable
+         permettrait une incoherence silencieuse ou l'application ne
+         trouverait pas sa base. */}}
+  DB_HOST: {{ include "opspilot.db.fullname" . | quote }}
+  {{- range $k, $v := .Values.config }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}

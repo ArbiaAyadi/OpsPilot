@@ -1,0 +1,56 @@
+---
+# ---------------------------------------------------------------------------
+# PodDisruptionBudget : disponibilite pendant les operations planifiees
+# ---------------------------------------------------------------------------
+# Protege contre les interruptions VOLONTAIRES : vidange d'un noeud pour
+# maintenance (kubectl drain), mise a jour du cluster, redimensionnement
+# automatique. Il n'a AUCUN effet sur les pannes involontaires -- un
+# noeud qui tombe emporte ses pods, quel que soit le PDB.
+#
+# Sans PDB, "kubectl drain" peut evacuer TOUS les pods d'une application
+# simultanement : interruption totale pendant une operation pourtant
+# planifiee et maitrisee.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: opspilot-app
+  namespace: opspilot
+  labels:
+    app.kubernetes.io/name: opspilot
+spec:
+  # minAvailable: 1 -- au moins un pod doit rester disponible.
+  #
+  # ATTENTION a un piege classique : avec replicas: 1, ce PDB BLOQUE
+  # toute vidange de noeud. Kubernetes ne peut pas evacuer l'unique pod
+  # sans violer le budget, et "kubectl drain" reste bloque
+  # indefiniment.
+  #
+  # C'est acceptable ici parce que le HPA peut monter jusqu'a 5
+  # repliques : en charge, la vidange fonctionne. A une seule replique,
+  # l'administrateur devra forcer (--disable-eviction) -- et c'est bien
+  # ainsi : le PDB l'oblige a constater consciemment qu'il provoque une
+  # interruption.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: opspilot
+      app.kubernetes.io/component: backend
+---
+# PDB pour la base : maxUnavailable: 0.
+# Formulation plus stricte encore -- AUCUNE interruption volontaire
+# toleree. Une base de donnees a replique unique ne doit jamais etre
+# evacuee automatiquement : la decision revient a un humain qui sait ce
+# qu'il fait.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: opspilot-db
+  namespace: opspilot
+  labels:
+    app.kubernetes.io/name: opspilot
+spec:
+  maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: opspilot
+      app.kubernetes.io/component: database
