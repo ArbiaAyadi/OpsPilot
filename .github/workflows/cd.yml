@@ -39,6 +39,17 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  # ATTENTION : github.repository conserve la casse du depot
+  # ("ArbiaAyadi/OpsPilot"). Or les registres OCI n'acceptent QUE des
+  # minuscules dans un nom d'image.
+  #
+  # docker/metadata-action convertit silencieusement -- d'ou une
+  # publication reussie. Mais syft et Trivy recoivent la variable BRUTE
+  # et echouent avec un message peu explicite :
+  #   "failed with exit code 1" sur ghcr.io/ArbiaAyadi/OpsPilot@sha256:...
+  #
+  # IMAGE_LC est calcule a l'execution (voir l'etape "Normaliser") et
+  # utilise partout ou l'outil ne normalise pas lui-meme.
 
 jobs:
   publier:
@@ -62,6 +73,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Normaliser le nom de l'image en minuscules
+        run: |
+          echo "IMAGE_LC=${IMAGE_NAME,,}" >> "$GITHUB_ENV"
+          echo "Nom normalise : ${IMAGE_NAME,,}"
+        env:
+          IMAGE_NAME: ${{ github.repository }}
+
       - name: Preparer Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -76,7 +94,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_LC }}
           # Plusieurs etiquettes pour une meme image, chacune avec un role :
           #   v1.2.3  -- version exacte, immuable, celle a deployer
           #   1.2     -- suit les correctifs de la serie 1.2
@@ -119,6 +137,8 @@ jobs:
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
           DIGEST: ${{ steps.build.outputs.digest }}
+          REGISTRY: ${{ env.REGISTRY }}
+          IMAGE_LC: ${{ env.IMAGE_LC }}
         run: |
           # Signature SANS CLE. Le modele classique exige de stocker une
           # cle privee -- qui doit etre protegee, tournee, et qui peut
@@ -134,7 +154,7 @@ jobs:
           # Ce que cela prouve : cette image a bien ete construite par CE
           # depot, par CE workflow. Une image substituee dans le registre
           # echouerait la verification.
-          cosign sign --yes "${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
+          cosign sign --yes "${REGISTRY}/${IMAGE_LC}@${DIGEST}"
         # continue-on-error : la signature est un renforcement, pas un
         # prerequis. Si Sigstore est indisponible, l'image reste publiee.
         continue-on-error: true
@@ -142,14 +162,14 @@ jobs:
       - name: Generer le SBOM
         uses: anchore/sbom-action@v0
         with:
-          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_LC }}@${{ steps.build.outputs.digest }}
           format: spdx-json
           output-file: sbom.spdx.json
 
       - name: Analyser l'image publiee
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_LC }}@${{ steps.build.outputs.digest }}
           severity: CRITICAL,HIGH
           format: sarif
           output: trivy.sarif
@@ -180,6 +200,9 @@ jobs:
     name: Publier le chart Helm
     runs-on: ubuntu-latest
     needs: publier
+    # if: always() volontairement ABSENT : si la publication de l'image
+    # echoue, publier le chart n'a pas de sens -- il referencerait une
+    # image inexistante. Le saut est le bon comportement.
     permissions:
       contents: read
       packages: write
@@ -211,4 +234,6 @@ jobs:
       - name: Empaqueter et publier
         run: |
           helm package helm/opspilot --destination /tmp
-          helm push /tmp/opspilot-*.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
+          # Meme contrainte de casse que pour l'image.
+          PROPRIETAIRE=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          helm push /tmp/opspilot-*.tgz "oci://ghcr.io/${PROPRIETAIRE}/charts"
