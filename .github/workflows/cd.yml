@@ -179,8 +179,7 @@ jobs:
         with:
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_LC }}@${{ steps.build.outputs.digest }}
           severity: CRITICAL,HIGH
-          format: sarif
-          output: trivy.sarif
+          format: table
           exit-code: '0'
 
       - name: Publier le rapport dans l'onglet Security
