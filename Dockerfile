@@ -16,7 +16,7 @@
 # --------------------------------------------------------------------------
 # ÉTAPE 1 -- Compilation du frontend React
 # --------------------------------------------------------------------------
-FROM node:20-alpine AS frontend
+FROM node:25-alpine AS frontend
 
 WORKDIR /build
 
