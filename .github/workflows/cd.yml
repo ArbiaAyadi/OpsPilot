@@ -182,11 +182,6 @@ jobs:
           format: table
           exit-code: '0'
 
-      - name: Publier le rapport dans l'onglet Security
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: trivy.sarif
-        continue-on-error: true
 
       - name: Joindre le SBOM a la release
         uses: actions/upload-artifact@v4
