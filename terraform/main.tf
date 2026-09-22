@@ -20,7 +20,7 @@ resource "proxmox_virtual_environment_vm" "opspilot" {
   # secondes au lieu de minutes, et toutes les VMs partent d'une base
   # identique.
   clone {
-    vm_id = data.proxmox_virtual_environment_vms.template.vms[0].vm_id
+    vm_id = try(data.proxmox_virtual_environment_vms.template.vms[0].vm_id, 9000)
     full  = true
   }
 
