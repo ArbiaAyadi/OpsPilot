@@ -1,20 +1,7 @@
 # ------------------------------------------------------------------------------
 # OpsPilot -- Intégration continue
 # ------------------------------------------------------------------------------
-# S'exécute sur les serveurs GitHub à chaque push et chaque pull request.
-# Aucune ressource consommée sur le poste de développement -- point important
-# ici, où la mémoire disponible est la contrainte principale.
-#
-# Quatre travaux indépendants, exécutés EN PARALLÈLE :
-#   tests    -- les 235 tests, contre un vrai PostgreSQL éphémère
-#   qualite  -- analyse statique (ruff)
-#   secrets  -- recherche d'identifiants dans le code ET dans l'historique
-#   deps     -- vulnérabilités connues des dépendances (Trivy)
-#   image    -- construction de l'image Docker + scan de l'image produite
-#
-# Le parallélisme est délibéré : un échec de lint ne doit pas masquer un
-# échec de test, et inversement. On veut TOUS les problèmes en un seul
-# passage, pas le premier rencontré.
+
 name: CI
 
 on:
@@ -22,21 +9,9 @@ on:
     branches: [opspilot-v6, main, master]
   pull_request:
     branches: [opspilot-v6, main, master]
-  # Permet de relancer le pipeline à la demande depuis l'onglet Actions,
-  # utile pour une démonstration en direct sans avoir à pousser un commit.
   workflow_dispatch:
 
 jobs:
-
-  # ------------------------------------------------------------------------
-  # Tests -- avec un VRAI PostgreSQL, pas le repli mémoire
-  # ------------------------------------------------------------------------
-  # Point important : en local, les tests s'exécutent souvent sans base
-  # accessible et empruntent alors le repli mémoire de database.py. Les
-  # vrais chemins SQL (INSERT, UPDATE, la requête de déduplication
-  # donnees->>'target') ne sont donc jamais exercés. Ce service PostgreSQL
-  # éphémère corrige ce trou de couverture : la CI teste ce que la
-  # production exécute réellement.
   tests:
     name: Tests (${{ matrix.python-version }})
     runs-on: ubuntu-latest
@@ -44,9 +19,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.12 est la version de développement. 3.11 vérifie qu'aucune
-        # syntaxe trop récente ne s'est glissée dans le code -- utile pour
-        # un déploiement client sur une distribution plus ancienne.
         python-version: ['3.11', '3.12']
 
     services:
@@ -58,8 +30,6 @@ jobs:
           POSTGRES_PASSWORD: opspilot_secret
         ports:
           - 5432:5432
-        # Sans ce contrôle de santé, les tests démarrent avant que
-        # PostgreSQL n'accepte les connexions et échouent au hasard.
         options: >-
           --health-cmd pg_isready
           --health-interval 10s
@@ -106,9 +76,6 @@ jobs:
           DB_NAME: opspilot
           DB_USER: opspilot
           DB_PASSWORD: opspilot_secret
-          # Valeurs factices : aucun appel réseau réel n'est fait pendant
-          # les tests, mais ces variables doivent exister pour que les
-          # modules s'importent sans avertissement bloquant.
           GROQ_API_KEY: cle-factice-ci
           SIGNUP_INVITE_CODE: code-ci
           PROMETHEUS_URL: http://localhost:9090
@@ -123,9 +90,7 @@ jobs:
           path: coverage.xml
           retention-days: 14
 
-  # ------------------------------------------------------------------------
   # Qualité du code
-  # ------------------------------------------------------------------------
   qualite:
     name: Qualité du code
     runs-on: ubuntu-latest
@@ -139,28 +104,15 @@ jobs:
 
       - name: Installer ruff
         run: pip install ruff
-
-      # Deux passes délibérément séparées.
-      # La première BLOQUE : erreurs de syntaxe, noms non définis, imports
-      # cassés -- des défauts qui font planter en production.
-      # La seconde INFORME : style, imports inutilisés, lignes trop longues.
-      # Un projet existant a toujours des écarts de style ; les traiter
-      # comme bloquants rendrait le pipeline rouge en permanence, et un
-      # pipeline toujours rouge n'est plus lu par personne.
+        
       - name: Erreurs bloquantes
         run: ruff check . --select=E9,F63,F7,F82 --output-format=full
 
       - name: Style et bonnes pratiques (informatif)
         run: ruff check . --statistics || true
 
-  # ------------------------------------------------------------------------
   # Recherche de secrets -- code ET historique
-  # ------------------------------------------------------------------------
-  # Ce projet manipule un mot de passe root Proxmox, un secret de jeton API
-  # et des clés de fournisseurs LLM. Un secret committé par inadvertance
-  # reste dans l'historique Git de façon permanente, même après suppression
-  # du fichier -- d'où fetch-depth: 0, qui récupère TOUT l'historique et non
-  # le dernier commit seulement.
+
   secrets:
     name: Recherche de secrets
     runs-on: ubuntu-latest
@@ -174,9 +126,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # ------------------------------------------------------------------------
   # Vulnérabilités des dépendances
-  # ------------------------------------------------------------------------
   deps:
     name: Vulnérabilités des dépendances
     runs-on: ubuntu-latest
@@ -188,32 +138,12 @@ jobs:
         with:
           scan-type: fs
           scan-ref: .
-          # CRITICAL et HIGH seulement : signaler les vulnérabilités
-          # mineures d'une dépendance transitive noierait les vraies
-          # alertes sous du bruit.
           severity: CRITICAL,HIGH
           format: table
-          # exit-code 0 : informe sans bloquer. Une CVE peut apparaître
-          # dans une dépendance sans correctif disponible -- bloquer le
-          # pipeline ne la corrigerait pas, mais empêcherait tout le reste
-          # d'avancer. Le rapport reste visible dans les logs.
           exit-code: '0'
 
-  # ------------------------------------------------------------------------
   # Image Docker -- construction et analyse
-  # ------------------------------------------------------------------------
-  # Construite ICI et non sur le poste de développement. Deux raisons.
-  #
-  # Pratique : Docker Desktop exige WSL2, donc Hyper-V, qui entre en
-  # conflit avec VMware Workstation -- sur lequel repose toute
-  # l'infrastructure Proxmox de ce projet. Activer l'un casserait l'autre.
-  #
-  # Méthodologique : une image construite en CI est reproductible, alors
-  # qu'une image construite localement dépend de l'état de la machine du
-  # développeur. C'est la pratique attendue en production.
-  #
-  # L'image n'est PAS publiée : on vérifie qu'elle se construit et qu'elle
-  # est saine. La publication vers un registre viendra avec le déploiement.
+
   image:
     name: Image Docker
     runs-on: ubuntu-latest
@@ -230,9 +160,7 @@ jobs:
           push: false
           load: true
           tags: opspilot:ci
-          # Cache partagé entre exécutions : sans lui, chaque build
-          # réinstalle PyTorch et toutes les dépendances Python depuis
-          # zéro -- plusieurs minutes à chaque push.
+         
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -264,26 +192,11 @@ jobs:
           image-ref: opspilot:ci
           severity: CRITICAL,HIGH
           format: table
-          # Informatif, comme pour l'analyse des dépendances : une CVE
-          # d'une image de base sans correctif disponible ne doit pas
-          # bloquer tout le pipeline. Le rapport reste consultable.
+        
           exit-code: '0'
 
-  # ------------------------------------------------------------------------
   # Manifestes Kubernetes -- validation et bonnes pratiques
-  # ------------------------------------------------------------------------
-  # Sans ce travail, une erreur dans un manifeste n'est decouverte qu'au
-  # moment du deploiement -- sur le cluster, avec des ressources deja
-  # modifiees. Le valider en CI la revele au commit, avant tout impact.
-  #
-  # Trois outils, trois roles distincts :
-  #   kustomize  -- les overlays s'assemblent-ils ?
-  #   kubeconform -- les manifestes respectent-ils le schema de l'API ?
-  #   kube-score  -- respectent-ils les bonnes pratiques ?
-  #
-  # Le premier attrape une reference cassee, le deuxieme un champ invalide,
-  # le troisieme une sonde absente ou un conteneur en root. Aucun ne
-  # remplace les deux autres.
+ 
   kubernetes:
     name: Manifestes Kubernetes
     runs-on: ubuntu-latest
