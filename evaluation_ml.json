@@ -1,0 +1,236 @@
+{
+  "scenarios": [
+    {
+      "nom": "Cluster au repos",
+      "categorie": "normal",
+      "anomalie_reelle": false,
+      "detecte": false,
+      "correct": true,
+      "score_seuils": 0.0,
+      "score_if": 0.1436,
+      "score_lstm": 0.0,
+      "score_final": 0.1005
+    },
+    {
+      "nom": "Activite moderee",
+      "categorie": "normal",
+      "anomalie_reelle": false,
+      "detecte": false,
+      "correct": true,
+      "score_seuils": 0.0,
+      "score_if": 0.2706,
+      "score_lstm": 0.0,
+      "score_final": 0.1894
+    },
+    {
+      "nom": "Pic de trafic reseau legitime",
+      "categorie": "normal",
+      "anomalie_reelle": false,
+      "detecte": false,
+      "correct": true,
+      "score_seuils": 0.0,
+      "score_if": 0.2702,
+      "score_lstm": 0.0,
+      "score_final": 0.1892
+    },
+    {
+      "nom": "Sauvegarde nocturne (I/O eleve, sain)",
+      "categorie": "normal",
+      "anomalie_reelle": false,
+      "detecte": false,
+      "correct": true,
+      "score_seuils": 0.0,
+      "score_if": 0.528,
+      "score_lstm": 0.0,
+      "score_final": 0.3696
+    },
+    {
+      "nom": "Disque a 72% (surveille, pas critique)",
+      "categorie": "normal",
+      "anomalie_reelle": false,
+      "detecte": false,
+      "correct": true,
+      "score_seuils": 0.0,
+      "score_if": 0.2348,
+      "score_lstm": 0.0,
+      "score_final": 0.1644
+    },
+    {
+      "nom": "RAM a 78% -- sous le seuil critique",
+      "categorie": "ambigu-normal",
+      "anomalie_reelle": false,
+      "detecte": true,
+      "correct": false,
+      "score_seuils": 0.55,
+      "score_if": 0.2193,
+      "score_lstm": 0.0,
+      "score_final": 0.55
+    },
+    {
+      "nom": "Latence 40ms -- elevee mais toleree",
+      "categorie": "ambigu-normal",
+      "anomalie_reelle": false,
+      "detecte": true,
+      "correct": false,
+      "score_seuils": 0.7375,
+      "score_if": 0.3248,
+      "score_lstm": 0.0,
+      "score_final": 0.7375
+    },
+    {
+      "nom": "Swap a 45% apres redemarrage",
+      "categorie": "ambigu-normal",
+      "anomalie_reelle": false,
+      "detecte": false,
+      "correct": true,
+      "score_seuils": 0.0,
+      "score_if": 0.3466,
+      "score_lstm": 0.0,
+      "score_final": 0.2426
+    },
+    {
+      "nom": "CPU 62% soutenu -- charge normale",
+      "categorie": "ambigu-normal",
+      "anomalie_reelle": false,
+      "detecte": false,
+      "correct": true,
+      "score_seuils": 0.0,
+      "score_if": 0.3874,
+      "score_lstm": 0.0,
+      "score_final": 0.2712
+    },
+    {
+      "nom": "Cache ZFS a 72% -- degrade sans gravite",
+      "categorie": "ambigu-normal",
+      "anomalie_reelle": false,
+      "detecte": false,
+      "correct": true,
+      "score_seuils": 0.0,
+      "score_if": 0.2441,
+      "score_lstm": 0.0,
+      "score_final": 0.1709
+    },
+    {
+      "nom": "RAM critique 88%",
+      "categorie": "evident",
+      "anomalie_reelle": true,
+      "detecte": true,
+      "correct": true,
+      "score_seuils": 0.9,
+      "score_if": 0.4382,
+      "score_lstm": 0.0,
+      "score_final": 0.9
+    },
+    {
+      "nom": "CPU sature 93%",
+      "categorie": "evident",
+      "anomalie_reelle": true,
+      "detecte": true,
+      "correct": true,
+      "score_seuils": 0.85,
+      "score_if": 0.4699,
+      "score_lstm": 0.0,
+      "score_final": 0.85
+    },
+    {
+      "nom": "Tempete I/O -- latence 220ms",
+      "categorie": "evident",
+      "anomalie_reelle": true,
+      "detecte": true,
+      "correct": true,
+      "score_seuils": 0.85,
+      "score_if": 0.7011,
+      "score_lstm": 0.0,
+      "score_final": 0.85
+    },
+    {
+      "nom": "Toutes les VMs arretees",
+      "categorie": "evident",
+      "anomalie_reelle": true,
+      "detecte": true,
+      "correct": true,
+      "score_seuils": 0.8,
+      "score_if": 0.2195,
+      "score_lstm": 0.0,
+      "score_final": 0.8
+    },
+    {
+      "nom": "Erreurs reseau massives",
+      "categorie": "evident",
+      "anomalie_reelle": true,
+      "detecte": true,
+      "correct": true,
+      "score_seuils": 0.7,
+      "score_if": 0.5174,
+      "score_lstm": 0.0,
+      "score_final": 0.7
+    },
+    {
+      "nom": "Combinaison suspecte -- rien de critique isole",
+      "categorie": "ambigu-anomalie",
+      "anomalie_reelle": true,
+      "detecte": true,
+      "correct": true,
+      "score_seuils": 0.6,
+      "score_if": 0.7595,
+      "score_lstm": 0.0,
+      "score_final": 0.6
+    },
+    {
+      "nom": "Derive memoire lente + swap qui monte",
+      "categorie": "ambigu-anomalie",
+      "anomalie_reelle": true,
+      "detecte": true,
+      "correct": true,
+      "score_seuils": 0.75,
+      "score_if": 0.5109,
+      "score_lstm": 0.0,
+      "score_final": 0.75
+    },
+    {
+      "nom": "Contention disque discrete",
+      "categorie": "ambigu-anomalie",
+      "anomalie_reelle": true,
+      "detecte": true,
+      "correct": true,
+      "score_seuils": 0.61,
+      "score_if": 0.8251,
+      "score_lstm": 0.0,
+      "score_final": 0.61
+    },
+    {
+      "nom": "Fuite de descripteurs de fichiers",
+      "categorie": "ambigu-anomalie",
+      "anomalie_reelle": true,
+      "detecte": true,
+      "correct": true,
+      "score_seuils": 0.805,
+      "score_if": 0.506,
+      "score_lstm": 0.0,
+      "score_final": 0.805
+    },
+    {
+      "nom": "Surchauffe + charge combinees",
+      "categorie": "ambigu-anomalie",
+      "anomalie_reelle": true,
+      "detecte": true,
+      "correct": true,
+      "score_seuils": 0.715,
+      "score_if": 0.531,
+      "score_lstm": 0.2028,
+      "score_final": 0.715
+    }
+  ],
+  "matrice": {
+    "vp": 10,
+    "vn": 8,
+    "fp": 2,
+    "fn": 0
+  },
+  "metriques": {
+    "precision": 83.3,
+    "rappel": 100.0,
+    "exactitude": 90.0,
+    "f1": 90.9
+  }
+}

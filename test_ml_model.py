@@ -197,7 +197,7 @@ for scenario in scenarios:
     if scenario["metriques"] is None:
         # Tenter de collecter les metriques reelles
         try:
-            from proxmox_api import get_etat_cluster
+            from proxmox.proxmox_api import get_etat_cluster
             etat = get_etat_cluster()
             noeuds = etat.get("noeuds", [])
             n_noeuds = max(len(noeuds), 1)
