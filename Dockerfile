@@ -65,7 +65,7 @@ RUN npm run build \
 # pour la musl d'alpine. Sur alpine, pip devrait tout recompiler depuis
 # les sources -- plusieurs dizaines de minutes de build, et un gcc à
 # installer dans l'image.
-FROM python:3.12-slim AS runtime
+FROM python:3.14-slim AS runtime
 
 # Variables d'environnement de build uniquement -- aucun secret ici.
 ENV PYTHONUNBUFFERED=1 \
