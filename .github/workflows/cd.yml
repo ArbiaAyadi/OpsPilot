@@ -79,7 +79,7 @@ jobs:
       security-events: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Normaliser le nom de l'image en minuscules
         run: |
@@ -89,10 +89,10 @@ jobs:
           IMAGE_NAME: ${{ github.repository }}
 
       - name: Preparer Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: S'authentifier aupres de GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -100,7 +100,7 @@ jobs:
 
       - name: Calculer les etiquettes et metadonnees
         id: meta
-        uses: docker/metadata-action@v5  # v5 reste la derniere majeure
+        uses: docker/metadata-action@v6  # v5 reste la derniere majeure
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_LC }}
           # Plusieurs etiquettes pour une meme image, chacune avec un role :
@@ -125,7 +125,7 @@ jobs:
 
       - name: Construire et pousser
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true
@@ -184,7 +184,7 @@ jobs:
 
 
       - name: Joindre le SBOM a la release
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sbom
           path: sbom.spdx.json
@@ -210,9 +210,9 @@ jobs:
       packages: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
         with:
           version: v3.16.2
 
